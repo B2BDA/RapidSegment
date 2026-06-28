@@ -9,31 +9,31 @@
         "seg_1": {
             "weight": 73,
             "lift": 11.183,
-            "response_rate": 1,
+            "response_rate": 0.8146,
             "capture_rate": 0.0338
         },
         "seg_2": {
             "weight": 61,
             "lift": 11.1343,
-            "response_rate": 1,
+            "response_rate": 0.811,
             "capture_rate": 0.0283
         },
         "seg_3": {
             "weight": 102,
             "lift": 10.6086,
-            "response_rate": 1,
+            "response_rate": 0.7727,
             "capture_rate": 0.0513
         },
         "seg_4": {
             "weight": 50,
             "lift": 9.9559,
-            "response_rate": 1,
+            "response_rate": 0.7252,
             "capture_rate": 0.0261
         },
         "seg_5": {
             "weight": 102,
             "lift": 10.0916,
-            "response_rate": 1,
+            "response_rate": 0.7351,
             "capture_rate": 0.0541
         }
     },

@@ -5,7 +5,7 @@ import pandas as pd
 np.random.seed(42)
 
 # 1. Define dataset size
-n_rows = 2500000
+n_rows = 3*10**6  # 3 million rows
 
 print("Generating features...")
 

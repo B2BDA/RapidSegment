@@ -4,7 +4,7 @@ Strategic Segmentation & Scorecard Engine
 Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning, 
 and vectorized DuckDB scorecard deciling.
 
-Author: Bishwarup Biswas + Gemini Pro
+Author: Bishwarup Biswas + Gemini
 Python Version: 3.9+
 """
 
@@ -12,6 +12,7 @@ import json
 import logging
 import multiprocessing
 import re
+import itertools
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -42,10 +43,11 @@ class StrategicSegmentBuilder:
     Attributes:
         target: Dependent binary target column name (1 = Event, 0 = Non-Event).
         n_jobs: Number of CPU cores allocated to parallelized search jobs.
-        min_sample_size: Absolute minimum row count required for a valid rule.
-        min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate).
+        min_sample_size: Absolute minimum row count required for a valid rule (fallback default).
+        min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate) (fallback default).
         top_n_vars: Number of highest-IV features passed into the Apriori engine.
         max_segments: Hard stopping ceiling for extracted mutually exclusive segments.
+        max_feature_reuse: Structural limit for tracking and restricting feature dominance.
         enable_diversity: If True, blocks rules combining variables from the same business group.
         enable_1way: Allow 1-dimensional rules in final pool.
         enable_2way: Allow 2-dimensional intersection rules in final pool.
@@ -62,6 +64,7 @@ class StrategicSegmentBuilder:
         min_lift: float = 2.0,
         top_n_vars: int = 20,
         max_segments: int = 10,
+        max_feature_reuse: int = 1,
         enable_diversity: bool = False,
         enable_1way: bool = True,
         enable_2way: bool = True,
@@ -77,6 +80,7 @@ class StrategicSegmentBuilder:
         self.min_lift = min_lift
         self.top_n_vars = top_n_vars
         self.max_segments = max_segments
+        self.max_feature_reuse = max_feature_reuse
         self.segments: List[Dict[str, Any]] = []
 
         self.enable_diversity = enable_diversity
@@ -85,6 +89,7 @@ class StrategicSegmentBuilder:
         self.enable_3way = enable_3way
         self.feature_groups = feature_groups or {}
         self.ignore_features = ignore_features or []
+        self.feature_usage_counts: Dict[str, int] = {}
 
     @staticmethod
     def _resolve_optb_dtype(series: pd.Series) -> str:
@@ -208,7 +213,6 @@ class StrategicSegmentBuilder:
                 return None
 
             # Optimized string join over loop concatenation
-            rule_expressions = [f"{col}={summary[col].astype(str)}" for col in combo]
             summary["rule"] = summary.apply(
                 lambda row: " & ".join([f"{c}={row[c]}" for c in combo]), axis=1
             )
@@ -291,101 +295,156 @@ class StrategicSegmentBuilder:
             f"({cond})" if "AND" in cond else cond for cond in sql_conditions
         )
 
-    def extract_segments(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Sequentially extracts high-lift segments, pruning captured rows per iteration."""
+    def extract_segments(self, df: pd.DataFrame, param_grid: Optional[Dict[str, List[Any]]] = None) -> pd.DataFrame:
+        """Sequentially extracts high-lift segments using an iterative Multi-Threshold Grid Search 
+        while applying feature usage constraints to eliminate structural feature dominance.
+        """
         if self.enable_diversity:
             self._validate_feature_groups(df)
 
         current_df = df.copy()
 
+        # Initialize global tracking map for tracking structural dominance
+        eligible_cols = [c for c in df.columns if c != self.target and c not in self.ignore_features]
+        self.feature_usage_counts = {col: 0 for col in eligible_cols}
+        # Build dynamic grid search boundaries
+        if param_grid:
+            logger.info(
+                f"Dynamic Grid Search Enabled: {len(param_grid.get('min_sample_size', [self.min_sample_size])) * len(param_grid.get('min_lift', [self.min_lift]))} total configurations."
+            )
+            sizes = param_grid.get("min_sample_size", [self.min_sample_size])
+            lifts = param_grid.get("min_lift", [self.min_lift])
+            experiments = [
+                {"min_sample_size": s, "min_lift": l}
+                for s, l in itertools.product(sizes, lifts)
+            ]
+        else:
+            experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
+
         for i in range(1, self.max_segments + 1):
             base_rate = current_df[self.target].mean()
-            if base_rate == 0 or len(current_df) < self.min_sample_size:
+            min_floor_volume = min(exp["min_sample_size"] for exp in experiments)
+            
+            if base_rate == 0 or len(current_df) < min_floor_volume:
                 break
 
             logger.info(
                 f"Iteration {i} | Remaining Volume: {len(current_df):,} | Base Rate: {base_rate*100:.2f}%"
             )
 
+            # 1. Recalculate Dynamic IV Ranking on residual portfolio population
             iv_ranking = self.compute_iv_ranking(current_df)
-            top_vars = iv_ranking.head(self.top_n_vars)["variable"].tolist()
+            
+            # 2. Apply Dominance Constraints: Filter out exhausted features
+            allowed_vars = [
+                row["variable"] for _, row in iv_ranking.iterrows()
+                if self.feature_usage_counts.get(row["variable"], 0) < self.max_feature_reuse
+            ]
+            
+            top_vars = allowed_vars[:self.top_n_vars]
+            if not top_vars:
+                logger.warning("All eligible features have been exhausted via max_feature_reuse filters. Aborting.")
+                break
+
             binned_df = self.create_binned_df(current_df, top_vars)
-
-            # Prevent uninformative single-bin distributions from polluting n-way space
             valid_vars = [v for v in top_vars if binned_df[v].nunique() > 1]
-            all_rules: List[pd.DataFrame] = []
+            
+            grid_candidates: List[pd.Series] = []
 
-            # Apriori Level 1 (Singles)
-            res_1 = self._agg_combinations(
-                binned_df, [(c,) for c in valid_vars], base_rate
-            )
-            valid_1way_vars = set()
+            # 3. Parameter Matrix Grid Sweep
+            for config in experiments:
+                # Override parameters for joblib serialization state access rules
+                self.min_sample_size = config["min_sample_size"]
+                self.min_lift = config["min_lift"]
 
-            if not res_1.empty:
-                valid_1way_vars = {c[0] for c in res_1["combo_vars"]}
-                if self.enable_1way:
-                    all_rules.append(res_1)
+                all_rules: List[pd.DataFrame] = []
 
-            if not valid_1way_vars:
-                logger.warning(
-                    "Zero features cleared single-variable pruning thresholds. Aborting search."
+                # Apriori Level 1 (Singles)
+                res_1 = self._agg_combinations(
+                    binned_df, [(c,) for c in valid_vars], base_rate
                 )
-                break
+                valid_1way_vars = set()
 
-            # Apriori Level 2 (Pairs)
-            valid_2way_sets = set()
-            if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
-                combos_2 = [
-                    c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)
-                ]
-                if combos_2:
-                    res_2 = self._agg_combinations(binned_df, combos_2, base_rate)
-                    if not res_2.empty:
-                        valid_2way_sets = {frozenset(c) for c in res_2["combo_vars"]}
-                        if self.enable_2way:
-                            all_rules.append(res_2)
+                if not res_1.empty:
+                    valid_1way_vars = {c[0] for c in res_1["combo_vars"]}
+                    if self.enable_1way:
+                        all_rules.append(res_1)
 
-            # Apriori Level 3 (Triplets)
-            if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
-                combos_3 = [
-                    c
-                    for c in combinations(valid_1way_vars, 3)
-                    if self.is_diverse(c)
-                    and all(
-                        frozenset(p) in valid_2way_sets for p in combinations(c, 2)
+                if not valid_1way_vars:
+                    continue
+
+                # Apriori Level 2 (Pairs)
+                valid_2way_sets = set()
+                if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
+                    combos_2 = [
+                        c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)
+                    ]
+                    if combos_2:
+                        res_2 = self._agg_combinations(binned_df, combos_2, base_rate)
+                        if not res_2.empty:
+                            valid_2way_sets = {frozenset(c) for c in res_2["combo_vars"]}
+                            if self.enable_2way:
+                                all_rules.append(res_2)
+
+                # Apriori Level 3 (Triplets)
+                if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
+                    combos_3 = [
+                        c
+                        for c in combinations(valid_1way_vars, 3)
+                        if self.is_diverse(c)
+                        and all(
+                            frozenset(p) in valid_2way_sets for p in combinations(c, 2)
+                        )
+                    ]
+                    if combos_3:
+                        res_3 = self._agg_combinations(binned_df, combos_3, base_rate)
+                        if not res_3.empty:
+                            all_rules.append(res_3)
+
+                if all_rules:
+                    shortlisted_config = (
+                        pd.concat(all_rules, ignore_index=True)
+                        .sort_values(["lift", "rate", "count"], ascending=False)
+                        .reset_index(drop=True)
                     )
-                ]
-                if combos_3:
-                    res_3 = self._agg_combinations(binned_df, combos_3, base_rate)
-                    if not res_3.empty:
-                        all_rules.append(res_3)
+                    top_match = shortlisted_config.iloc[0].copy()
+                    top_match["grid_min_sample_size"] = config["min_sample_size"]
+                    top_match["grid_min_lift"] = config["min_lift"]
+                    grid_candidates.append(top_match)
 
-            if not all_rules:
-                logger.info("No active candidates cleared criteria pool. Stopping.")
+            if not grid_candidates:
+                logger.info("No active candidates cleared criteria pool across grid variations. Stopping.")
                 break
 
-            shortlisted = (
-                pd.concat(all_rules, ignore_index=True)
-                .sort_values(["lift", "rate", "count"], ascending=False)
-                .reset_index(drop=True)
-            )
+            # 4. Resolve Championship Rule Across Parameter Configuration Grid Result Sets
+            grid_results = pd.DataFrame(grid_candidates).sort_values(
+                ["lift", "count", "rate"], ascending=False
+            ).reset_index(drop=True)
 
-            best_rule = shortlisted.loc[0, "rule"]
+            best_match = grid_results.iloc[0]
+            best_rule = best_match["rule"]
             best_sql = self.parse_rule_to_sql(best_rule)
+            winning_combo = best_match["combo_vars"]
+
+            # 5. Commit Feature Adoption and Increment Dominance Counter State
+            for var in winning_combo:
+                self.feature_usage_counts[var] = self.feature_usage_counts.get(var, 0) + 1
+                logger.info(f"Feature Usage Tracker Update -> '{var}' used count = {self.feature_usage_counts[var]}")
 
             self.segments.append(
                 {
                     "segment_id": i,
                     "rule_string": best_rule,
                     "sql_filter": best_sql,
-                    "count": int(shortlisted.loc[0, "count"]),
-                    "rate": float(shortlisted.loc[0, "rate"]),
-                    "lift": float(shortlisted.loc[0, "lift"]),
+                    "count": int(best_match["count"]),
+                    "rate": float(best_match["rate"]),
+                    "lift": float(best_match["lift"]),
+                    "meta_applied_sample_size": int(best_match["grid_min_sample_size"]),
+                    "meta_applied_min_lift": float(best_match["grid_min_lift"])
                 }
             )
 
-            logger.info(f"Segment {i} Captured: {best_sql}")
-            # DuckDB dynamically scans current_df locally
+            logger.info(f"Segment {i} Captured (Size Floor: {best_match['grid_min_sample_size']} | Lift Floor: {best_match['grid_min_lift']}): {best_sql}")
             current_df = duckdb.query(
                 f"SELECT * FROM current_df WHERE NOT ({best_sql})"
             ).df()

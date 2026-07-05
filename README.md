@@ -356,7 +356,10 @@ Because of this cascading extraction:
 This happens when your extraction criteria are so restrictive that your final segments capture only a tiny fraction of the total population. Even though your input data is healthy, the final scored data becomes artificially zero-inflated because the vast majority of your rows fail to qualify for any segment rules and receive a baseline score of exactly 0.  
 When the engine sorts the entire population from highest to lowest score, the small group of customers who actually triggered rules get pushed into Deciles 1 and 2. Because the remaining 80%+ of the population all have a score of 0, Decile 3 onwards fills up entirely with these unsegmented, lowest-risk customers—collapsing their minimum thresholds to 0.  
 This indicates that your segment rules are too strict and lack generalizability. To fix this and distribute your scores more evenly across deciles, you can give the engine more breathing room by applying these adjustments:  
-    **`Increase max_feature_reuse (e.g., set to 2 or 3)`**: This allows highly predictive features to be reused across different segment combinations instead of being locked out after their first use.
-    **`Increase top_n_vars (e.g., set to 25 or 30)`**: This expands the pool of candidate features the engine can look at in later iterations.  
-    **`Relax the param_grid thresholds`**: Lower your minimum min_lift or min_sample_size constraints so that smaller or slightly less concentrated segments can still be captured in later rounds.  
-    **`Disable diversity constraints (enable_diversity = False)`**: This allows features within the same business category to pair up, unlocking more valid rule combinations.  
+**`Increase max_feature_reuse (e.g., set to 2 or 3)`**: This allows highly predictive features to be reused across different segment combinations instead of being locked out after their first use.
+
+**`Increase top_n_vars (e.g., set to 25 or 30)`**: This expands the pool of candidate features the engine can look at in later iterations.  
+
+**`Relax the param_grid thresholds`**: Lower your minimum min_lift or min_sample_size constraints so that smaller or slightly less concentrated segments can still be captured in later rounds.  
+
+**`Disable diversity constraints (enable_diversity = False)`**: This allows features within the same business category to pair up, unlocking more valid rule combinations.  

@@ -17,7 +17,7 @@ It is divided into two decoupled, synergistic modules:
 In risk management, fraud detection, and marketing analytics, engineering transparent models usually forces teams into a difficult trade-off:
 * **The Machine Learning Pitfall**: Black-box models (e.g., XGBoost, LightGBM) surface multi-way feature interactions automatically but cannot be natively translated into transparent, hard-coded SQL logic required by legacy transaction rules engines.
 * **The Manual Profiling Pitfall**: Manual segmentation misses non-linear intersections of three or more variables, risks severe over-fitting on small sample sizes, and frequently creates overlapping conditions where a single record qualifies for multiple rules.
-* **The Solution**: This framework bridges the gap by combining the automated discovery power of multi-threaded algorithmic search with the execution speeds of **DuckDB** and **NumPy BLAS operations**, outputting pure ANSI SQL text filters and robust linear scorecards.
+* **The Solution**: This framework bridges the gap by combining the automated discovery power of multi-threaded algorithmic search with the execution speeds of **DuckDB** and **Num BLAS operations**, outputting pure ANSI SQL text filters and robust linear scorecards.
 
 ### HOW does it work?
 The engine runs recursively through an analytical lifecycle:
@@ -58,6 +58,12 @@ This metric is multiplied by the segment's lift and scaled to produce a robust, 
 $$\text{Raw Weight}_s = L_s \times \text{Harmonic Mean}_s \times 100.0$$
 $$\text{Weight}_s = \lfloor \text{round}(\text{Raw Weight}_s) \rfloor$$
 
+#### Decile Calculation
+* Calculate and Sort Final Scores: For each customer, sum up the weights of all the segments they triggered to calculate their total score. Line up all customers and sort them by this final score in descending order (highest score to lowest score).
+* Divide the Population Equally: Split the sorted list of customers into 10 perfectly equal groups (buckets). For example, if you have 10,000 customers, each decile bucket will contain exactly 1,000 customers.. 
+* Identify the Boundary Row: For each decile band (1 through 10), look at the very last customer sitting at the bottom of that specific bucket.
+* Assign the Minimum Threshold: Capture that customer's score and assign it as the decile minimum threshold. This score represents the lowest value required to qualify for that specific decile tier.
+
 ---
 
 ### 3. Zero-Inflation & Active Population Calibration
@@ -67,9 +73,9 @@ To prevent highly skewed zero-bins from distorting score calibrations, the engin
 $$\text{Zero-Inflation Rate} = 1.0 - \text{Baseline Population Event Rate}$$
 
 * **Normal Distribution (< 80% Zero-Inflation)**: If the zero-inflation rate is low, the engine computes decile minimum score thresholds across the entire population.
-* **High Zero-Inflation ($\ge$ 80% Zero-Inflation)**: If the zero-inflation rate meets or exceeds the 80% threshold, the engine automatically runs a NumPy boolean slicing mask to isolate the **Active Population** (`train_scores > 0`). Decile step-boundaries are then calibrated exclusively over this active subgroup, preventing a large block of unsegmented records from flattening the model's risk stratification tiers.
+* **High Zero-Inflation ($\ge$ 80% Zero-Inflation)**: If the zero-inflation rate meets or exceeds the 80% threshold, the engine automatically runs a Num boolean slicing mask to isolate the **Active Population** (`train_scores > 0`). Decile step-boundaries are then calibrated exclusively over this active subgroup, preventing a large block of unsegmented records from flattening the model's risk stratification tiers.
 
-* ## 3. Algorithmic Design: Apriori Pruning & Grid Search
+## 3. Algorithmic Design: Apriori Pruning & Grid Search
 
 Evaluating multidimensional feature intersections across wide schemas risks severe processing delays and combinatorial explosion. This framework addresses these bottlenecks by pairing a multi-core **Apriori pruning heuristic** with a **Champion-Challenger Grid Search** architecture.
 
@@ -95,7 +101,7 @@ This pruning mechanism reduces multi-key grouping evaluations by up to 90%, spee
 
 ### 2. Multi-Threshold Grid Search
 When extracting rules, the engine natively accepts an execution hyperparameter matrix (param_grid) tracking lists of min_sample_size and min_lift constraints.
-```python
+```thon
 param_grid = {
     "min_sample_size": [1000, 5000, 10000], 
     "min_lift": [1.5, 2.0, 2.5]
@@ -105,7 +111,7 @@ Instead of short-circuiting early or requiring inputs to be sorted from highest 
 1. **Permutation Generation**: It maps every parameter permutation into isolated, independent experiments via itertools.product.
 2. **Exhaustive Evaluation**: For each iteration, it runs the entire multi-level Apriori combination loop for every hyperparameter combination, collecting the top rule that cleared that specific experiment's floor into a master grid_candidates array.
 3. **Global Champion Resolution**: Once all experiments finish, the complete candidate table is sorted globally across all dimensions:
-     ```python
+     ```thon
     grid_candidates.sort(key=lambda x: (x["lift"], x["count"], x["rate"]), reverse=True)
      ```
 4. **Winning Extraction**: The record at index zero (iloc[0]) is crowned the absolute champion for that loop. The engine locks in its specific rule, updates feature usage metrics, tracks the applied parameters, and isolates the target cohort.
@@ -234,8 +240,8 @@ Instead of short-circuiting early or requiring inputs to be sorted from highest 
 
 This guide demonstrates an end-to-end analytical pipeline: extracting rules across a hyperparameter grid, evaluating cascading database coverage, generating binary indicator flags, and building an optimized scorecard.
 
-```python
-import numpy as np
+```Python
+import num as np
 import pandas as pd
 import duckdb
 from SSB import StrategicSegmentBuilder, StrategicSegmentScore
@@ -297,7 +303,7 @@ print("\nCascading Portfolio Coverage Analysis:")
 print(pd.DataFrame(coverage_report))
 
 # 6. Prepare Binary Array Representation for Scorecard Tuning
-scoring_df = data[["cust_id", "default_flag"]].copy()
+scoring_df = data[["cust_id", "default_flag"]].co()
 
 # Map SQL filters to binary columns (1 = matches rule, 0 = otherwise)
 segment_columns = []
@@ -331,3 +337,26 @@ print("\nCalibrated Score Decile Thresholds:")
 for decile, min_score in model_parameters["decile_min_thresholds"].items():
     print(f"Decile {decile:2s} -> Minimum Passing Score: {min_score}")
 ```
+## 7. Notes
+
+### 1. Why can't we produce OR-based rules?
+Allowing OR operations within the search layer causes a massive combinatorial explosion that makes algorithmic pruning impossible. The engine relies on the Apriori property (an AND intersection), where a higher-order rule can be safely skipped if its lower-order components fail the baseline performance thresholds. If OR logic is introduced, a higher-order combination could still clear the threshold even if its individual parts fail, completely breaking the pruning heuristic and forcing an exhaustive, computationally prohibitive search.
+
+Additionally, while single multi-way rules can handle internal OR states for categorical fields (implemented via SQL IN clauses), introducing cross-variable OR conditions natively within the same step complicates the sequential deletion process, making it much harder to cleanly extract distinct, high-risk populations. 
+
+The OR Mutually Exclusive Clarification: Technically, an OR rule could be forced to be mutually exclusive if you deleted anyone who met any part of the OR condition. The real problem with OR is that it breaks the Apriori pruning math. If Rule A fails and Rule B fails, Rule A AND Rule B is guaranteed to fail (Apriori works). But Rule A OR Rule B might succeed, meaning you can no longer drop failed features from your search space.
+
+### 2. Why is Segment $n+k$ (e.g., Segment 3) sometimes better than Segment $n$ (e.g., Segment 2) in terms of lift or other KPIs when evaluated on the full dataset?
+The segment extraction process is entirely sequential and operates on a shrinking residual population. Once a champion rule is discovered, its matching records are deleted from the working environment before the next iteration begins.
+Because of this cascading extraction:  
+    **`Local Optimization`**: The engine optimizes parameters and evaluates candidates based purely on the residual portfolio left behind by previous segments. A rule that yields massive lift on a specific, purified subset of data might look less dominant if it had been evaluated against the noisy baseline of the entire original population.  
+    **`Changing Base Rates`**: As high-risk or high-performing records are stripped away in early rounds, the baseline event rate of the remaining pool shifts dynamically. This shifting baseline changes the mathematical benchmark for what constitutes a "high-lift" rule during that specific loop.  Consequently, when evaluate_final_coverage maps all rules simultaneously back over the original, unfiltered dataset, the global KPIs can naturally surface instances where a later segment outperforms an earlier one.  
+
+### 3. My dataset is not zero inflated, still my deciles 3 onwards the floor is zero?
+This happens when your extraction criteria are so restrictive that your final segments capture only a tiny fraction of the total population. Even though your input data is healthy, the final scored data becomes artificially zero-inflated because the vast majority of your rows fail to qualify for any segment rules and receive a baseline score of exactly 0.  
+When the engine sorts the entire population from highest to lowest score, the small group of customers who actually triggered rules get pushed into Deciles 1 and 2. Because the remaining 80%+ of the population all have a score of 0, Decile 3 onwards fills up entirely with these unsegmented, lowest-risk customers—collapsing their minimum thresholds to 0.  
+This indicates that your segment rules are too strict and lack generalizability. To fix this and distribute your scores more evenly across deciles, you can give the engine more breathing room by applying these adjustments:  
+    **`Increase max_feature_reuse (e.g., set to 2 or 3)`**: This allows highly predictive features to be reused across different segment combinations instead of being locked out after their first use.
+    **`Increase top_n_vars (e.g., set to 25 or 30)`**: This expands the pool of candidate features the engine can look at in later iterations.  
+    **`Relax the param_grid thresholds`**: Lower your minimum min_lift or min_sample_size constraints so that smaller or slightly less concentrated segments can still be captured in later rounds.  
+    **`Disable diversity constraints (enable_diversity = False)`**: This allows features within the same business category to pair up, unlocking more valid rule combinations.  

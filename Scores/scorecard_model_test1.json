@@ -1,34 +1,46 @@
 {
     "model_metadata": {
-        "total_training_population": 50000,
-        "active_scored_population": 16224,
-        "active_population_pct": 32.45,
-        "baseline_event_rate": 0.1477
+        "total_training_population": 25500,
+        "active_scored_population": 25500,
+        "active_population_pct": 100.0,
+        "baseline_event_rate": 0.2999
     },
     "segment_weights": {
         "seg_1": {
-            "weight": 50,
-            "lift": 1.8285,
-            "response_rate": 0.27,
-            "capture_rate": 0.2779
+            "weight": 31,
+            "lift": 2.828,
+            "response_rate": 0.8481,
+            "capture_rate": 0.0577
         },
         "seg_2": {
-            "weight": 45,
-            "lift": 1.6284,
-            "response_rate": 0.2405,
-            "capture_rate": 0.3291
+            "weight": 117,
+            "lift": 2.752,
+            "response_rate": 0.8253,
+            "capture_rate": 0.2853
+        },
+        "seg_3": {
+            "weight": 33,
+            "lift": 1.9159,
+            "response_rate": 0.5745,
+            "capture_rate": 0.1003
+        },
+        "seg_4": {
+            "weight": 21,
+            "lift": 1.5182,
+            "response_rate": 0.4553,
+            "capture_rate": 0.0812
         }
     },
     "decile_min_thresholds": {
-        "1": 50,
-        "2": 50,
-        "3": 50,
-        "4": 50,
-        "5": 45,
-        "6": 45,
-        "7": 45,
-        "8": 45,
-        "9": 45,
-        "10": 45
+        "1": 117,
+        "2": 0,
+        "3": 0,
+        "4": 0,
+        "5": 0,
+        "6": 0,
+        "7": 0,
+        "8": 0,
+        "9": 0,
+        "10": 0
     }
 }

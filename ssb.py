@@ -650,13 +650,23 @@ class StrategicSegmentScore:
         logger.info(
             f"Calibrating deciles across {len(active_scores):,} target customers..."
         )
-        sorted_scores = np.sort(active_scores)[::-1]
+        # Sorts your scores in ascending order (lowest to highest). 
+        # The [::-1] syntax reverses that result, turning it into descending order (highest to lowest). 
+        sorted_scores = np.sort(active_scores)[::-1] 
+        # Simply counts how many customers are in this pool
         active_pop_size = len(sorted_scores)
 
         decile_thresholds: Dict[str, int] = {}
         for d in range(1, 11):
+            # This formula calculates exactly which row index represents the bottom boundary of the current decile.
+            # For example, for the 1st decile (d=1), it calculates the index that corresponds to the top 10% of the sorted scores.
+            # Converting to an integer keeps it as 2. Then we subtract 1: 2 - 1 = 1.
+            # Index 1 points to the 2nd item in a Python array (since Python counting starts at 0). This is exactly the last person in your first bucket!
             row_idx = int((d / 10.0) * active_pop_size) - 1
+            # This line is a safety net. It ensures that the calculated row_idx never accidentally breaks your code if your dataset is extremely small or has unusual dimensions.
             row_idx = max(0, min(active_pop_size - 1, row_idx))
+            # min(active_pop_size - 1, row_idx) makes sure the index never goes past the end of the array
+            # max(0, ...) makes sure the index never dips below 0.
             decile_thresholds[str(d)] = int(sorted_scores[row_idx])
 
         self.model_artifact = {

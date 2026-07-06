@@ -8,7 +8,6 @@ In-Memory PyArrow Tables, and Google Cloud BigQuery Storage API streams.
 import os
 import logging
 from typing import Any, Optional, Union
-import duckdb
 import pyarrow as pa
 import pyarrow.csv as pa_csv
 import pyarrow.parquet as pa_pq
@@ -138,12 +137,41 @@ class UniversalDataLoader:
         try:
             from google.cloud import bigquery
             logger.info(f"Initializing Google Cloud BigQuery Client storage stream for: {full_bq_path}")
-            
+
+            """
+            Dynamically generates a BigQuery SQL query that automatically casts 
+            all DECIMAL/NUMERIC columns into FLOAT64, preserving everything else.
+            """
             bq_client = bigquery.Client(project=self.project_id)
-            query = f'SELECT * FROM `{full_bq_path}`'
+            
+            # 1. Query the schema metadata for your target table
+            schema_query = f"""
+                SELECT column_name, data_type 
+                FROM `{self.project_id}.{self.dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+                WHERE table_name = '{self.table_id}'
+            """
+            query_job = bq_client.query(schema_query)
+            columns_metadata = query_job.result()
+            
+            select_clauses = []
+            
+            # 2. Iterate over columns and dynamically apply cast rules based on data type
+            for row in columns_metadata:
+                col_name = row.column_name
+                data_type = row.data_type
+                
+                # Catch any variant of NUMERIC, BIGNUMERIC, or fixed-point DECIMAL
+                if any(kw in data_type for kw in ("NUMERIC", "BIGNUMERIC", "DECIMAL")):
+                    select_clauses.append(f"SAFE_CAST(`{col_name}` AS FLOAT64) AS `{col_name}`")
+                else:
+                    # Leave strings, dates, ints, and categories completely untouched
+                    select_clauses.append(f"`{col_name}`")
+                    
+            # 3. Construct the final scalable SQL script
+            final_query = f"SELECT \n    " + ",\n    ".join(select_clauses) + f"\nFROM `{self.project_id}.{self.dataset_id}.{self.table_id}`"
             
             # Streams data via high-speed gRPC Storage API directly to internal Arrow chunks
-            return bq_client.query(query).to_arrow()
+            return bq_client.query(final_query).to_arrow()
 
         except ImportError:
             # Resilient Fallback: If google-cloud-bigquery package is missing, 

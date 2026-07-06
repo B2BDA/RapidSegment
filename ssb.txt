@@ -15,7 +15,8 @@ import re
 import itertools
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import os
+import psutil
 import duckdb
 import numpy as np
 from joblib import Parallel, delayed
@@ -107,7 +108,7 @@ class StrategicSegmentBuilder:
             float(val)
             return True
         except ValueError:
-            return False
+            return False   
 
     def _validate_feature_groups(self, columns: List[str]) -> None:
         """Validates that all declared feature group variables exist in the target dataset."""
@@ -273,25 +274,35 @@ class StrategicSegmentBuilder:
                 elif len(content.split(",")) > 2:
                     is_categorical = True
 
-            # 1. Categorical Set Handling
+            # 1. FIX: Robust Categorical Set Handling using AST Literal Parsing
             if is_categorical and bracket_match:
-                raw_items = [
-                    i.strip().strip("'").strip('"')
-                    for i in bracket_match.group(1).split(",")
-                    if i.strip()
-                ]
+                import ast
+                try:
+                    # Safely convert the string string-representation of a list e.g. "['A', 'B']" into an actual Python list
+                    raw_items = ast.literal_eval(bracket_match.group(0))
+                except Exception:
+                    # Fallback backup parsing if string structure is slightly malformed
+                    raw_items = [
+                        i.strip().strip("'").strip('"')
+                        for i in bracket_match.group(1).split(",")
+                        if i.strip()
+                    ]
+                
+                # Format strings correctly with quotes, but leave purely numeric string keys raw
                 formatted_items = ", ".join(
                     [
-                        item if self._is_numeric_string(item) else f"'{item}'"
+                        item if self._is_numeric_string(str(item)) else f"'{item}'"
                         for item in raw_items
                     ]
                 )
-                sql_conditions.append(f"{col} IN ({formatted_items})")
+                
+                if formatted_items:
+                    sql_conditions.append(f'"{col}" IN ({formatted_items})')
                 continue
 
             # 2. Null/Special State Handling
             if interval in ["Special", "Missing"]:
-                sql_conditions.append(f"{col} IS NULL")
+                sql_conditions.append(f'"{col}" IS NULL')
                 continue
 
             # 3. Continuous Numeric Range Handling
@@ -302,11 +313,11 @@ class StrategicSegmentBuilder:
                 range_conds = []
                 if lower_str.lower() != "-inf":
                     op = ">=" if left_char == "[" else ">"
-                    range_conds.append(f"{col} {op} {lower_str}")
+                    range_conds.append(f'"{col}" {op} {lower_str}')
 
                 if upper_str.lower() != "inf":
                     op = "<=" if right_char == "]" else "<"
-                    range_conds.append(f"{col} {op} {upper_str}")
+                    range_conds.append(f'"{col}" {op} {upper_str}')
 
                 if range_conds:
                     sql_conditions.append(" AND ".join(range_conds))
@@ -320,6 +331,26 @@ class StrategicSegmentBuilder:
         while applying feature usage constraints to eliminate structural feature dominance.
         """
         con = duckdb.connect()
+        """Initializes the in-memory DuckDB connection, dynamically scaling resources."""
+        
+        
+        # 1. Dynamically calculate available CPU cores
+        # We leave a 2-core buffer for the OS / Python orchestration layer if cores > 4
+        total_cores = os.cpu_count() or 1
+        target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
+        
+        # 2. Dynamically calculate memory limit (in bytes)
+        # We allocate 75% of total system RAM to DuckDB, leaving a 25% safety cushion
+        total_memory_bytes = psutil.virtual_memory().total
+        target_memory_gb = int((total_memory_bytes * 0.75) / (1024 ** 3))
+        
+        # 3. Apply the settings dynamically to DuckDB
+        con.execute(f"SET threads = {target_threads};")
+        con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
+    
+        # Logger block to verify configurations in production logs
+        logger.info(f"DuckDB Configured: Threads={target_threads}/{total_cores}, MemoryLimit={target_memory_gb}GB")
+
         # DuckDB resolves local Python variables automatically (handles Pandas, Arrow, Dictionaries)
         con.execute("CREATE TABLE current_df AS SELECT * FROM data")
 

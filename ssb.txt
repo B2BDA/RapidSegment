@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger("StrategicEngine")
 
 # Pre-compile regex at module load for O(1) lookup inside loops
-_BRACKET_REGEX = re.compile(r"\[(.*)\]")
+_BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags = re.DOTALL)
 
 
 class StrategicSegmentBuilder:
@@ -297,12 +297,12 @@ class StrategicSegmentBuilder:
                 )
                 
                 if formatted_items:
-                    sql_conditions.append(f'"{col}" IN ({formatted_items})')
+                    sql_conditions.append(f'{col} IN ({formatted_items})')
                 continue
 
             # 2. Null/Special State Handling
             if interval in ["Special", "Missing"]:
-                sql_conditions.append(f'"{col}" IS NULL')
+                sql_conditions.append(f'{col} IS NULL')
                 continue
 
             # 3. Continuous Numeric Range Handling
@@ -313,11 +313,11 @@ class StrategicSegmentBuilder:
                 range_conds = []
                 if lower_str.lower() != "-inf":
                     op = ">=" if left_char == "[" else ">"
-                    range_conds.append(f'"{col}" {op} {lower_str}')
+                    range_conds.append(f'{col} {op} {lower_str}')
 
                 if upper_str.lower() != "inf":
                     op = "<=" if right_char == "]" else "<"
-                    range_conds.append(f'"{col}" {op} {upper_str}')
+                    range_conds.append(f'{col} {op} {upper_str}')
 
                 if range_conds:
                     sql_conditions.append(" AND ".join(range_conds))
@@ -409,7 +409,7 @@ class StrategicSegmentBuilder:
             
             valid_vars = []
             for v in top_vars:
-                distinct_count = con.execute(f'SELECT COUNT(DISTINCT "{v}") FROM binned_df').fetchone()[0]
+                distinct_count = con.execute(f'SELECT COUNT(DISTINCT {v}) FROM binned_df').fetchone()[0]
                 if distinct_count > 1:
                     valid_vars.append(v)
             

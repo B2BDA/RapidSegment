@@ -1,4 +1,4 @@
-# Strategic Segmentation & Scorecard Engine
+# SegmentIQ - Strategic Segmentation & Scorecard Engine
 
 A high-performance, industrial-grade combinatorial heuristic engine and scoring framework for extracting highly predictive, mutually exclusive segments from tabular data and compiling them into optimized financial scorecards.
 

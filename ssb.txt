@@ -45,6 +45,7 @@ class StrategicSegmentBuilder:
         n_jobs: Number of CPU cores allocated to parallelized search jobs.
         min_sample_size: Absolute minimum row count required for a valid rule (fallback default).
         min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate) (fallback default).
+        min_events: Minimum number of positive events required for a valid rule (fallback default).
         top_n_vars: Number of highest-IV features passed into the Apriori engine.
         max_segments: Hard stopping ceiling for extracted mutually exclusive segments.
         max_feature_reuse: Structural limit for tracking and restricting feature dominance.
@@ -63,6 +64,7 @@ class StrategicSegmentBuilder:
         n_jobs: int = -1,
         min_sample_size: int = 1000,
         min_lift: float = 2.0,
+        min_events: int = 5,
         top_n_vars: int = 20,
         max_segments: int = 10,
         max_feature_reuse: int = 1,
@@ -80,6 +82,7 @@ class StrategicSegmentBuilder:
         )
         self.min_sample_size = min_sample_size
         self.min_lift = min_lift
+        self.min_events = min_events
         self.top_n_vars = top_n_vars
         self.max_segments = max_segments
         self.max_feature_reuse = max_feature_reuse
@@ -217,14 +220,15 @@ class StrategicSegmentBuilder:
             combo_str = ",".join(combo)
             
             query = f"""
-                SELECT 
+                    SELECT 
                     {rule_concat} AS rule,
                     COUNT("{self.target}")::BIGINT AS count,
                     SUM(CAST("{self.target}" AS DOUBLE)) AS events,
                     '{combo_str}' AS combo_vars_str
-                FROM binned_df
-                GROUP BY {cols_str}
-                HAVING COUNT("{self.target}") >= {self.min_sample_size}
+                    FROM binned_df
+                    GROUP BY {cols_str}
+                    HAVING COUNT("{self.target}") >= {self.min_sample_size}
+                    AND SUM(CAST("{self.target}" AS DOUBLE)) >= {self.min_events}
             """
             queries.append(query)
 
@@ -241,7 +245,9 @@ class StrategicSegmentBuilder:
                 rate = (events / count) * 100.0 if count > 0 else 0
                 lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
                 
-                if lift >= self.min_lift:
+                # Require at least self.min_events events and lift > 1.0
+
+                if lift >= self.min_lift and events >= self.min_events and lift > 1.0:
                     valid_results.append({
                         "rule": rule,
                         "count": count,
@@ -274,7 +280,7 @@ class StrategicSegmentBuilder:
                 elif len(content.split(",")) > 2:
                     is_categorical = True
 
-            # 1. FIX: Robust Categorical Set Handling using AST Literal Parsing
+# Robust Categorical Set Handling using AST Literal Parsing
             if is_categorical and bracket_match:
                 import ast
                 try:
@@ -288,10 +294,10 @@ class StrategicSegmentBuilder:
                         if i.strip()
                     ]
                 
-                # Format strings correctly with quotes, but leave purely numeric string keys raw
+                # If the item is a true string instance, wrap it in SQL quotes. Otherwise, treat it as a raw literal number.
                 formatted_items = ", ".join(
                     [
-                        item if self._is_numeric_string(str(item)) else f"'{item}'"
+                        f"'{item}'" if isinstance(item, str) else str(item)
                         for item in raw_items
                     ]
                 )

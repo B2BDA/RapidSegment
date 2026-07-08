@@ -155,11 +155,12 @@ class StrategicSegmentBuilder:
         columns_types = {row[0]: row[1] for row in cols_info}
         eligible_cols = [c for c in columns_types.keys() if c != self.target and c not in self.ignore_features]
 
-        # Fetch dictionary of flat NumPy arrays for fast, zero-copy serialization across joblib workers
-        data_dict = con.execute("SELECT * FROM current_df").fetchnumpy()
+
 
         def _worker(col: str) -> Dict[str, Union[str, float]]:
             try:
+                # Fetch dictionary of flat NumPy arrays for fast, zero-copy serialization across joblib workers
+                data_dict = con.execute(f'SELECT "{col}", "{self.target}" FROM current_df').fetchnumpy()
                 col_arr = data_dict[col]
                 target_arr = data_dict[self.target]
                 dtype = self._resolve_optb_dtype(columns_types[col])
@@ -174,7 +175,7 @@ class StrategicSegmentBuilder:
                 logger.debug(f"IV computation failed for {col}: {e}")
                 return {"variable": col, "iv": 0.0}
 
-        results = Parallel(n_jobs=self.n_jobs)(
+        results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
         )
         
@@ -182,7 +183,12 @@ class StrategicSegmentBuilder:
 
     def create_binned_table(self, con: duckdb.DuckDBPyConnection, variables: List[str]) -> None:
         """Transforms continuous data into discrete optimal binned strings natively mapped in DuckDB."""
-        data_dict = con.execute("SELECT * FROM current_df").fetchnumpy()
+        # 1. Create a specific list of just the target and the top variables
+        query_cols = [self.target] + variables
+        cols_str = ", ".join([f'"{c}"' for c in query_cols])
+        
+        # 2. Fetch ONLY the needed columns, drastically reducing the RAM footprint
+        data_dict = con.execute(f"SELECT {cols_str} FROM current_df").fetchnumpy()
         binned_data = {self.target: data_dict[self.target]}
         
         cols_info = con.execute("DESCRIBE current_df").fetchall()
@@ -346,9 +352,9 @@ class StrategicSegmentBuilder:
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
         
         # 2. Dynamically calculate memory limit (in bytes)
-        # We allocate 75% of total system RAM to DuckDB, leaving a 25% safety cushion
+        # We allocate 50% of total system RAM to DuckDB, leaving a 50% safety cushion
         total_memory_bytes = psutil.virtual_memory().total
-        target_memory_gb = int((total_memory_bytes * 0.75) / (1024 ** 3))
+        target_memory_gb = int((total_memory_bytes * 0.5) / (1024 ** 3))
         
         # 3. Apply the settings dynamically to DuckDB
         con.execute(f"SET threads = {target_threads};")

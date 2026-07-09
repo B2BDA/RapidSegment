@@ -15,7 +15,8 @@ import re
 import itertools
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import os
+import psutil
 import duckdb
 import numpy as np
 from joblib import Parallel, delayed
@@ -29,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger("StrategicEngine")
 
 # Pre-compile regex at module load for O(1) lookup inside loops
-_BRACKET_REGEX = re.compile(r"\[(.*)\]")
+_BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags = re.DOTALL)
 
 
 class StrategicSegmentBuilder:
@@ -44,9 +45,11 @@ class StrategicSegmentBuilder:
         n_jobs: Number of CPU cores allocated to parallelized search jobs.
         min_sample_size: Absolute minimum row count required for a valid rule (fallback default).
         min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate) (fallback default).
+        min_events: Minimum number of positive events required for a valid rule (fallback default).
         top_n_vars: Number of highest-IV features passed into the Apriori engine.
         max_segments: Hard stopping ceiling for extracted mutually exclusive segments.
         max_feature_reuse: Structural limit for tracking and restricting feature dominance.
+        param_grid: Optional dictionary of parameter grid search values for min_sample_size and min_lift.
         enable_diversity: If True, blocks rules combining variables from the same business group.
         enable_1way: Allow 1-dimensional rules in final pool.
         enable_2way: Allow 2-dimensional intersection rules in final pool.
@@ -61,6 +64,7 @@ class StrategicSegmentBuilder:
         n_jobs: int = -1,
         min_sample_size: int = 1000,
         min_lift: float = 2.0,
+        min_events: int = 5,
         top_n_vars: int = 20,
         max_segments: int = 10,
         max_feature_reuse: int = 1,
@@ -78,6 +82,7 @@ class StrategicSegmentBuilder:
         )
         self.min_sample_size = min_sample_size
         self.min_lift = min_lift
+        self.min_events = min_events
         self.top_n_vars = top_n_vars
         self.max_segments = max_segments
         self.max_feature_reuse = max_feature_reuse
@@ -90,6 +95,8 @@ class StrategicSegmentBuilder:
         self.feature_groups = feature_groups or {}
         self.ignore_features = ignore_features or []
         self.feature_usage_counts: Dict[str, int] = {}
+        # New: Diagnostic repository
+        self.diagnostics_: List[Dict[str, Any]] = []
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -106,7 +113,7 @@ class StrategicSegmentBuilder:
             float(val)
             return True
         except ValueError:
-            return False
+            return False   
 
     def _validate_feature_groups(self, columns: List[str]) -> None:
         """Validates that all declared feature group variables exist in the target dataset."""
@@ -150,11 +157,12 @@ class StrategicSegmentBuilder:
         columns_types = {row[0]: row[1] for row in cols_info}
         eligible_cols = [c for c in columns_types.keys() if c != self.target and c not in self.ignore_features]
 
-        # Fetch dictionary of flat NumPy arrays for fast, zero-copy serialization across joblib workers
-        data_dict = con.execute("SELECT * FROM current_df").fetchnumpy()
+
 
         def _worker(col: str) -> Dict[str, Union[str, float]]:
             try:
+                # Fetch dictionary of flat NumPy arrays for fast, zero-copy serialization across joblib workers
+                data_dict = con.execute(f'SELECT "{col}", "{self.target}" FROM current_df').fetchnumpy()
                 col_arr = data_dict[col]
                 target_arr = data_dict[self.target]
                 dtype = self._resolve_optb_dtype(columns_types[col])
@@ -169,7 +177,7 @@ class StrategicSegmentBuilder:
                 logger.debug(f"IV computation failed for {col}: {e}")
                 return {"variable": col, "iv": 0.0}
 
-        results = Parallel(n_jobs=self.n_jobs)(
+        results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
         )
         
@@ -177,7 +185,12 @@ class StrategicSegmentBuilder:
 
     def create_binned_table(self, con: duckdb.DuckDBPyConnection, variables: List[str]) -> None:
         """Transforms continuous data into discrete optimal binned strings natively mapped in DuckDB."""
-        data_dict = con.execute("SELECT * FROM current_df").fetchnumpy()
+        # 1. Create a specific list of just the target and the top variables
+        query_cols = [self.target] + variables
+        cols_str = ", ".join([f'"{c}"' for c in query_cols])
+        
+        # 2. Fetch ONLY the needed columns, drastically reducing the RAM footprint
+        data_dict = con.execute(f"SELECT {cols_str} FROM current_df").fetchnumpy()
         binned_data = {self.target: data_dict[self.target]}
         
         cols_info = con.execute("DESCRIBE current_df").fetchall()
@@ -215,14 +228,15 @@ class StrategicSegmentBuilder:
             combo_str = ",".join(combo)
             
             query = f"""
-                SELECT 
+                    SELECT 
                     {rule_concat} AS rule,
                     COUNT("{self.target}")::BIGINT AS count,
                     SUM(CAST("{self.target}" AS DOUBLE)) AS events,
                     '{combo_str}' AS combo_vars_str
-                FROM binned_df
-                GROUP BY {cols_str}
-                HAVING COUNT("{self.target}") >= {self.min_sample_size}
+                    FROM binned_df
+                    GROUP BY {cols_str}
+                    HAVING COUNT("{self.target}") >= {self.min_sample_size}
+                    AND SUM(CAST("{self.target}" AS DOUBLE)) >= {self.min_events}
             """
             queries.append(query)
 
@@ -239,7 +253,9 @@ class StrategicSegmentBuilder:
                 rate = (events / count) * 100.0 if count > 0 else 0
                 lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
                 
-                if lift >= self.min_lift:
+                # Require at least self.min_events events and lift > 1.0
+
+                if lift >= self.min_lift and events >= self.min_events and lift > 1.0:
                     valid_results.append({
                         "rule": rule,
                         "count": count,
@@ -272,25 +288,35 @@ class StrategicSegmentBuilder:
                 elif len(content.split(",")) > 2:
                     is_categorical = True
 
-            # 1. Categorical Set Handling
+# Robust Categorical Set Handling using AST Literal Parsing
             if is_categorical and bracket_match:
-                raw_items = [
-                    i.strip().strip("'").strip('"')
-                    for i in bracket_match.group(1).split(",")
-                    if i.strip()
-                ]
+                import ast
+                try:
+                    # Safely convert the string string-representation of a list e.g. "['A', 'B']" into an actual Python list
+                    raw_items = ast.literal_eval(bracket_match.group(0))
+                except Exception:
+                    # Fallback backup parsing if string structure is slightly malformed
+                    raw_items = [
+                        i.strip().strip("'").strip('"')
+                        for i in bracket_match.group(1).split(",")
+                        if i.strip()
+                    ]
+                
+                # If the item is a true string instance, wrap it in SQL quotes. Otherwise, treat it as a raw literal number.
                 formatted_items = ", ".join(
                     [
-                        item if self._is_numeric_string(item) else f"'{item}'"
+                        f"'{item}'" if isinstance(item, str) else str(item)
                         for item in raw_items
                     ]
                 )
-                sql_conditions.append(f"{col} IN ({formatted_items})")
+                
+                if formatted_items:
+                    sql_conditions.append(f'{col} IN ({formatted_items})')
                 continue
 
             # 2. Null/Special State Handling
             if interval in ["Special", "Missing"]:
-                sql_conditions.append(f"{col} IS NULL")
+                sql_conditions.append(f'{col} IS NULL')
                 continue
 
             # 3. Continuous Numeric Range Handling
@@ -301,11 +327,11 @@ class StrategicSegmentBuilder:
                 range_conds = []
                 if lower_str.lower() != "-inf":
                     op = ">=" if left_char == "[" else ">"
-                    range_conds.append(f"{col} {op} {lower_str}")
+                    range_conds.append(f'{col} {op} {lower_str}')
 
                 if upper_str.lower() != "inf":
                     op = "<=" if right_char == "]" else "<"
-                    range_conds.append(f"{col} {op} {upper_str}")
+                    range_conds.append(f'{col} {op} {upper_str}')
 
                 if range_conds:
                     sql_conditions.append(" AND ".join(range_conds))
@@ -319,6 +345,26 @@ class StrategicSegmentBuilder:
         while applying feature usage constraints to eliminate structural feature dominance.
         """
         con = duckdb.connect()
+        """Initializes the in-memory DuckDB connection, dynamically scaling resources."""
+        
+        
+        # 1. Dynamically calculate available CPU cores
+        # We leave a 2-core buffer for the OS / Python orchestration layer if cores > 4
+        total_cores = os.cpu_count() or 1
+        target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
+        
+        # 2. Dynamically calculate memory limit (in bytes)
+        # We allocate 50% of total system RAM to DuckDB, leaving a 50% safety cushion
+        total_memory_bytes = psutil.virtual_memory().total
+        target_memory_gb = int((total_memory_bytes * 0.5) / (1024 ** 3))
+        
+        # 3. Apply the settings dynamically to DuckDB
+        con.execute(f"SET threads = {target_threads};")
+        con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
+    
+        # Logger block to verify configurations in production logs
+        logger.info(f"DuckDB Configured: Threads={target_threads}/{total_cores}, MemoryLimit={target_memory_gb}GB")
+
         # DuckDB resolves local Python variables automatically (handles Pandas, Arrow, Dictionaries)
         con.execute("CREATE TABLE current_df AS SELECT * FROM data")
 
@@ -361,6 +407,40 @@ class StrategicSegmentBuilder:
 
             # 1. Recalculate Dynamic IV Ranking on residual portfolio population
             iv_ranking = self.compute_iv_ranking(con)
+
+            # --- START DIAGNOSTIC CAPTURE ---
+            # Map current dynamic IVs for quick lookup
+            current_iv_map = {row["variable"]: row["iv"] for row in iv_ranking}
+            
+            # Record status of every eligible column in this specific iteration
+            iteration_snapshot = {}
+            for col in eligible_cols:
+                used_count = self.feature_usage_counts.get(col, 0)
+                current_iv = current_iv_map.get(col, 0.0)
+                
+                # Determine eligibility status
+                if used_count >= self.max_feature_reuse:
+                    status = "Excluded (Max Feature Reuse Exceeded)"
+                elif col not in [r["variable"] for r in iv_ranking[:self.top_n_vars]]:
+                    status = "Excluded (Outside Top N Features by IV)"
+                else:
+                    status = "Eligible for Combination Search"
+                    
+                iteration_snapshot[col] = {
+                    "iv": current_iv,
+                    "times_used_previously": used_count,
+                    "status": status
+                }
+            
+            # Store the state metadata for this iteration
+            self.diagnostics_.append({
+                "iteration": i,
+                "residual_volume": current_volume,
+                "base_rate": base_rate,
+                "features_state": iteration_snapshot,
+                "winning_segment": None # Will fill this in at the end of the loop
+            })
+            # --- END DIAGNOSTIC CAPTURE ---
             
             # 2. Apply Dominance Constraints: Filter out exhausted features
             allowed_vars = [
@@ -377,7 +457,7 @@ class StrategicSegmentBuilder:
             
             valid_vars = []
             for v in top_vars:
-                distinct_count = con.execute(f'SELECT COUNT(DISTINCT "{v}") FROM binned_df').fetchone()[0]
+                distinct_count = con.execute(f'SELECT COUNT(DISTINCT {v}) FROM binned_df').fetchone()[0]
                 if distinct_count > 1:
                     valid_vars.append(v)
             
@@ -472,6 +552,18 @@ class StrategicSegmentBuilder:
 
             logger.info(f"Segment {i} Captured (Size Floor: {best_match['grid_min_sample_size']} | Lift Floor: {best_match['grid_min_lift']}): {best_sql}")
             
+
+            # ... (after establishing best_match and best_sql) ...
+
+            # Record the winning details into our diagnostics snapshot
+            self.diagnostics_[-1]["winning_segment"] = {
+                "rule": best_rule,
+                "sql_filter": best_sql,
+                "variables_used": list(winning_combo),
+                "lift": float(best_match["lift"]),
+                "count": int(best_match["count"])
+            }
+
             # Execute deletion directly on the view instead of copying dataframe slices back and forth
             con.execute(f"DELETE FROM current_df WHERE ({best_sql})")
 
@@ -521,6 +613,37 @@ class StrategicSegmentBuilder:
         res = con.execute(final_query)
         columns = [desc[0] for desc in res.description]
         return [dict(zip(columns, row)) for row in res.fetchall()]
+    
+    def explain_feature_journey(self, feature_name: str) -> None:
+        """Prints a detailed audit trail of a specific feature across all iterations."""
+        if not self.diagnostics_:
+            print("No diagnostic records found. Run extract_segments() first.")
+            return
+            
+        print("=" * 80)
+        print(f"AUDIT TRAIL FOR FEATURE: '{feature_name}'")
+        print("=" * 80)
+        
+        for record in self.diagnostics_:
+            iter_num = record["iteration"]
+            state = record["features_state"].get(feature_name)
+            winner = record["winning_segment"]
+            
+            if not state:
+                print(f"Iteration {iter_num}: Variable not present or was ignored.")
+                continue
+                
+            print(f"\n[Iteration {iter_num}]")
+            print(f"  • Current dynamic IV   : {state['iv']:.4f}")
+            print(f"  • Previous times used  : {state['times_used_previously']}")
+            print(f"  • Selection Status     : {state['status']}")
+            
+            if winner and feature_name in winner["variables_used"]:
+                print(f"  🎉 SELECTED as part of winning rule!")
+                print(f"     Rule: {winner['rule']}")
+            elif winner:
+                print(f"  • Winner this round    : {winner['rule']} (Variables: {winner['variables_used']})")
+        print("=" * 80)
 
 
 class StrategicSegmentScore:
@@ -649,13 +772,23 @@ class StrategicSegmentScore:
         logger.info(
             f"Calibrating deciles across {len(active_scores):,} target customers..."
         )
-        sorted_scores = np.sort(active_scores)[::-1]
+        # Sorts your scores in ascending order (lowest to highest). 
+        # The [::-1] syntax reverses that result, turning it into descending order (highest to lowest). 
+        sorted_scores = np.sort(active_scores)[::-1] 
+        # Simply counts how many customers are in this pool
         active_pop_size = len(sorted_scores)
 
         decile_thresholds: Dict[str, int] = {}
         for d in range(1, 11):
+            # This formula calculates exactly which row index represents the bottom boundary of the current decile.
+            # For example, for the 1st decile (d=1), it calculates the index that corresponds to the top 10% of the sorted scores.
+            # Converting to an integer keeps it as 2. Then we subtract 1: 2 - 1 = 1.
+            # Index 1 points to the 2nd item in a Python array (since Python counting starts at 0). This is exactly the last person in your first bucket!
             row_idx = int((d / 10.0) * active_pop_size) - 1
+            # This line is a safety net. It ensures that the calculated row_idx never accidentally breaks your code if your dataset is extremely small or has unusual dimensions.
             row_idx = max(0, min(active_pop_size - 1, row_idx))
+            # min(active_pop_size - 1, row_idx) makes sure the index never goes past the end of the array
+            # max(0, ...) makes sure the index never dips below 0.
             decile_thresholds[str(d)] = int(sorted_scores[row_idx])
 
         self.model_artifact = {

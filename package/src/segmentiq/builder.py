@@ -21,6 +21,13 @@ import duckdb
 import numpy as np
 from joblib import Parallel, delayed
 from optbinning import OptimalBinning
+from datetime import datetime
+
+# 1. Get current date and time
+now = datetime.now()
+
+# Example output: "2026_07_11_22_24_30"
+timestamp = now.strftime("%Y_%m_%d_%H_%M_%S")
 
 # Configure Production Module Logger
 logging.basicConfig(
@@ -311,7 +318,9 @@ class StrategicSegmentBuilder:
         while applying feature usage constraints to eliminate structural feature dominance.
         """
         # Memory Optimization: Use file-backed storage
-        con = duckdb.connect("scorecard_analytics.db")
+        if os.path.exists(f"experiment_{timestamp}.db"):
+            os.remove(f"experiment_{timestamp}.db")
+        con = duckdb.connect(f"experiment_{timestamp}.db")
         
         # 1. Dynamically calculate available CPU cores
         total_cores = os.cpu_count() or 1
@@ -327,7 +336,7 @@ class StrategicSegmentBuilder:
     
         logger.info(f"DuckDB Configured: Threads={target_threads}/{total_cores}, MemoryLimit={target_memory_gb}GB")
 
-        con.execute("CREATE TABLE current_df AS SELECT * FROM data")
+        con.execute("CREATE OR REPLACE TABLE current_df AS SELECT * FROM data")
 
         cols_info = con.execute("DESCRIBE current_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}
@@ -539,7 +548,7 @@ class StrategicSegmentBuilder:
         if not self.segments:
             return []
             
-        con = duckdb.connect("scorecard_analytics.db")
+        con = duckdb.connect(f"experiment_{timestamp}.db")
         con.execute("CREATE TABLE original_df AS SELECT * FROM original_data")
 
         case_statements = [

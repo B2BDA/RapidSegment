@@ -9,8 +9,17 @@ Python Version: 3.9+
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Union
 import duckdb
+from datetime import datetime
+
+# 1. Get current date and time
+now = datetime.now()
+
+# Example output: "2026_07_11_22_24_30"
+timestamp = now.strftime("%Y_%m_%d_%H_%M_%S")
+
 
 # Configure Production Module Logger
 logging.basicConfig(
@@ -35,13 +44,15 @@ class StrategicSegmentScore:
         self.model_artifact: Dict[str, Any] = {}
 
     def calculate_and_export_weights(
-        self, data: Any, export_path: str = "scorecard_model.json"
+        self, data: Any, export_path: str = f"scored_experiment_{timestamp}.json"
     ) -> Dict[str, Any]:
         """Calculates harmonic weights and derives decile boundaries via vectorized execution."""
         logger.info(f"Initializing out-of-core DuckDB scorecard engine...")
 
         # Memory Optimization: File-backed engine for 100M+ rows
-        ctx = duckdb.connect("scorecard_analytics.db")
+        if os.path.exists(f"score_experiment_{timestamp}.db"):
+            os.remove(f"score_experiment_{timestamp}.db")
+        ctx = duckdb.connect(f"score_experiment_{timestamp}.db")
         ctx.execute("CREATE OR REPLACE TABLE df AS SELECT * FROM data")
 
         # Step 1: Baseline metrics + Vectorized multi-segment aggregation (O(1) Scan)

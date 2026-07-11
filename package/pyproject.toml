@@ -1,0 +1,19 @@
+[project]
+name = "SegmentIQ"
+version = "1.0.0"
+authors = [
+  { name="Bishwarup Biswas", email="bishwarup1429@gmail.com" },
+]
+description = "A Python package for strategic segmentation and feature selection"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+[project.urls]
+Homepage = "https://github.com/B2BDA/Strategic_Segment_Builder"
+Issues = "https://github.com/B2BDA/Strategic_Segment_Builder/issues"

@@ -14,7 +14,7 @@ def test_pipeline():
     # 1. DATA LOADER: Generate Synthetic Data using PyArrow
     print("Step 1: Generating synthetic data via PyArrow...")
     np.random.seed(42)
-    n_records = 20000
+    n_records = 2000000
     
     # Generate dictionary of numpy arrays
     data_dict = {

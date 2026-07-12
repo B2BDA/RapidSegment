@@ -1,5 +1,5 @@
 [project]
-name = "segmentiq"
+name = "rapidsegment"
 version = "1.0.0"
 description = "A fast, multi-segment population scoring and combinatorial heuristic rule extraction engine."
 readme = "README.md"
@@ -35,5 +35,5 @@ license = "MIT"
 license-files = ["LICEN[CS]E*"]
 
 [project.urls]
-Homepage = "https://github.com/B2BDA/Strategic_Segment_Builder"
-Issues = "https://github.com/B2BDA/Strategic_Segment_Builder/issues"
+Homepage = "https://github.com/B2BDA/RapidSegment"
+Issues = "https://github.com/B2BDA/RapidSegment/issues"

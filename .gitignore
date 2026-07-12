@@ -3,3 +3,23 @@ __pycache__
 *.db.wal
 *.parquet
 .venv
+
+# Build and Distribution Artifacts
+dist/
+build/
+*.egg-info/
+
+# Virtual Environments (Local testing)
+.venv/
+venv/
+ENV/
+
+# Python Cache (Compiled bytecode)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Package Manager Locks & Temporary DBs (like your file-backed DuckDB storage)
+.uv/
+*.db

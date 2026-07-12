@@ -1,17 +1,28 @@
 # SegmentIQ - Strategic Segmentation & Scorecard Engine
 
-A high-performance, industrial-grade combinatorial heuristic engine and scoring framework for extracting highly predictive, mutually exclusive segments from tabular data and compiling them into optimized financial scorecards.
+> [!IMPORTANT]
+> **Legal Disclaimer**
+> This open-source software library (`segmentiq`) is an independent, community-driven predictive analytics framework. It is **completely unaffiliated, unrelated, and not associated** with any commercial products, software-as-a-service (SaaS) platforms, trademarks, or enterprise solutions of the same or similar name found on the internet or operated by other corporations. Any overlap in nomenclature is purely coincidental.
+
+SegmentIQ (pronounced: Segment-ick/Segment-iqu) A high-performance, industrial-grade combinatorial heuristic engine and scoring framework for extracting highly predictive, mutually exclusive segments from tabular data and compiling them into optimized financial scorecards.
 
 ---
 
 ## 1. Executive Summary
 
 ### WHAT is it?
-The **Strategic Segmentation & Scorecard Engine** is an automated framework designed to solve two core challenges in predictive analytics: discovering high-performing sub-populations (segments) within large feature spaces and compiling those segments into highly optimized, production-ready linear scoring models. 
 
-It is divided into two decoupled, synergistic modules:
+The **Strategic Segmentation & Scorecard Engine (SegmentIQ)** is an automated framework designed to solve core challenges in enterprise predictive analytics: discovering high-performing sub-populations (segments) within large feature spaces, executing high-throughput cloud feature screening, and compiling those segments into transparent, production-ready linear scoring models.
+
+It contains four decoupled, synergistic core components:
+
 1. **`StrategicSegmentBuilder`**: Searches feature combinations using an Apriori-inspired pruning technique and an exhaustive multi-threshold grid search to extract precise, non-overlapping rule conditions.
+
 2. **`StrategicSegmentScore`**: Converts those rules into a vectorized scoring model by computing harmonic feature weights, executing ultra-fast linear algebra transformations, calibrating decile distributions, and exporting the results into a lightweight JSON artifact.
+
+3. **`BigQueryFeatureSelector`**: Scales massive feature screening loops directly within Google BigQuery, evaluating Information Value (IV) and variation markers across billions of records before downloading data.
+
+4. **`UniversalDataLoader`**: Standardizes multi-format inputs (CSV, Parquet, Arrow, Excel, and BigQuery) into optimized in-memory structures compatible with vectorized down-stream compute engines.
 
 ### WHY do we need it?
 In risk management, fraud detection, and marketing analytics, engineering transparent models usually forces teams into a difficult trade-off:
@@ -191,7 +202,18 @@ Instead of short-circuiting early or requiring inputs to be sorted from highest 
 
 ## 5. Class Attributes & Parameter Reference
 
-### 1. `StrategicSegmentBuilder`
+### 1. `UniversalDataLoader`
+Standardizes multiple ingestion pathways into a uniform, memory-optimized PyArrow data frame abstraction.
+
+#### Initialization Parameters
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `project_id` | `str` | `None` | Google Cloud project location (for BigQuery streaming). |
+| `dataset_id` | `str` | `None` | Target BigQuery Dataset identifier. |
+| `table_id` | `str` | `None` | Target BigQuery Table identifier. |
+| `file_path` | `str` | `None` | Local folder system pointer path (`.csv`, `.parquet`, `.xlsx`, `.feather`). |
+
+### 2. `StrategicSegmentBuilder`
 
 #### Initialization Parameters
 | Parameter | Type | Default | Description |
@@ -200,6 +222,7 @@ Instead of short-circuiting early or requiring inputs to be sorted from highest 
 | `n_jobs` | `int` | `-1` | CPU threads for parallel processing. `-1` uses `available_cores - 1`. |
 | `min_sample_size` | `int` | `1000` | Absolute minimum record volume floor required to validate a rule. |
 | `min_lift` | `float` | `2.0` | Minimum lift cutoff value ($\text{Segment Rate} / \text{Base Rate}$). |
+| `min_events` | `float` | `5.0` | Absolute minimum event record volume floor required to validate a rule. |
 | `top_n_vars` | `int` | `20` | Total highest-IV features passed into the combinatorial engine. |
 | `max_segments` | `int` | `10` | Hard stopping ceiling for total extracted mutually exclusive segments. |
 | `max_feature_reuse` | `int` | `1` | Max times an individual feature can appear across all final rules. |
@@ -220,9 +243,12 @@ Instead of short-circuiting early or requiring inputs to be sorted from highest 
 * **`meta_applied_sample_size`**: The specific `min_sample_size` parameter that captured the winning rule.
 * **`meta_applied_min_lift`**: The specific `min_lift` parameter that captured the winning rule.
 
+#### Diagnostic & Audit Trail Methods
+**`explain_feature_journey(feature_name: str)`**: Prints an execution audit trail tracking the targeted feature across all execution loops. Details its dynamic IV, previous usage count, structural status flags (e.g., Excluded, Eligible), and whether it was adopted by a winning segment.
+
 ---
 
-### 2. `StrategicSegmentScore`
+### 3. `StrategicSegmentScore`
 
 #### Initialization Parameters
 | Parameter | Type | Description |
@@ -236,15 +262,33 @@ Instead of short-circuiting early or requiring inputs to be sorted from highest 
 * **`segment_weights`**: Nested dictionary mapping each column to its `weight`, `lift`, `response_rate`, and `capture_rate`.
 * **`decile_min_thresholds`**: Dictionary mapping decile levels (`"1"` to `"10"`) to their corresponding integer score cutoffs.
 
+### 4. `BigQueryFeatureSelector`
+Designed for enterprise-scale pre-screening loops. It calculates naive IV distributions and filters variance boundaries natively inside Google BigQuery to prevent local memory bottlenecks.
+
+#### Initialization Parameters
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `project_id` | `str` | `Required` | Google Cloud Platform Project identifier. |
+| `dataset_id` | `str` | `Required` | Target BigQuery Dataset namespace. |
+| `table_id` | `str` | `Required` | Target BigQuery Data Table identity string. |
+| `target_column` | `str` | `Required` | Dependent binary tracking variable (1 or 0). |
+| `iv_threshold` | `float` | `0.02` | Minimum Information Value needed to keep a feature. |
+| `stddev_threshold` | `float` | `1e-5` | Minimum standard deviation needed to prevent zero-variance processing. |
+| `min_bin_n_event` | `int` | `1` | Defensive baseline floor for positive items inside an individual bin. |
+| `bins` | `int` | `10` | Quantile groupings (NTILE) used to build numeric range limits. |
+| `batch_size` | `int` | `15` | Maximum number of column structures processed per BigQuery execution hit. |
+
+
+
 ## 6. Quick Start Guide
 
 This guide demonstrates an end-to-end analytical pipeline: extracting rules across a hyperparameter grid, evaluating cascading database coverage, generating binary indicator flags, and building an optimized scorecard.
 
 ```Python
-import num as np
+import numpy as np
 import pandas as pd
 import duckdb
-from SSB import StrategicSegmentBuilder, StrategicSegmentScore
+from segmentiq import StrategicSegmentBuilder, StrategicSegmentScore, UniversalDataLoader
 
 # 1. Generate Synthetic Tabular Transaction Pool for Verification
 np.random.seed(42)
@@ -297,13 +341,16 @@ segments_df = pd.DataFrame(segments_summary)
 print("\nExtracted Segment Profiles:")
 print(segments_df[["segment_id", "count", "lift", "meta_applied_sample_size", "sql_filter"]])
 
+# [Diagnostic Step] Print audit trail for a key feature
+builder.explain_feature_journey("max_dpd_12m")
+
 # 5. Review Cascading Portfolio Coverage Analysis Report
 coverage_report = builder.evaluate_final_coverage(data)
 print("\nCascading Portfolio Coverage Analysis:")
 print(pd.DataFrame(coverage_report))
 
 # 6. Prepare Binary Array Representation for Scorecard Tuning
-scoring_df = data[["cust_id", "default_flag"]].co()
+scoring_df = data[["cust_id", "default_flag"]].copy()
 
 # Map SQL filters to binary columns (1 = matches rule, 0 = otherwise)
 segment_columns = []

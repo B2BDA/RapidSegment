@@ -158,7 +158,7 @@ class StrategicSegmentBuilder:
                 # FIX: Thread-safe cursor implementation to prevent connection corruption
                 thread_con = con.cursor()
                 data_dict = thread_con.execute(f'SELECT "{col}", "{self.target}" FROM current_df').fetchnumpy()
-		col_arr = data_dict[col]
+                col_arr = data_dict[col]
                 target_arr = data_dict[self.target]
                 dtype = self._resolve_optb_dtype(columns_types[col])
                 

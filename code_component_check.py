@@ -74,7 +74,7 @@ if __name__ == "__main__":
         n_jobs=-1,              # Enforce maximum multi-core processing
         min_sample_size=1000,    # Top-level global floor requirement
         min_lift=2.0,
-        min_events=20,
+        min_events=1000,
         top_n_vars=5,
         max_segments=5,
         param_grid={

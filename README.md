@@ -450,3 +450,7 @@ This indicates that your segment rules are too strict and lack generalizability.
 
 No. The feature will be dropped by Optbinning during segment creation steps.
 Furthermore, if you are using `BigQueryFeatureSelector` the feature IV will be marked as 0 and not considered. 
+
+### 5. I am getting this error "BinderException: Binder Error: No function matches the given name and argument types 'avg(VARCHAR)'. You might need to add explicit type casts.".
+Make sure your target variable is one hot encoded.
+

@@ -1,6 +1,11 @@
+
 > [!IMPORTANT]
 > **Legal Disclaimer**
 > This open-source software library (`RapidSegment`) is an independent, community-driven predictive analytics framework. It is **completely unaffiliated, unrelated, and not associated** with any commercial products, software-as-a-service (SaaS) platforms, trademarks, or enterprise solutions of the same or similar name found on the internet or operated by other corporations. Any overlap in nomenclature is purely coincidental.
+
+<p align="center">
+<img width="500" height="300" alt="ChatGPT Image Jul 15, 2026, 08_33_50 PM" src="https://github.com/user-attachments/assets/0d06b429-aa61-4730-9f40-90ee4f0805c5" />
+</p>
 
 # RapidSegment - Strategic Segmentation & Scorecard Engine
 

@@ -329,6 +329,10 @@ class StrategicSegmentBuilder:
         """Sequentially extracts high-lift segments using an iterative Multi-Threshold Grid Search 
         while applying feature usage constraints to eliminate structural feature dominance.
         """
+        # Cache true global hard floors before the grid sweeps alter them
+        abs_min_sample_size = self.min_sample_size
+        abs_min_events = self.min_events
+
         # Memory Optimization: Use file-backed storage
         if os.path.exists(f"experiment_{timestamp}.db"):
             os.remove(f"experiment_{timestamp}.db")
@@ -511,7 +515,19 @@ class StrategicSegmentBuilder:
             # FIX: Sorted primarily by volume to ensure high-lift, ultra-low-sample subsets don't override robust sets.
             grid_candidates.sort(key=lambda x: (x["count"], x["lift"], x["rate"]), reverse=True)
             best_match = grid_candidates[0]
-            
+            # ==================================================================
+            # 🛑 ABSOLUTE SAFETY GATE
+            # ==================================================================
+            # If a micro-config (like size=10) games the system and wins the grid selection,
+            # this check forcefully catches it and drops the execution line here.
+            if best_match["count"] < abs_min_sample_size or best_match["events"] < abs_min_events:
+                logger.warning(
+                    f"Iteration {i} | Winning candidate rejected by absolute safety gate. "
+                    f"Required >= {abs_min_sample_size} rows and >= {abs_min_events} events. "
+                    f"Got {best_match['count']:,} rows and {best_match['events']} events instead. Halting."
+                )
+                break
+            # ==================================================================
             best_rule = best_match["rule"]
             best_sql = self.parse_rule_to_sql(best_rule)
             winning_combo = best_match["combo_vars"]
@@ -553,6 +569,10 @@ class StrategicSegmentBuilder:
             con.execute("DROP TABLE current_df")
             con.execute("ALTER TABLE temp_residual RENAME TO current_df")
 
+        # 🟢 CLEANUP: Restore the original configuration values back to the instance
+        self.min_sample_size = abs_min_sample_size
+        self.min_events = abs_min_events
+        
         con.close()
         return self.segments    
 

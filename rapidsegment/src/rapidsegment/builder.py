@@ -578,27 +578,55 @@ class StrategicSegmentBuilder:
         return self.segments    
 
     def evaluate_final_coverage(self, original_data: Any) -> List[Dict[str, Any]]:
-        """Executes a full CASE WHEN query over the source dataset to map mutually exclusive coverage."""
+        """Executes a full CASE WHEN query over a dynamically coalesced view of the source dataset."""
         if not self.segments:
             return []
             
         con = duckdb.connect(f"experiment_{timestamp}.db")
         con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM original_data")
 
+        # 1. Fetch data types of original_df to determine correct coalescing behavior
+        cols_info = con.execute("DESCRIBE original_df").fetchall()
+        original_column_types = {row[0]: row[1] for row in cols_info}
+
+        # 2. Build the SELECT expression list dynamically
+        coalesce_exprs = []
+        for col, col_type in original_column_types.items():
+            # Keep target column clean to avoid altering metrics
+            if col == self.target:
+                coalesce_exprs.append(f'"{col}"')
+                continue
+                
+            col_type_upper = col_type.upper()
+            is_numeric = any(t in col_type_upper for t in ["INT", "DOUBLE", "FLOAT", "DECIMAL", "NUMERIC", "REAL", "TINYINT", "SMALLINT", "BIGINT", "HUGEINT"])
+            
+            if is_numeric:
+                coalesce_exprs.append(f'COALESCE("{col}", 0) AS "{col}"')
+            else:
+                coalesce_exprs.append(f'COALESCE("{col}", \'Missing\') AS "{col}"')
+                
+        coalesce_select = ", ".join(coalesce_exprs)
+
+        # 3. Piece together the CASE WHEN rules
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
             for seg in self.segments
         ]
         case_sql = "\n                ".join(case_statements)
 
+        # 4. Evaluate rules against clean_df to align counts perfectly
         final_query = f"""
-        WITH PER_SEG_KPIS AS (
+        WITH clean_df AS (
+            SELECT {coalesce_select}
+            FROM original_df
+        ),
+        PER_SEG_KPIS AS (
             SELECT 
                 CASE {case_sql} ELSE 0 END AS segment, 
                 COUNT(*) AS total_count,
                 SUM(CAST("{self.target}" AS DOUBLE)) AS target_events,
                 (SUM(CAST("{self.target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
-            FROM original_df
+            FROM clean_df
             GROUP BY 1
         ),
         BASE_KPIS AS (
@@ -617,10 +645,8 @@ class StrategicSegmentBuilder:
         ORDER BY segment
         """
         
-        # Native return as a List of Dictionaries
         res = con.execute(final_query)
         columns = [desc[0] for desc in res.description]
-        # Make sure to close connection before returning
         res_list = [dict(zip(columns, row)) for row in res.fetchall()]
         con.close()
         return res_list
@@ -655,5 +681,4 @@ class StrategicSegmentBuilder:
             elif winner:
                 print(f"  • Winner this round    : {winner['rule']} (Variables: {winner['variables_used']})")
         print("=" * 80)
-
 

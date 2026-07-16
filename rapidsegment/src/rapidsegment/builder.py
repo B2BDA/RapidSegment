@@ -50,8 +50,10 @@ class StrategicSegmentBuilder:
     Attributes:
         target: Dependent binary target column name (1 = Event, 0 = Non-Event).
         n_jobs: Number of CPU cores allocated to parallelized search jobs.
-        min_sample_size: Absolute minimum row count required for a valid rule (fallback default).
+        min_sample_size: Absolute minimum row count required for a valid rule (fallback default). 
+        Set this value carefully as it will be checked during rule shortlisting to make sure min_sample_size is not violated.
         min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate) (fallback default).
+        Set this value carefully as it will be checked during rule shortlisting to make sure min_sample_size is not violated.
         min_events: Minimum number of positive events required for a valid rule (fallback default).
         top_n_vars: Number of highest-IV features passed into the Apriori engine.
         max_segments: Hard stopping ceiling for extracted mutually exclusive segments.

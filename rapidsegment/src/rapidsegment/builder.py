@@ -48,23 +48,21 @@ class StrategicSegmentBuilder:
     to surface multi-way rules meeting defined Lift and Volume thresholds.
 
     Attributes:
-        target: Dependent binary target column name (1 = Event, 0 = Non-Event).
-        n_jobs: Number of CPU cores allocated to parallelized search jobs.
-        min_sample_size: Absolute minimum row count required for a valid rule (fallback default). 
-        Set this value carefully as it will be checked during rule shortlisting to make sure min_sample_size is not violated.
-        min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate) (fallback default).
-        Set this value carefully as it will be checked during rule shortlisting to make sure min_sample_size is not violated.
-        min_events: Minimum number of positive events required for a valid rule (fallback default).
-        top_n_vars: Number of highest-IV features passed into the Apriori engine.
-        max_segments: Hard stopping ceiling for extracted mutually exclusive segments.
-        max_feature_reuse: Structural limit for tracking and restricting feature dominance.
-        param_grid: Optional dictionary of parameter grid search values for min_sample_size and min_lift.
-        enable_diversity: If True, blocks rules combining variables from the same business group.
-        enable_1way: Allow 1-dimensional rules in final pool.
-        enable_2way: Allow 2-dimensional intersection rules in final pool.
-        enable_3way: Allow 3-dimensional intersection rules in final pool.
-        feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
-        ignore_features: Explicit list of columns to drop prior to IV calculation.
+        **target**: Dependent binary target column name (1 = Event, 0 = Non-Event).
+        **n_jobs**: Number of CPU cores allocated to parallelized search jobs.
+        **min_sample_size**: Absolute minimum row count required for a valid rule (fallback default). Set this value carefully as it will be checked during rule shortlisting to make sure min_sample_size is not violated.
+        **min_lift**: Minimum lift cutoff (Segment Rate / Population Base Rate) (fallback default). Set this value carefully as it will be checked during rule shortlisting to make sure min_sample_size is not violated.
+        **min_events**: Minimum number of positive events required for a valid rule (fallback default).
+        **top_n_vars**: Number of highest-IV features passed into the Apriori engine.
+        **max_segments**: Hard stopping ceiling for extracted mutually exclusive segments.
+        **max_feature_reuse**: Structural limit for tracking and restricting feature dominance.
+        **param_grid**: Optional dictionary of parameter grid search values for min_sample_size and min_lift.
+        **enable_diversity**: If True, blocks rules combining variables from the same business group.
+        **enable_1way**: Allow 1-dimensional rules in final pool.
+        **enable_2way**: Allow 2-dimensional intersection rules in final pool.
+        **enable_3way**: Allow 3-dimensional intersection rules in final pool.
+        **feature_groups**: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
+        **ignore_features**: Explicit list of columns to drop prior to IV calculation.
     """
 
     def __init__(

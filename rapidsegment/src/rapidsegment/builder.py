@@ -583,7 +583,7 @@ class StrategicSegmentBuilder:
             return []
             
         con = duckdb.connect(f"experiment_{timestamp}.db")
-        con.execute("CREATE TABLE original_df AS SELECT * FROM original_data")
+        con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM original_data")
 
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"

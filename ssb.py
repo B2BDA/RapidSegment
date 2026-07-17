@@ -1,7 +1,7 @@
 """
-Strategic Segmentation & Scorecard Engine
+Strategic Segmentation Engine
 =========================================
-Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning, 
+Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning,
 and vectorized DuckDB scorecard deciling.
 
 Author: Bishwarup Biswas + Gemini
@@ -21,6 +21,11 @@ import duckdb
 import numpy as np
 from joblib import Parallel, delayed
 from optbinning import OptimalBinning
+from datetime import datetime
+
+# 1. Get current date and time
+now = datetime.now()
+timestamp = now.strftime("%Y_%m_%d_%H_%M_%S")
 
 # Configure Production Module Logger
 logging.basicConfig(
@@ -30,32 +35,22 @@ logging.basicConfig(
 logger = logging.getLogger("StrategicEngine")
 
 # Pre-compile regex at module load for O(1) lookup inside loops
-_BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags = re.DOTALL)
+_BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags=re.DOTALL)
 
 
 class StrategicSegmentBuilder:
-    """Extracts mutually exclusive, predictive segments from tabular data.
+    """
+    Extracts hierarchical, predictive segments from tabular data.
 
-    Utilizes Optimal Binning to discretize continuous features into monotonic
-    Information Value (IV) bins, applying an Apriori-style combinatorial prune
-    to surface multi-way rules meeting defined Lift and Volume thresholds.
+    The extraction is sequential: at each step, the best rule (by lift and volume)
+    is found on the current residual dataset. The rule is then applied to remove
+    those rows before the next iteration. The final segmentation is hierarchical:
+    the first rule has highest priority, the second rule applies to the remainder,
+    and so on.
 
-    Attributes:
-        target: Dependent binary target column name (1 = Event, 0 = Non-Event).
-        n_jobs: Number of CPU cores allocated to parallelized search jobs.
-        min_sample_size: Absolute minimum row count required for a valid rule (fallback default).
-        min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate) (fallback default).
-        min_events: Minimum number of positive events required for a valid rule (fallback default).
-        top_n_vars: Number of highest-IV features passed into the Apriori engine.
-        max_segments: Hard stopping ceiling for extracted mutually exclusive segments.
-        max_feature_reuse: Structural limit for tracking and restricting feature dominance.
-        param_grid: Optional dictionary of parameter grid search values for min_sample_size and min_lift.
-        enable_diversity: If True, blocks rules combining variables from the same business group.
-        enable_1way: Allow 1-dimensional rules in final pool.
-        enable_2way: Allow 2-dimensional intersection rules in final pool.
-        enable_3way: Allow 3-dimensional intersection rules in final pool.
-        feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
-        ignore_features: Explicit list of columns to drop prior to IV calculation.
+    The `extract_segments()` method returns segments whose counts reflect the
+    final hierarchical assignment on the original dataset, exactly matching the
+    output of `evaluate_final_coverage()`.
     """
 
     def __init__(
@@ -95,6 +90,8 @@ class StrategicSegmentBuilder:
         self.feature_groups = feature_groups or {}
         self.ignore_features = ignore_features or []
         self.feature_usage_counts: Dict[str, int] = {}
+        # Diagnostic repository
+        self.diagnostics_: List[Dict[str, Any]] = []
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -103,15 +100,6 @@ class StrategicSegmentBuilder:
         if any(t in dtype_upper for t in ["VARCHAR", "CHAR", "STRING", "TEXT", "UUID"]):
             return "categorical"
         return "numerical"
-
-    @staticmethod
-    def _is_numeric_string(val: str) -> bool:
-        """Safely evaluates if a raw string represents a float/int (handles scientific notation)."""
-        try:
-            float(val)
-            return True
-        except ValueError:
-            return False   
 
     def _validate_feature_groups(self, columns: List[str]) -> None:
         """Validates that all declared feature group variables exist in the target dataset."""
@@ -148,19 +136,15 @@ class StrategicSegmentBuilder:
         groups = [self.get_group(v) for v in combo]
         return len(groups) == len(set(groups))
 
-    def compute_iv_ranking(self, con: duckdb.DuckDBPyConnection) -> List[Dict[str, Union[str, float]]]:
-        """Calculates Information Value (IV) for all eligible features using natively fetched numpy arrays."""
+    def compute_iv_ranking_and_bin(
+        self, con: duckdb.DuckDBPyConnection, eligible_cols: List[str], columns_types: Dict[str, str]
+    ) -> Tuple[List[Dict[str, Union[str, float]]], Dict[str, np.ndarray]]:
+        """Calculates Information Value (IV) and returns pre-computed bins in a single pass."""
         
-        cols_info = con.execute("DESCRIBE current_df").fetchall()
-        columns_types = {row[0]: row[1] for row in cols_info}
-        eligible_cols = [c for c in columns_types.keys() if c != self.target and c not in self.ignore_features]
-
-
-
-        def _worker(col: str) -> Dict[str, Union[str, float]]:
+        def _worker(col: str) -> Tuple[str, float, Optional[np.ndarray]]:
             try:
-                # Fetch dictionary of flat NumPy arrays for fast, zero-copy serialization across joblib workers
-                data_dict = con.execute(f'SELECT "{col}", "{self.target}" FROM current_df').fetchnumpy()
+                thread_con = con.cursor()
+                data_dict = thread_con.execute(f'SELECT "{col}", "{self.target}" FROM current_df').fetchnumpy()
                 col_arr = data_dict[col]
                 target_arr = data_dict[self.target]
                 dtype = self._resolve_optb_dtype(columns_types[col])
@@ -168,46 +152,28 @@ class StrategicSegmentBuilder:
                 optb = OptimalBinning(name=col, dtype=dtype)
                 optb.fit(col_arr, target_arr)
                 
-                # Extract IV value directly without needing a pandas import in this file
                 iv_val = optb.binning_table.build()["IV"].values[-1]
-                return {"variable": col, "iv": float(iv_val) * 100}
+                transformed_bins = optb.transform(col_arr, metric="bins").astype(str)
+                
+                thread_con.close()
+                return col, float(iv_val) * 100, transformed_bins
             except Exception as e:
                 logger.debug(f"IV computation failed for {col}: {e}")
-                return {"variable": col, "iv": 0.0}
+                return col, 0.0, None
 
         results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
         )
         
-        return sorted(results, key=lambda x: x["iv"], reverse=True)
-
-    def create_binned_table(self, con: duckdb.DuckDBPyConnection, variables: List[str]) -> None:
-        """Transforms continuous data into discrete optimal binned strings natively mapped in DuckDB."""
-        # 1. Create a specific list of just the target and the top variables
-        query_cols = [self.target] + variables
-        cols_str = ", ".join([f'"{c}"' for c in query_cols])
-        
-        # 2. Fetch ONLY the needed columns, drastically reducing the RAM footprint
-        data_dict = con.execute(f"SELECT {cols_str} FROM current_df").fetchnumpy()
-        binned_data = {self.target: data_dict[self.target]}
-        
-        cols_info = con.execute("DESCRIBE current_df").fetchall()
-        columns_types = {row[0]: row[1] for row in cols_info}
-
-        for col in variables:
-            col_arr = data_dict[col]
-            target_arr = data_dict[self.target]
-            dtype = self._resolve_optb_dtype(columns_types[col])
-            
-            optb = OptimalBinning(name=col, dtype=dtype)
-            optb.fit(col_arr, target_arr)
-
-            transformed_bins = optb.transform(col_arr, metric="bins")
-            binned_data[col] = transformed_bins.astype(str)
-
-        # DuckDB resolves local dictionary variables automatically
-        con.execute("DROP TABLE IF EXISTS binned_df")
-        con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
+        ranking = []
+        precomputed_bins = {}
+        for col, iv, bins in results:
+            ranking.append({"variable": col, "iv": iv})
+            if bins is not None:
+                precomputed_bins[col] = bins
+                
+        ranking.sort(key=lambda x: x["iv"], reverse=True)
+        return ranking, precomputed_bins
 
     def _agg_combinations(
         self,
@@ -239,9 +205,8 @@ class StrategicSegmentBuilder:
             queries.append(query)
 
         valid_results = []
-        chunk_size = 50
+        chunk_size = 100
         
-        # Batch execute independent group bys natively in C++ via UNION ALL
         for i in range(0, len(queries), chunk_size):
             chunk = queries[i:i+chunk_size]
             union_query = " UNION ALL ".join(chunk)
@@ -251,14 +216,13 @@ class StrategicSegmentBuilder:
                 rate = (events / count) * 100.0 if count > 0 else 0
                 lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
                 
-                # Require at least self.min_events events and lift > 1.0
-
                 if lift >= self.min_lift and events >= self.min_events and lift > 1.0:
                     valid_results.append({
                         "rule": rule,
                         "count": count,
                         "rate": rate,
                         "lift": lift,
+                        "events": events,
                         "combo_vars": tuple(combo_vars_str.split(","))
                     })
 
@@ -286,21 +250,23 @@ class StrategicSegmentBuilder:
                 elif len(content.split(",")) > 2:
                     is_categorical = True
 
-# Robust Categorical Set Handling using AST Literal Parsing
             if is_categorical and bracket_match:
                 import ast
                 try:
-                    # Safely convert the string string-representation of a list e.g. "['A', 'B']" into an actual Python list
                     raw_items = ast.literal_eval(bracket_match.group(0))
                 except Exception:
-                    # Fallback backup parsing if string structure is slightly malformed
+                    raw_content = bracket_match.group(1)
+                    if "," not in raw_content:
+                        raw_content = re.sub(r"'\s+'", "','", raw_content)
+                        raw_content = re.sub(r'"\s+"', '","', raw_content)
+                        raw_content = re.sub(r'\s+', ',', raw_content)
+                        
                     raw_items = [
                         i.strip().strip("'").strip('"')
-                        for i in bracket_match.group(1).split(",")
+                        for i in raw_content.split(",")
                         if i.strip()
                     ]
                 
-                # If the item is a true string instance, wrap it in SQL quotes. Otherwise, treat it as a raw literal number.
                 formatted_items = ", ".join(
                     [
                         f"'{item}'" if isinstance(item, str) else str(item)
@@ -309,15 +275,13 @@ class StrategicSegmentBuilder:
                 )
                 
                 if formatted_items:
-                    sql_conditions.append(f'{col} IN ({formatted_items})')
+                    sql_conditions.append(f"{col} IN ({formatted_items})")
                 continue
 
-            # 2. Null/Special State Handling
             if interval in ["Special", "Missing"]:
-                sql_conditions.append(f'{col} IS NULL')
+                sql_conditions.append(f"{col} IS NULL")
                 continue
 
-            # 3. Continuous Numeric Range Handling
             if interval.startswith(("[", "(")):
                 left_char, right_char = interval[0], interval[-1]
                 lower_str, upper_str = [x.strip() for x in interval[1:-1].split(",", 1)]
@@ -325,11 +289,11 @@ class StrategicSegmentBuilder:
                 range_conds = []
                 if lower_str.lower() != "-inf":
                     op = ">=" if left_char == "[" else ">"
-                    range_conds.append(f'{col} {op} {lower_str}')
+                    range_conds.append(f"{col} {op} {lower_str}")
 
                 if upper_str.lower() != "inf":
                     op = "<=" if right_char == "]" else "<"
-                    range_conds.append(f'{col} {op} {upper_str}')
+                    range_conds.append(f"{col} {op} {upper_str}")
 
                 if range_conds:
                     sql_conditions.append(" AND ".join(range_conds))
@@ -339,48 +303,44 @@ class StrategicSegmentBuilder:
         )
 
     def extract_segments(self, data: Any) -> List[Dict[str, Any]]:
-        """Sequentially extracts high-lift segments using an iterative Multi-Threshold Grid Search 
-        while applying feature usage constraints to eliminate structural feature dominance.
         """
-        con = duckdb.connect()
-        """Initializes the in-memory DuckDB connection, dynamically scaling resources."""
+        Sequentially extracts high‑lift rules on the residual dataset.
+
+        After extraction, the stored counts are updated to reflect the final
+        hierarchical segmentation on the original dataset, ensuring consistency
+        with `evaluate_final_coverage()`.
+        """
+        # Cache absolute hard constraints
+        abs_min_sample_size = self.min_sample_size
+        abs_min_events = self.min_events
+
+        # Use file‑backed storage for performance
+        if os.path.exists(f"experiment_{timestamp}.db"):
+            os.remove(f"experiment_{timestamp}.db")
+        con = duckdb.connect(f"experiment_{timestamp}.db")
         
-        
-        # 1. Dynamically calculate available CPU cores
-        # We leave a 2-core buffer for the OS / Python orchestration layer if cores > 4
         total_cores = os.cpu_count() or 1
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
-        
-        # 2. Dynamically calculate memory limit (in bytes)
-        # We allocate 50% of total system RAM to DuckDB, leaving a 50% safety cushion
         total_memory_bytes = psutil.virtual_memory().total
         target_memory_gb = int((total_memory_bytes * 0.5) / (1024 ** 3))
         
-        # 3. Apply the settings dynamically to DuckDB
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
-    
-        # Logger block to verify configurations in production logs
         logger.info(f"DuckDB Configured: Threads={target_threads}/{total_cores}, MemoryLimit={target_memory_gb}GB")
 
-        # DuckDB resolves local Python variables automatically (handles Pandas, Arrow, Dictionaries)
-        con.execute("CREATE TABLE current_df AS SELECT * FROM data")
+        con.execute("CREATE OR REPLACE TABLE current_df AS SELECT * FROM data")
 
         cols_info = con.execute("DESCRIBE current_df").fetchall()
-        all_cols = [row[0] for row in cols_info]
+        columns_types = {row[0]: row[1] for row in cols_info}
+        all_cols = list(columns_types.keys())
 
         if self.enable_diversity:
             self._validate_feature_groups(all_cols)
 
-        # Initialize global tracking map for tracking structural dominance
         eligible_cols = [c for c in all_cols if c != self.target and c not in self.ignore_features]
         self.feature_usage_counts = {col: 0 for col in eligible_cols}
         
-        # Build dynamic grid search boundaries
         if self.param_grid:
-            logger.info(
-                f"Dynamic Grid Search Enabled: {len(self.param_grid.get('min_sample_size', [self.min_sample_size])) * len(self.param_grid.get('min_lift', [self.min_lift]))} total configurations."
-            )
             sizes = self.param_grid.get("min_sample_size", [self.min_sample_size])
             lifts = self.param_grid.get("min_lift", [self.min_lift])
             experiments = [
@@ -397,49 +357,74 @@ class StrategicSegmentBuilder:
             min_floor_volume = min(exp["min_sample_size"] for exp in experiments)
             
             if base_rate == 0 or current_volume < min_floor_volume:
+                logger.info(f"Stopping: base_rate={base_rate}, volume={current_volume} < min_floor={min_floor_volume}")
                 break
 
             logger.info(
                 f"Iteration {i} | Remaining Volume: {current_volume:,} | Base Rate: {base_rate*100:.2f}%"
             )
 
-            # 1. Recalculate Dynamic IV Ranking on residual portfolio population
-            iv_ranking = self.compute_iv_ranking(con)
-            
-            # 2. Apply Dominance Constraints: Filter out exhausted features
+            iv_ranking, precomputed_bins = self.compute_iv_ranking_and_bin(con, eligible_cols, columns_types)
+
+            # Diagnostic capture
+            current_iv_map = {row["variable"]: row["iv"] for row in iv_ranking}
+            top_n_variable_names = [r["variable"] for r in iv_ranking[:self.top_n_vars]]
+            iteration_snapshot = {}
+            for col in eligible_cols:
+                used_count = self.feature_usage_counts.get(col, 0)
+                current_iv = current_iv_map.get(col, 0.0)
+                if used_count >= self.max_feature_reuse:
+                    status = "Excluded (Max Feature Reuse Exceeded)"
+                elif current_iv <= 0.0:
+                    status = "Excluded (Information Value is Zero/Invalid)"
+                elif col not in top_n_variable_names:
+                    status = "Excluded (Outside Top N Features by IV)"
+                else:
+                    status = "Eligible for Combination Search"
+                iteration_snapshot[col] = {
+                    "iv": current_iv,
+                    "times_used_previously": used_count,
+                    "status": status
+                }
+            self.diagnostics_.append({
+                "iteration": i,
+                "residual_volume": current_volume,
+                "base_rate": base_rate,
+                "features_state": iteration_snapshot,
+                "winning_segment": None
+            })
+
             allowed_vars = [
                 row["variable"] for row in iv_ranking
                 if self.feature_usage_counts.get(row["variable"], 0) < self.max_feature_reuse
             ]
-            
             top_vars = allowed_vars[:self.top_n_vars]
             if not top_vars:
-                logger.warning("All eligible features have been exhausted via max_feature_reuse filters. Aborting.")
+                logger.warning("All eligible features exhausted. Aborting.")
                 break
 
-            self.create_binned_table(con, top_vars)
-            
+            binned_data = {self.target: con.execute(f'SELECT "{self.target}" FROM current_df').fetchnumpy()[self.target]}
             valid_vars = []
             for v in top_vars:
-                distinct_count = con.execute(f'SELECT COUNT(DISTINCT {v}) FROM binned_df').fetchone()[0]
-                if distinct_count > 1:
+                if v in precomputed_bins and len(np.unique(precomputed_bins[v])) > 1:
+                    binned_data[v] = precomputed_bins[v]
                     valid_vars.append(v)
+            if not valid_vars:
+                logger.warning("No valid binned variables found. Stopping.")
+                break
+
+            con.execute("DROP TABLE IF EXISTS binned_df")
+            con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
             
             grid_candidates: List[Dict[str, Any]] = []
-
-            # 3. Parameter Matrix Grid Sweep
             for config in experiments:
                 self.min_sample_size = config["min_sample_size"]
                 self.min_lift = config["min_lift"]
 
                 all_rules: List[Dict[str, Any]] = []
 
-                # Apriori Level 1 (Singles)
-                res_1 = self._agg_combinations(
-                    con, [(c,) for c in valid_vars], base_rate
-                )
+                res_1 = self._agg_combinations(con, [(c,) for c in valid_vars], base_rate)
                 valid_1way_vars = set()
-
                 if res_1:
                     valid_1way_vars = {c["combo_vars"][0] for c in res_1}
                     if self.enable_1way:
@@ -448,7 +433,6 @@ class StrategicSegmentBuilder:
                 if not valid_1way_vars:
                     continue
 
-                # Apriori Level 2 (Pairs)
                 valid_2way_sets = set()
                 if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
                     combos_2 = [
@@ -461,7 +445,6 @@ class StrategicSegmentBuilder:
                             if self.enable_2way:
                                 all_rules.extend(res_2)
 
-                # Apriori Level 3 (Triplets)
                 if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
                     combos_3 = [
                         c
@@ -477,58 +460,141 @@ class StrategicSegmentBuilder:
                             all_rules.extend(res_3)
 
                 if all_rules:
-                    # Sort candidates down natively in python to avoid DataFrame serialization overhead
-                    all_rules.sort(key=lambda x: (x["lift"], x["rate"], x["count"]), reverse=True)
+                    all_rules.sort(key=lambda x: (x["lift"], x["count"], x["rate"]), reverse=True)
                     top_match = all_rules[0].copy()
                     top_match["grid_min_sample_size"] = config["min_sample_size"]
                     top_match["grid_min_lift"] = config["min_lift"]
                     grid_candidates.append(top_match)
 
             if not grid_candidates:
-                logger.info("No active candidates cleared criteria pool across grid variations. Stopping.")
+                logger.info("No candidates cleared the grid. Stopping.")
                 break
 
-            # 4. Resolve Championship Rule Across Parameter Configuration Grid Result Sets
             grid_candidates.sort(key=lambda x: (x["lift"], x["count"], x["rate"]), reverse=True)
-            best_match = grid_candidates[0]
             
-            best_rule = best_match["rule"]
-            best_sql = self.parse_rule_to_sql(best_rule)
-            winning_combo = best_match["combo_vars"]
+            selected_candidate = None
+            for candidate in grid_candidates:
+                rule_str = candidate["rule"]
+                sql_filter = self.parse_rule_to_sql(rule_str)
+                # Validate on raw current_df (residual)
+                actual = con.execute(
+                    f'SELECT COUNT(*) AS cnt, SUM(CAST("{self.target}" AS DOUBLE)) AS evt '
+                    f'FROM current_df WHERE ({sql_filter})'
+                ).fetchone()
+                actual_cnt, actual_evt = actual[0], actual[1] or 0
 
-            # 5. Commit Feature Adoption and Increment Dominance Counter State
+                if actual_cnt >= abs_min_sample_size and actual_evt >= abs_min_events:
+                    selected_candidate = {
+                        **candidate,
+                        "sql_filter": sql_filter,
+                        "actual_count": actual_cnt,
+                        "actual_events": actual_evt,
+                    }
+                    break
+                else:
+                    logger.debug(
+                        f"Candidate rejected by raw validation: {rule_str} -> "
+                        f"rows={actual_cnt}, events={actual_evt}"
+                    )
+
+            if selected_candidate is None:
+                logger.warning(f"Iteration {i}: No candidate passed hard constraints. Stopping.")
+                break
+
+            best_rule = selected_candidate["rule"]
+            best_raw_sql = selected_candidate["sql_filter"]
+            winning_combo = selected_candidate["combo_vars"]
+
+            # Compute metrics from the residual counts
+            actual_rate = (selected_candidate["actual_events"] / selected_candidate["actual_count"]) * 100.0
+            actual_lift = actual_rate / (base_rate * 100.0) if base_rate > 0 else 0.0
+
             for var in winning_combo:
                 self.feature_usage_counts[var] = self.feature_usage_counts.get(var, 0) + 1
                 logger.info(f"Feature Usage Tracker Update -> '{var}' used count = {self.feature_usage_counts[var]}")
 
+            # Store the raw rule and raw SQL (no exclusions)
             self.segments.append(
                 {
                     "segment_id": i,
                     "rule_string": best_rule,
-                    "sql_filter": best_sql,
-                    "count": int(best_match["count"]),
-                    "rate": float(best_match["rate"]),
-                    "lift": float(best_match["lift"]),
-                    "meta_applied_sample_size": int(best_match["grid_min_sample_size"]),
-                    "meta_applied_min_lift": float(best_match["grid_min_lift"])
+                    "sql_filter": best_raw_sql,
+                    "count": int(selected_candidate["actual_count"]),
+                    "rate": float(actual_rate),
+                    "lift": float(actual_lift),
+                    "meta_applied_sample_size": int(selected_candidate["grid_min_sample_size"]),
+                    "meta_applied_min_lift": float(selected_candidate["grid_min_lift"])
                 }
             )
 
-            logger.info(f"Segment {i} Captured (Size Floor: {best_match['grid_min_sample_size']} | Lift Floor: {best_match['grid_min_lift']}): {best_sql}")
-            
-            # Execute deletion directly on the view instead of copying dataframe slices back and forth
-            con.execute(f"DELETE FROM current_df WHERE ({best_sql})")
+            logger.info(
+                f"Segment {i} Captured (Size Floor: {selected_candidate['grid_min_sample_size']} | Lift Floor: {selected_candidate['grid_min_lift']}): "
+                f"rows={selected_candidate['actual_count']}, events={selected_candidate['actual_events']}, lift={actual_lift:.2f}\n"
+                f"  Rule: {best_rule}\n"
+                f"  SQL: {best_raw_sql}"
+            )
+
+            self.diagnostics_[-1]["winning_segment"] = {
+                "rule": best_rule,
+                "sql_filter": best_raw_sql,
+                "variables_used": list(winning_combo),
+                "lift": actual_lift,
+                "count": int(selected_candidate["actual_count"])
+            }
+
+            # Remove rows matching the raw rule from the residual
+            con.execute(f"""
+                CREATE TABLE temp_residual AS 
+                SELECT * FROM current_df 
+                WHERE NOT ({best_raw_sql}) OR ({best_raw_sql}) IS NULL
+            """)
+            con.execute("DROP TABLE current_df")
+            con.execute("ALTER TABLE temp_residual RENAME TO current_df")
+
+        # Restore original config
+        self.min_sample_size = abs_min_sample_size
+        self.min_events = abs_min_events
+
+        # Close the connection used for extraction
+        con.close()
+
+        # ============================================================
+        #  FINAL STEP: Update stored counts to reflect hierarchical
+        #  segmentation on the original dataset.
+        # ============================================================
+        # if self.segments:
+        #     # Re‑evaluate on the original data to get hierarchical counts
+        #     hierarchical_results = self.evaluate_final_coverage(data)
+        #     # Build a lookup by segment_id
+        #     hierarchical_map = {r["segment"]: r for r in hierarchical_results}
+        #     for seg in self.segments:
+        #         seg_id = seg["segment_id"]
+        #         if seg_id in hierarchical_map:
+        #             h = hierarchical_map[seg_id]
+        #             seg["count"] = int(h["total_count"])
+        #             seg["rate"] = float(h["response_rate"])
+        #             seg["lift"] = float(h["lift"])
+        #             logger.info(
+        #                 f"Updated segment {seg_id} to hierarchical counts: "
+        #                 f"count={seg['count']}, rate={seg['rate']:.2f}%, lift={seg['lift']:.2f}"
+        #             )
 
         return self.segments
 
     def evaluate_final_coverage(self, original_data: Any) -> List[Dict[str, Any]]:
-        """Executes a full CASE WHEN query over the source dataset to map mutually exclusive coverage."""
+        """
+        Evaluates the hierarchical segmentation on the original dataset.
+
+        The rules are applied in the order they were extracted (first rule gets
+        highest priority). This yields the true hierarchical segmentation.
+        """
         if not self.segments:
             return []
             
-        con = duckdb.connect()
-        con.execute("CREATE TABLE original_df AS SELECT * FROM original_data")
+        con = duckdb.connect(f"experiment_{timestamp}.db")
+        con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM original_data")
 
+        # Build CASE statement with raw SQL filters in order
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
             for seg in self.segments
@@ -561,10 +627,42 @@ class StrategicSegmentBuilder:
         ORDER BY segment
         """
         
-        # Native return as a List of Dictionaries
         res = con.execute(final_query)
         columns = [desc[0] for desc in res.description]
-        return [dict(zip(columns, row)) for row in res.fetchall()]
+        res_list = [dict(zip(columns, row)) for row in res.fetchall()]
+        con.close()
+        return res_list
+
+    def explain_feature_journey(self, feature_name: str) -> None:
+        """Prints a detailed audit trail of a specific feature across all iterations."""
+        if not self.diagnostics_:
+            print("No diagnostic records found. Run extract_segments() first.")
+            return
+            
+        print("=" * 80)
+        print(f"AUDIT TRAIL FOR FEATURE: '{feature_name}'")
+        print("=" * 80)
+        
+        for record in self.diagnostics_:
+            iter_num = record["iteration"]
+            state = record["features_state"].get(feature_name)
+            winner = record["winning_segment"]
+            
+            if not state:
+                print(f"Iteration {iter_num}: Variable not present or was ignored.")
+                continue
+                
+            print(f"\n[Iteration {iter_num}]")
+            print(f"  • Current dynamic IV   : {state['iv']:.4f}")
+            print(f"  • Previous times used  : {state['times_used_previously']}")
+            print(f"  • Selection Status     : {state['status']}")
+            
+            if winner and feature_name in winner["variables_used"]:
+                print(f"  🎉 SELECTED as part of winning rule!")
+                print(f"     Rule: {winner['rule']}")
+            elif winner:
+                print(f"  • Winner this round    : {winner['rule']} (Variables: {winner['variables_used']})")
+        print("=" * 80)
 
 
 class StrategicSegmentScore:

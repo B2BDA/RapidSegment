@@ -269,6 +269,7 @@ Customers are sorted in **descending** order; deciles are formed by splitting th
 | `enable_1way/2way/3way` | `bool` | `True` | Toggle rule complexity levels. |
 | `feature_groups` | `dict` | `{}` | Business‑category mapping for diversity. |
 | `ignore_features` | `list` | `[]` | Columns to drop before processing. |
+| `sort_priority` | `STR` | `lift_count_rate` | Order in which rules will ranked and selected. Sample capture heavy/Response Rate Heavy/Lift Heavy. |
 
 **Output** – list of dicts with keys: `segment_id`, `rule_string`, `sql_filter`, `count`, `rate`, `lift`, `meta_applied_sample_size`, `meta_applied_min_lift`.
 
@@ -317,5 +318,7 @@ This project is licensed under the MIT License – see the [LICENSE](LICENSE) fi
 ---
 
 **Built with ❤️ by Bishwarup Biswas, Gemini & DeepSeek.**  
+Special Thanks to Mr. [Guillermo Navas Palencia]([url](https://github.com/guillermo-navas-palencia))  for creating [Optbinning]([url](https://github.com/guillermo-navas-palencia/optbinning)) library.
+
 _Independent, open‑source, and ready for production._
 ```

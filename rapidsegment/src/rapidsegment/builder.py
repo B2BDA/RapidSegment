@@ -4,7 +4,7 @@ Strategic Segmentation Engine
 Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning,
 and vectorized DuckDB scorecard deciling.
 
-Author: Bishwarup Biswas + Gemini + DeepSeek
+Author: Bishwarup Biswas + Gemini + DeepSeek + ChatGPT
 Python Version: 3.9+
 """
 
@@ -69,6 +69,7 @@ class StrategicSegmentBuilder:
         enable_3way: bool = True,
         feature_groups: Optional[Dict[str, List[str]]] = None,
         ignore_features: Optional[List[str]] = None,
+        sort_priority: str = "lift_count_rate"  # or "count_lift_rate", "lift_rate_count", etc.
     ) -> None:
         """
         Args:
@@ -87,6 +88,7 @@ class StrategicSegmentBuilder:
             enable_3way: Allow 3‑dimensional intersection rules.
             feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
             ignore_features: Explicit list of columns to drop prior to IV calculation.
+            sort_priority: Order in which rules will ranked and selected. Sample capture heavy/Response Rate Heavy/Lift Heavy.
         """
         self.target = target
         self.n_jobs = n_jobs if n_jobs != -1 else max(1, os.cpu_count() - 1)
@@ -105,7 +107,7 @@ class StrategicSegmentBuilder:
         self.feature_groups = feature_groups or {}
         self.ignore_features = ignore_features or []
         self.feature_usage_counts: Dict[str, int] = {}
-
+        self.sort_priority = sort_priority
         # Diagnostic repository (feature journey tracking)
         self.diagnostics_: List[Dict[str, Any]] = []
 
@@ -181,6 +183,33 @@ class StrategicSegmentBuilder:
             return True
         groups = [self.get_group(v) for v in combo]
         return len(groups) == len(set(groups))
+
+    def _get_sort_key(self, rule: Dict[str, Any]) -> Tuple[float, ...]:
+        """
+        Utility function to shorlist rules based on users choice on which metric to prioritize.
+
+        Args:
+            rule: Dictionary of Rules that was captured and passed hard constraints.
+
+        Returns:
+            Returns a tuple for sorting rules based on self.sort_priority.
+        """
+        priority = self.sort_priority
+        if priority == "lift_count_rate":
+            return (rule["lift"], rule["count"], rule["rate"])
+        elif priority == "count_lift_rate":
+            return (rule["count"], rule["lift"], rule["rate"])
+        elif priority == "rate_lift_count":
+            return (rule["rate"], rule["lift"], rule["count"])
+        elif priority == "lift_rate_count":
+            return (rule["lift"], rule["rate"], rule["count"])
+        elif priority == "count_rate_lift":
+            return (rule["count"], rule["rate"], rule["lift"])
+        elif priority == "rate_count_lift":
+            return (rule["rate"], rule["count"], rule["lift"])
+        else:
+            # Fallback: lift, count, rate
+            return (rule["lift"], rule["count"], rule["rate"])
 
     def compute_iv_ranking_and_bin(
         self,
@@ -422,7 +451,9 @@ class StrategicSegmentBuilder:
             f"⚙️ DuckDB Configured: Threads={target_threads}/{total_cores}, "
             f"MemoryLimit={target_memory_gb}GB"
         )
-
+        
+        logger.info(f"📊 Sort priority: {self.sort_priority}")
+        
         con.execute("CREATE OR REPLACE TABLE current_df AS SELECT * FROM data")
 
         cols_info = con.execute("DESCRIBE current_df").fetchall()
@@ -594,7 +625,7 @@ class StrategicSegmentBuilder:
                 if all_rules:
                     # Sort by lift first, then count, then rate (prioritise lift)
                     all_rules.sort(
-                        key=lambda x: (x["lift"], x["count"], x["rate"]),
+                        key=lambda x: self._get_sort_key(x),
                         reverse=True,
                     )
                     top_match = all_rules[0].copy()
@@ -608,7 +639,7 @@ class StrategicSegmentBuilder:
 
             # Rank candidates by (lift, count, rate)
             grid_candidates.sort(
-                key=lambda x: (x["lift"], x["count"], x["rate"]), reverse=True
+                key=lambda x: self._get_sort_key(x), reverse=True
             )
 
             selected_candidate = None

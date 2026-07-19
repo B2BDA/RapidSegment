@@ -336,10 +336,18 @@ Customers are sorted in **descending** order; deciles are formed by splitting th
 ## 🤔 FAQs & Troubleshooting
 
 **Q: Why are later segments sometimes stronger in lift than earlier ones?**  
-A: The engine optimises locally on the residual population. As the baseline shifts, a rule that captures a very specific tail can exhibit higher lift than the previous rule, even though it covers fewer rows. This is normal.
+A: The segment extraction process is entirely sequential and operates on a shrinking residual population. Once a champion rule is discovered, its matching records are deleted from the working environment before the next iteration begins.
+Because of this cascading extraction:  
+    **`Local Optimization`**: The engine optimizes parameters and evaluates candidates based purely on the residual portfolio left behind by previous segments. A rule that yields massive lift on a specific, purified subset of data might look less dominant if it had been evaluated against the noisy baseline of the entire original population.  
+    **`Changing Base Rates`**: As high-risk or high-performing records are stripped away in early rounds, the baseline event rate of the remaining pool shifts dynamically. This shifting baseline changes the mathematical benchmark for what constitutes a "high-lift" rule during that specific loop.  Consequently, when evaluate_final_coverage maps all rules simultaneously back over the original, unfiltered dataset, the global KPIs can naturally surface instances where a later segment outperforms an earlier one.  
 
 **Q: My deciles 3+ have a threshold of 0 – what’s wrong?**  
 A: This indicates high zero‑inflation in the scored dataset (most customers triggered no rules). Relax constraints: increase `max_feature_reuse`, lower `min_lift`/`min_sample_size`, or disable diversity to allow more segment coverage.
+Suggested relaxation during rule mining:  
+**`Increase max_feature_reuse (e.g., set to 2 or 3)`**: This allows highly predictive features to be reused across different segment combinations instead of being locked out after their first use.
+**`Increase top_n_vars (e.g., set to 25 or 30)`**: This expands the pool of candidate features the engine can look at in later iterations.  
+**`Relax the param_grid thresholds`**: Lower your minimum min_lift or min_sample_size constraints so that smaller or slightly less concentrated segments can still be captured in later rounds.  
+**`Disable diversity constraints (enable_diversity = False)`**: This allows features within the same business category to pair up, unlocking more valid rule combinations.  
 
 **Q: Why doesn’t the engine support OR‑based rules?**  
 A: OR breaks the Apriori pruning property: if A fails and B fails, A AND B will also fail (prune safe), but A OR B might succeed – forcing an exhaustive search. The engine prioritises speed and stability by focusing on AND‑based intersections.
@@ -349,6 +357,9 @@ A: Yes – just pass a DuckDB‑compatible table (e.g., a Pandas DataFrame) dire
 
 **Q: Does the engine handle missing values (NULLs) correctly?**  
 A: Yes. Both extraction and evaluation treat NULLs consistently – NULL conditions do not match the rule and are carried forward to later segments (or the `ELSE 0` bucket).
+
+**Q: My dataset may contain target leaked feature (100% correaltion with Target). Will it be taken as important feature?**
+A: No. The feature will be dropped by Optbinning during segment creation steps. Furthermore, if you are using BigQueryFeatureSelector the feature IV will be marked as 0 and not considered.
 
 ---
 

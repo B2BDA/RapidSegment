@@ -19,6 +19,7 @@
 
 ## 📖 Table of Contents
 - [✨ Features](#-features)
+- [🌳 Decision Trees vs RapidSegment](#-decision-trees-vs-rapidsegment)
 - [⚡ Quick Start](#-quick-start)
 - [🧩 Components](#-components)
 - [🏗️ System Architecture](#️-system-architecture)
@@ -40,6 +41,30 @@
 - **📦 Production‑Ready Outputs** – Exports pure ANSI SQL filters and a JSON scorecard with decile thresholds, ready for deployment.
 - **📊 Transparent Weighting** – Uses Lift and Harmonic Mean of Response/Capture rates to compute intuitive, integer weights.
 - **🔬 Audit Trail** – Built‑in diagnostic (`explain_feature_journey`) to trace any feature’s lifecycle through the extraction process.
+
+---
+
+## 🌳 Decision Trees vs RapidSegment
+
+Decision trees and RapidSegment both aim to create interpretable segments, but they are optimized for different jobs.
+
+| Aspect | Decision Tree | RapidSegment |
+|---|---|---|
+| Primary goal | Fit a single tree that maximizes predictive accuracy | Discover transparent, business-friendly segments and scorecard-ready rules |
+| Segment shape | Branches can split on different variables at different depths | Segments are built as explicit, hierarchical rules with SQL filters |
+| Variable consistency | A branch may use a completely different feature path than another | Supports a cleaner, more stable rule structure and can reuse the same variable across segments when desired |
+| Ease of use | Often requires model tuning, pruning, and interpretation of a tree structure | Designed for a straightforward workflow: ingest data → extract segments → score and export |
+| Production fit | Good for predictive modeling, but tree structure can be awkward for operations teams | Better suited for scorecards, policy rules, SQL deployment, and explainable segmentation |
+| Explainability | Interpretable, but can become hard to read at depth | Highly transparent because each segment is exposed as a rule and a SQL condition |
+
+### Why RapidSegment is often the better fit
+
+- It produces explicit rules that are easy to hand to analysts or operations teams.
+- The output is already aligned with SQL and scorecard workflows, reducing the gap between modeling and deployment.
+- It is easier to reason about when you want stable, reusable segmentation logic rather than a branching tree structure.
+- It is well suited for scenarios where you want a fixed set of business rules, consistent segment definitions, and explainable weights.
+
+In short, a decision tree is great when you want a predictive model structure; RapidSegment is better when you want transparent, deployable segments that are easy to understand and operationalize.
 
 ---
 
@@ -78,7 +103,8 @@ builder = StrategicSegmentBuilder(
         "delinquency": ["max_dpd_12m", "risk_segment"],
         "utilization": ["utilization_avg_3m"]
     },
-    ignore_features=["cust_id"]
+    ignore_features=["cust_id"],
+    sort_priority="lift_rate_count"
 )
 
 # 3. Extract hierarchical segments
@@ -96,11 +122,19 @@ for seg in segments:
     scoring_df[col] = duckdb.sql(f"SELECT ({seg['sql_filter']}) FROM data").df().astype(int)
     segment_cols.append(col)
 
-scorer = StrategicSegmentScore(target_col="default_flag", primary_key="cust_id", segment_cols=segment_cols)
+scorer = StrategicSegmentScore(
+    target_col="default_flag",
+    primary_key="cust_id",
+    segment_cols=segment_cols,
+    weight_type="ln_response"
+)
 model = scorer.calculate_and_export_weights(scoring_df, "model.json")
 
 print("Deciles:", model["decile_min_thresholds"])
 ```
+
+`sort_priority` controls how candidate segments are ranked during extraction, while `weight_type` controls how the scorecard weights are derived. Use `"response"` for absolute response-style weights or `"ln_response"` for a more relative, log-scaled weighting scheme.
+
 ## 🧩 Components
 
 RapidSegment is built from four decoupled, specialised modules. They can be used together or independently, depending on your pipeline needs.

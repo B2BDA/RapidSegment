@@ -1,10 +1,11 @@
 
+
 > [!IMPORTANT]
 > **Legal Disclaimer**  
 > This open‑source library (`RapidSegment`) is an independent, community‑driven predictive analytics framework. It is **completely unaffiliated** with any commercial products, SaaS platforms, or enterprise solutions of the same or similar name. Any overlap in nomenclature is purely coincidental.
 
 <p align="center">
-  <img width="1983" height="793" alt="f09fbbc6-17b6-4e86-96e7-5291a4175456" src="https://github.com/user-attachments/assets/f2584720-246b-4bda-b5a2-1b843bbec474" />
+  <img width="300" height="500" alt="adfd9cdf-251f-44e4-af79-20802d4a7a01" src="https://github.com/user-attachments/assets/803790d0-7ebe-4e79-a415-65f1daaea40b" />
 </p>
 
 # 🚀 RapidSegment – Strategic Segmentation & Scorecard Engine

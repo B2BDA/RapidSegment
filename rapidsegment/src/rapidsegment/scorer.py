@@ -50,7 +50,7 @@ class StrategicSegmentScore:
         target_col: str,
         primary_key: str,
         segment_cols: List[str],
-        weight_type: str = 'ln_response',
+        weight_type: str = 'response',
     ) -> None:
         self.target_col = target_col
         self.primary_key = primary_key

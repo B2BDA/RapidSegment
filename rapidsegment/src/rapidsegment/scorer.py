@@ -43,11 +43,6 @@ class StrategicSegmentScore:
         weight_type: 'response' (absolute probability) or 'ln_response' (log transform).
             - response = "Absolute". Great for head-hunting.
             - ln_response = "Relative" (adds proportional change). Great for fair ranking.
-        score_format: 'points' (scaled by 100) or 'probability' (exp transform for 0-1).
-            - 'points' returns raw sum of weights (higher = better).
-            - 'probability' returns exp(sum of ln(weights)) for matched segments,
-              giving a product of probabilities bounded in (0, 1). Higher = better.
-              Only valid when weight_type='ln_response'.
     """
 
     def __init__(
@@ -56,21 +51,12 @@ class StrategicSegmentScore:
         primary_key: str,
         segment_cols: List[str],
         weight_type: str = 'ln_response',
-        score_format: str = 'points'
     ) -> None:
         self.target_col = target_col
         self.primary_key = primary_key
         self.segment_cols = segment_cols
         self.weight_type = weight_type
-        self.score_format = score_format
         self.model_artifact: Dict[str, Any] = {}
-
-        # Validate combination
-        if score_format == 'probability' and weight_type != 'ln_response':
-            raise ValueError(
-                "score_format='probability' is only valid with weight_type='ln_response'. "
-                "The exponential transform requires log-space weights to produce a product."
-            )
 
     def calculate_and_export_weights(
         self,
@@ -167,6 +153,29 @@ class StrategicSegmentScore:
             }
 
         # ---------------------------------------------------------------------
+        # Step 2.5: User Warning for Low Segment Resolution 
+        # ---------------------------------------------------------------------
+        distinct_active_weights = set()
+        for seg_col in self.segment_cols:
+            w = weights_lookup.get(seg_col, {}).get('weight', 0)
+            if w != 0:
+                distinct_active_weights.add(w)
+        
+        distinct_count = len(distinct_active_weights)
+        
+        if distinct_count < 10:
+            logger.warning(
+                f"⚠️ DECILE RESOLUTION WARNING: Only {distinct_count} distinct non-zero score "
+                f"values found across {len(self.segment_cols)} segments. "
+                "Splitting into 10 deciles will produce repeated thresholds (e.g., top 5 deciles "
+                "may have identical scores). For smooth decile ranking, ensure the builder "
+                "discovers at least 10 distinct segments (increase `max_segments`). "
+                "Consider interpreting results as tiers rather than deciles."
+            )
+        else:
+            logger.info(f"✅ Scorecard has {distinct_count} distinct score values – good for deciling.")
+
+        # ---------------------------------------------------------------------
         # Step 3: Score the entire population using C++ SQL math
         # ---------------------------------------------------------------------
         logger.info("⚡ Scoring population natively via SQL engine...")
@@ -181,22 +190,7 @@ class StrategicSegmentScore:
         ]
         score_math_expr = " + ".join(score_terms)
 
-        # Build final total_score based on score_format
-        if self.score_format == 'probability':
-            # Method 1 (Product Transform):
-            # score = exp( sum(flag * ln(p)) ) = product(p_i)
-            # Since weight = ln(p) * 100, we divide the sum by 100 before exp.
-            # Baseline (sum = 0) maps to exp(0)=1, but we explicitly set it to 0
-            # so that non‑hits are excluded from active deciles (same as original logic).
-            score_sql = f"""
-                CASE
-                    WHEN ({score_math_expr}) = 0 THEN 0.0
-                    ELSE EXP(({score_math_expr}) / 100.0)
-                END AS total_score
-            """
-        else:  # 'points'
-            # Original behaviour: raw sum of weighted flags
-            score_sql = f"({score_math_expr}) AS total_score"
+        score_sql = f"({score_math_expr}) AS total_score"
 
         ctx.execute(f"""
             CREATE OR REPLACE TABLE scored_population AS
@@ -212,7 +206,7 @@ class StrategicSegmentScore:
         logger.info("📈 Calibrating deciles across active populations...")
 
         # Filter out baseline customers (score = 0) – unchanged from original
-        filter_clause = "WHERE total_score > 0" if zero_inflation_rate >= 0.80 else ""
+        filter_clause = "WHERE total_score <> 0" if zero_inflation_rate >= 0 else ""
 
         # Compute all 10 deciles in a single table scan using quantile_disc
         quantile_query = f"""
@@ -250,7 +244,6 @@ class StrategicSegmentScore:
                 ),
                 "baseline_event_rate": round(baseline_rate, 4),
                 "weight_type": self.weight_type,         # added for traceability
-                "score_format": self.score_format,       # added for traceability
             },
             "segment_weights": weights_lookup,
             "decile_min_thresholds": decile_thresholds,

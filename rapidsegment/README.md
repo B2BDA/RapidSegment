@@ -39,7 +39,7 @@
 - **⚡ Hyper‑Efficient** – Leverages **DuckDB** for vectorised SQL aggregations and **NumPy** (or DuckDB’s native quantiles) for blazing‑fast scoring.
 - **☁️ BigQuery Ready** – Optional feature screening runs natively inside Google BigQuery, downloading only the most predictive columns.
 - **📦 Production‑Ready Outputs** – Exports pure ANSI SQL filters and a JSON scorecard with decile thresholds, ready for deployment.
-- **📊 Transparent Weighting** – Uses Lift and Harmonic Mean of Response/Capture rates to compute intuitive, integer weights.
+- **📊 Transparent Weighting** – Uses either the segment response rate or its log‑scaled variant to compute intuitive integer weights, while retaining lift, response rate, and capture rate for each segment.
 - **🔬 Audit Trail** – Built‑in diagnostic (`explain_feature_journey`) to trace any feature’s lifecycle through the extraction process.
 
 ---
@@ -133,7 +133,7 @@ model = scorer.calculate_and_export_weights(scoring_df, "model.json")
 print("Deciles:", model["decile_min_thresholds"])
 ```
 
-`sort_priority` controls how candidate segments are ranked during extraction, while `weight_type` controls how the scorecard weights are derived. Use `"response"` for absolute response-style weights or `"ln_response"` for a more relative, log-scaled weighting scheme.
+`sort_priority` controls how candidate segments are ranked during extraction, while `weight_type` controls how the scorecard weights are derived. Use `"response"` for absolute response-rate weighting or `"ln_response"` for a more relative, log-scaled weighting scheme. The exported model retains each `weight` together with `lift`, `response_rate`, and `capture_rate` for auditability.
 
 ## 🧩 Components
 
@@ -169,9 +169,9 @@ flowchart LR
 
 ### 📊 `StrategicSegmentScore`
 - **Purpose**: Converts binary segment flags into a weighted scorecard with decile thresholds.
-- **Weighting**: Uses Lift × Harmonic Mean of Response/Capture rates.
-- **Output**: A JSON artifact containing model metadata, segment weights, and decile cutoffs.
-- **Zero‑Inflation**: Automatically isolates the active population if ≥80% of scores are zero.
+- **Weighting**: Uses either the segment response rate or its log‑scaled variant, rounded to an integer weight.
+- **Output**: A JSON artifact with model metadata, per-segment weights, and decile cutoffs.
+- **Active population handling**: Baseline customers with a zero total score are excluded from decile calibration so thresholds are derived from the active scored population.
 
 ### ☁️ `BigQueryFeatureSelector`
 - **Purpose**: Screens hundreds of features directly inside Google BigQuery using IV and variance filters.
@@ -297,7 +297,7 @@ This guarantees that the residual dataset exactly matches the `CASE`‑based hie
 Steps 1‑5 repeat until either `max_segments` is reached or no more rules can be found.
 
 ### 7. Scorecard Compilation
-Once all segments are extracted, they are converted to binary flags and passed to `StrategicSegmentScore`. This module computes weights using the Harmonic Mean formula and calibrates decile thresholds (with automatic zero‑inflation handling).
+Once all segments are extracted, they are converted to binary flags and passed to `StrategicSegmentScore`. This module computes weights from either the segment response rate or its log‑scaled variant and calibrates decile thresholds from the active scored population.
 
 ---
 
@@ -318,19 +318,19 @@ For a segment $s$:
 - **Capture Rate**: $CR_s = \frac{Events_s}{TotalEvents}$  
 - **Lift**: $L_s = \frac{RR_s}{BaselineRate}$
 
-The weight is:
+The raw weight is:
 
 $$
-\text{Weight}_s = \left\lfloor \, L_s \times 2 \cdot \frac{RR_s \cdot CR_s}{RR_s + CR_s} \times 100 \right\rfloor
+\text{RawWeight}_s =
+\begin{cases}
+RR_s \times 100, & \text{if } \text{weight\_type} = \"response\" \\\n\log(RR_s + 10^{-8}) \times 100, & \text{if } \text{weight\_type} = \"ln\_response\"
+\end{cases}
 $$
 
-**Why Harmonic Mean?**  
-It balances the density of the segment (Capture Rate) and its risk concentration (Response Rate), preventing extreme values from dominating the score.
+The exported weight is the rounded integer value of this raw weight. The scorer also retains the segment lift, response rate, and capture rate for auditability.
 
 ### Decile Calibration
-Scores are computed as the sum of weights for all segments a customer triggers.  
-Customers are sorted in **descending** order; deciles are formed by splitting the population into 10 equal‑sized buckets.  
-**Zero‑Inflation handling**: If $\ge$ 80% of customers have a score of 0, deciles are calculated **only on the active (score > 0)** population. This prevents a long tail of zeros from flattening the scorecard.
+Scores are computed as the sum of weights for all segments a customer triggers. Customers are sorted in **descending** order and split into 10 buckets using DuckDB quantiles. Before this step, baseline customers with a score of 0 are removed so the thresholds apply to the active scored population. The scorer also warns when too few distinct non-zero segment weights are available, because this can cause repeated thresholds.
 
 ---
 
@@ -363,8 +363,9 @@ Customers are sorted in **descending** order; deciles are formed by splitting th
 | `target_col` | `str` | Binary target column. |
 | `primary_key` | `str` | Unique row identifier. |
 | `segment_cols` | `list` | List of binary segment flag columns. |
+| `weight_type` | `str` | Weighting scheme to use: `response` for response-rate scaling or `ln_response` for log-scaled response-rate scaling. |
 
-**Export** – JSON artifact with `model_metadata`, `segment_weights`, `decile_min_thresholds`.
+**Export** – JSON artifact with `model_metadata`, `segment_weights`, and `decile_min_thresholds`.
 
 ---
 
@@ -377,12 +378,7 @@ Because of this cascading extraction:
     **`Changing Base Rates`**: As high-risk or high-performing records are stripped away in early rounds, the baseline event rate of the remaining pool shifts dynamically. This shifting baseline changes the mathematical benchmark for what constitutes a "high-lift" rule during that specific loop.  Consequently, when evaluate_final_coverage maps all rules simultaneously back over the original, unfiltered dataset, the global KPIs can naturally surface instances where a later segment outperforms an earlier one.  
 
 **Q: My deciles 3+ have a threshold of 0 – what’s wrong?**  
-A: This indicates high zero‑inflation in the scored dataset (most customers triggered no rules). Relax constraints: increase `max_feature_reuse`, lower `min_lift`/`min_sample_size`, or disable diversity to allow more segment coverage.
-Suggested relaxation during rule mining:  
-**`Increase max_feature_reuse (e.g., set to 2 or 3)`**: This allows highly predictive features to be reused across different segment combinations instead of being locked out after their first use.
-**`Increase top_n_vars (e.g., set to 25 or 30)`**: This expands the pool of candidate features the engine can look at in later iterations.  
-**`Relax the param_grid thresholds`**: Lower your minimum min_lift or min_sample_size constraints so that smaller or slightly less concentrated segments can still be captured in later rounds.  
-**`Disable diversity constraints (enable_diversity = False)`**: This allows features within the same business category to pair up, unlocking more valid rule combinations.  
+A: This usually means the scored population contains too few active segments or too few distinct non-zero segment weights. The scorer excludes zero-score customers from decile calibration, so repeated thresholds can occur when the model produces only a handful of active scores. Relax constraints by increasing `max_segments`, raising `top_n_vars`, or lowering `min_lift`/`min_sample_size` so more segments can be discovered. If the scorecard still collapses, interpret the result as score tiers rather than a smooth decile ladder.
 
 **Q: Why doesn’t the engine support OR‑based rules?**  
 A: OR breaks the Apriori pruning property: if A fails and B fails, A AND B will also fail (prune safe), but A OR B might succeed – forcing an exhaustive search. The engine prioritises speed and stability by focusing on AND‑based intersections.

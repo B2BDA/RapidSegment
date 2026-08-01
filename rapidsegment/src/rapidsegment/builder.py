@@ -14,7 +14,6 @@ import re
 from datetime import datetime
 from itertools import combinations, product
 from typing import Any, Dict, List, Optional, Tuple, Union
-
 import duckdb
 import numpy as np
 import psutil
@@ -69,15 +68,15 @@ class StrategicSegmentBuilder:
         enable_3way: bool = True,
         feature_groups: Optional[Dict[str, List[str]]] = None,
         ignore_features: Optional[List[str]] = None,
-        sort_priority: str = "lift_count_rate"  # or "count_lift_rate", "lift_rate_count", etc.
+        sort_priority: str = "lift_rate_count"  # or "count_lift_rate", "lift_rate_count", etc.
     ) -> None:
         """
         Args:
             target: Name of the binary target column (1 = Event, 0 = Non-Event).
             n_jobs: Number of parallel jobs for IV computation. -1 uses all but one core.
-            min_sample_size: Absolute minimum row count for a valid rule (fallback).
-            min_lift: Minimum lift threshold (fallback).
-            min_events: Minimum number of positive events for a valid rule (fallback).
+            min_sample_size: Absolute minimum row count for a valid rule. Used as a fallback when param_grid is None.
+            min_lift: Minimum lift threshold. Used as a fallback when param_grid is None.
+            min_events: Minimum number of positive events for a valid rule. Used as a fallback when param_grid is None.
             top_n_vars: Number of highest‑IV features passed into the Apriori engine.
             max_segments: Maximum number of segments to extract.
             max_feature_reuse: Max times a feature can appear across segments.
@@ -88,7 +87,14 @@ class StrategicSegmentBuilder:
             enable_3way: Allow 3‑dimensional intersection rules.
             feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
             ignore_features: Explicit list of columns to drop prior to IV calculation.
-            sort_priority: Order in which rules will ranked and selected. Sample capture heavy/Response Rate Heavy/Lift Heavy.
+            sort_priority: Ranking criteria for selecting champion segments. 
+                Can be a predefined shortcut string:
+                    - 'lift_rate_count': Lift → Response Rate → Sample Size
+                    - 'count_lift_rate': Sample Size → Lift → Response Rate
+                    - 'rate_lift_count': Response Rate → Lift → Sample Size
+                    - 'rate_count_lift': Response Rate → Sample Size → Lift
+                    - 'lift_count_rate': Lift → Sample Size → Response Rate
+                    - 'count_rate_lift': Sample Size → Response Rate → Lift
         """
         self.target = target
         self.n_jobs = n_jobs if n_jobs != -1 else max(1, os.cpu_count() - 1)

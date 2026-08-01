@@ -320,12 +320,13 @@ For a segment $s$:
 
 The raw weight is:
 
-$$
-\text{RawWeight}_s =
-\begin{cases}
-RR_s \times 100, & \text{if } \text{weight\_type} = \"response\" \\\n\log(RR_s + 10^{-8}) \times 100, & \text{if } \text{weight\_type} = \"ln\_response\"
-\end{cases}
-$$
+The raw weight is:
+
+```text
+RawWeight_s =
+    RR_s × 100                     if weight_type == "response"
+    log(RR_s + 1e-8) × 100         if weight_type == "ln_response"
+```
 
 The exported weight is the rounded integer value of this raw weight. The scorer also retains the segment lift, response rate, and capture rate for auditability.
 

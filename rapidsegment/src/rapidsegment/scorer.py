@@ -13,8 +13,8 @@ import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Union
-
 import duckdb
+import numpy as np
 
 # -----------------------------------------------------------------------------
 # Module-level configuration
@@ -33,22 +33,44 @@ class StrategicSegmentScore:
     """
     High‑Throughput Vectorised Scorecard Engine.
 
-    Computes segment weights via Harmonic Mean and applies deciling
-    over large datasets natively inside DuckDB's out‑of‑core engine.
+    Computes segment weights and applies deciling over large datasets natively
+    inside DuckDB's out‑of‑core engine.
 
     Args:
         target_col: Name of the binary target column (0/1).
         primary_key: Unique identifier column.
         segment_cols: List of binary (0/1) segment flag columns.
+        weight_type: 'response' (absolute probability) or 'ln_response' (log transform).
+            - response = "Absolute". Great for head-hunting.
+            - ln_response = "Relative" (adds proportional change). Great for fair ranking.
+        score_format: 'points' (scaled by 100) or 'probability' (exp transform for 0-1).
+            - 'points' returns raw sum of weights (higher = better).
+            - 'probability' returns exp(sum of ln(weights)) for matched segments,
+              giving a product of probabilities bounded in (0, 1). Higher = better.
+              Only valid when weight_type='ln_response'.
     """
 
     def __init__(
-        self, target_col: str, primary_key: str, segment_cols: List[str]
+        self,
+        target_col: str,
+        primary_key: str,
+        segment_cols: List[str],
+        weight_type: str = 'ln_response',
+        score_format: str = 'points'
     ) -> None:
         self.target_col = target_col
         self.primary_key = primary_key
         self.segment_cols = segment_cols
+        self.weight_type = weight_type
+        self.score_format = score_format
         self.model_artifact: Dict[str, Any] = {}
+
+        # Validate combination
+        if score_format == 'probability' and weight_type != 'ln_response':
+            raise ValueError(
+                "score_format='probability' is only valid with weight_type='ln_response'. "
+                "The exponential transform requires log-space weights to produce a product."
+            )
 
     def calculate_and_export_weights(
         self,
@@ -107,7 +129,7 @@ class StrategicSegmentScore:
         # ---------------------------------------------------------------------
         # Step 2: Unpack aggregated results into weight lookup
         # ---------------------------------------------------------------------
-        logger.info("📊 Computing harmonic scorecard weights...")
+        logger.info("📊 Computing scorecard weights...")
         weights_lookup: Dict[str, Dict[str, Union[int, float]]] = {}
 
         for idx, seg_col in enumerate(self.segment_cols):
@@ -130,10 +152,12 @@ class StrategicSegmentScore:
             capture_rate = seg_events / total_events
             lift = response_rate / baseline_rate
 
-            harmonic_mean = 2 * (
-                (response_rate * capture_rate) / (response_rate + capture_rate)
-            )
-            raw_weight = lift * harmonic_mean * 100.0
+            # Compute raw weight based on weight_type
+            if self.weight_type == "response":
+                raw_weight = response_rate * 100.0
+            else:  # 'ln_response'
+                # Add tiny epsilon to avoid log(0) – though min_event guards prevent this
+                raw_weight = np.log(response_rate + 1e-8) * 100.0
 
             weights_lookup[seg_col] = {
                 "weight": int(round(raw_weight)),
@@ -150,15 +174,33 @@ class StrategicSegmentScore:
         if not scored_cols:
             raise ValueError("Scorecard Failure: No valid segments found to score.")
 
+        # Build the linear sum expression: flag_1 * w1 + flag_2 * w2 + ...
         score_terms = [
             f'(CAST("{col}" AS DOUBLE) * {weights_lookup[col]["weight"]})'
             for col in scored_cols
         ]
         score_math_expr = " + ".join(score_terms)
 
+        # Build final total_score based on score_format
+        if self.score_format == 'probability':
+            # Method 1 (Product Transform):
+            # score = exp( sum(flag * ln(p)) ) = product(p_i)
+            # Since weight = ln(p) * 100, we divide the sum by 100 before exp.
+            # Baseline (sum = 0) maps to exp(0)=1, but we explicitly set it to 0
+            # so that non‑hits are excluded from active deciles (same as original logic).
+            score_sql = f"""
+                CASE
+                    WHEN ({score_math_expr}) = 0 THEN 0.0
+                    ELSE EXP(({score_math_expr}) / 100.0)
+                END AS total_score
+            """
+        else:  # 'points'
+            # Original behaviour: raw sum of weighted flags
+            score_sql = f"({score_math_expr}) AS total_score"
+
         ctx.execute(f"""
             CREATE OR REPLACE TABLE scored_population AS
-            SELECT "{self.primary_key}", ({score_math_expr}) AS total_score
+            SELECT "{self.primary_key}", {score_sql}
             FROM df
         """)
 
@@ -169,7 +211,7 @@ class StrategicSegmentScore:
         # ---------------------------------------------------------------------
         logger.info("📈 Calibrating deciles across active populations...")
 
-        # Handle zero‑inflation masking entirely on the database side
+        # Filter out baseline customers (score = 0) – unchanged from original
         filter_clause = "WHERE total_score > 0" if zero_inflation_rate >= 0.80 else ""
 
         # Compute all 10 deciles in a single table scan using quantile_disc
@@ -191,7 +233,7 @@ class StrategicSegmentScore:
         quantiles = quantiles[::-1]  # Reverse to descending order
         decile_thresholds = {str(i + 1): int(quantiles[i]) for i in range(10)}
 
-        # Active population size (only those with positive scores or all, depending on filter)
+        # Active population size (only those with positive scores)
         active_pop_size = ctx.execute(
             f"SELECT COUNT(*) FROM scored_population {filter_clause}"
         ).fetchone()[0]
@@ -207,6 +249,8 @@ class StrategicSegmentScore:
                     (active_pop_size / total_population) * 100.0, 2
                 ),
                 "baseline_event_rate": round(baseline_rate, 4),
+                "weight_type": self.weight_type,         # added for traceability
+                "score_format": self.score_format,       # added for traceability
             },
             "segment_weights": weights_lookup,
             "decile_min_thresholds": decile_thresholds,

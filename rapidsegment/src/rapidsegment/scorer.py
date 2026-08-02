@@ -40,9 +40,6 @@ class StrategicSegmentScore:
         target_col: Name of the binary target column (0/1).
         primary_key: Unique identifier column.
         segment_cols: List of binary (0/1) segment flag columns.
-        weight_type: 'response' (absolute probability) or 'ln_response' (log transform).
-            - response = "Absolute". Great for head-hunting.
-            - ln_response = "Relative" (adds proportional change). Great for fair ranking.
     """
 
     def __init__(
@@ -50,12 +47,10 @@ class StrategicSegmentScore:
         target_col: str,
         primary_key: str,
         segment_cols: List[str],
-        weight_type: str = 'response',
     ) -> None:
         self.target_col = target_col
         self.primary_key = primary_key
         self.segment_cols = segment_cols
-        self.weight_type = weight_type
         self.model_artifact: Dict[str, Any] = {}
 
     def calculate_and_export_weights(
@@ -138,12 +133,7 @@ class StrategicSegmentScore:
             capture_rate = seg_events / total_events
             lift = response_rate / baseline_rate
 
-            # Compute raw weight based on weight_type
-            if self.weight_type == "response":
-                raw_weight = response_rate * 100.0
-            else:  # 'ln_response'
-                # Add tiny epsilon to avoid log(0) – though min_event guards prevent this
-                raw_weight = np.log(response_rate + 1e-8) * 100.0
+            raw_weight = response_rate * 100.0
 
             weights_lookup[seg_col] = {
                 "weight": int(round(raw_weight)),
@@ -243,7 +233,6 @@ class StrategicSegmentScore:
                     (active_pop_size / total_population) * 100.0, 2
                 ),
                 "baseline_event_rate": round(baseline_rate, 4),
-                "weight_type": self.weight_type,         # added for traceability
             },
             "segment_weights": weights_lookup,
             "decile_min_thresholds": decile_thresholds,

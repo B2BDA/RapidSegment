@@ -75,7 +75,9 @@ class StrategicSegmentBuilder:
             target: Name of the binary target column (1 = Event, 0 = Non-Event).
             n_jobs: Number of parallel jobs for IV computation. -1 uses all but one core.
             min_sample_size: Absolute minimum row count for a valid rule. Used as a fallback when param_grid is None.
-            min_lift: Minimum lift threshold. Used as a fallback when param_grid is None.
+            min_lift: Absolute minimum lift threshold (hard constraint).
+                Enforced on all final segments, calculated relative to the locked original base response rate. 
+                Not relaxed during param_grid exploration.: Minimum lift threshold. Used as a fallback when param_grid is None.
             min_events: Minimum number of positive events for a valid rule. Used as a fallback when param_grid is None.
             top_n_vars: Number of highest‑IV features passed into the Apriori engine.
             max_segments: Maximum number of segments to extract.
@@ -326,7 +328,7 @@ class StrategicSegmentBuilder:
                 rate = (events / count) * 100.0 if count > 0 else 0
                 lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
 
-                if lift >= self.min_lift and events >= self.min_events and lift > 1.0:
+                if lift >= self.min_lift and events >= self.min_events:
                     valid_results.append(
                         {
                             "rule": rule,
@@ -437,10 +439,6 @@ class StrategicSegmentBuilder:
         """
         logger.info("🚀 Starting hierarchical segment extraction...")
 
-        # Cache absolute hard constraints
-        abs_min_sample_size = self.min_sample_size
-        abs_min_events = self.min_events
-
         # Use file‑backed storage for performance
         if os.path.exists(f"experiment_{timestamp}.db"):
             os.remove(f"experiment_{timestamp}.db")
@@ -488,24 +486,34 @@ class StrategicSegmentBuilder:
         else:
             experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
 
+        # Cache original base_rate and absolute constraints
+        original_base_rate = con.execute(
+            f'SELECT AVG(CAST("{self.target}" AS DOUBLE)) FROM current_df'
+        ).fetchone()[0] or 0.0
+        abs_min_sample_size = self.min_sample_size
+        abs_min_events = self.min_events
+        abs_min_lift = self.min_lift
+
+        logger.info(f"🔒 Locking Original Base Rate: {original_base_rate*100:.2f}%")
+
         for i in range(1, self.max_segments + 1):
             res = con.execute(
                 f'SELECT AVG("{self.target}"), COUNT(*) FROM current_df'
             ).fetchone()
-            base_rate, current_volume = res[0] or 0.0, res[1] or 0
+            current_base_rate, current_volume = res[0] or 0.0, res[1] or 0
 
             min_floor_volume = min(exp["min_sample_size"] for exp in experiments)
 
-            if base_rate == 0 or current_volume < min_floor_volume:
+            if current_base_rate == 0 or current_volume < min_floor_volume:
                 logger.info(
-                    f"⏹️ Stopping: base_rate={base_rate}, volume={current_volume} < "
+                    f"⏹️ Stopping: base_rate={current_base_rate}, volume={current_volume} < "
                     f"min_floor={min_floor_volume}"
                 )
                 break
 
             logger.info(
                 f"🔄 Iteration {i} | Remaining Volume: {current_volume:,} | "
-                f"Base Rate: {base_rate*100:.2f}%"
+                f"Base Rate: {current_base_rate*100:.2f}%"
             )
 
             iv_ranking, precomputed_bins = self.compute_iv_ranking_and_bin(
@@ -536,7 +544,7 @@ class StrategicSegmentBuilder:
                 {
                     "iteration": i,
                     "residual_volume": current_volume,
-                    "base_rate": base_rate,
+                    "base_rate": current_base_rate,
                     "features_state": iteration_snapshot,
                     "winning_segment": None,
                 }
@@ -580,7 +588,7 @@ class StrategicSegmentBuilder:
 
                 # Level 1 (Singles)
                 res_1 = self._agg_combinations(
-                    con, [(c,) for c in valid_vars], base_rate
+                    con, [(c,) for c in valid_vars], original_base_rate
                 )
                 valid_1way_vars = set()
                 if res_1:
@@ -600,7 +608,7 @@ class StrategicSegmentBuilder:
                         if self.is_diverse(c)
                     ]
                     if combos_2:
-                        res_2 = self._agg_combinations(con, combos_2, base_rate)
+                        res_2 = self._agg_combinations(con, combos_2, original_base_rate)
                         if res_2:
                             valid_2way_sets = {
                                 frozenset(c["combo_vars"]) for c in res_2
@@ -624,7 +632,7 @@ class StrategicSegmentBuilder:
                         )
                     ]
                     if combos_3:
-                        res_3 = self._agg_combinations(con, combos_3, base_rate)
+                        res_3 = self._agg_combinations(con, combos_3, original_base_rate)
                         if res_3:
                             all_rules.extend(res_3)
 
@@ -658,8 +666,11 @@ class StrategicSegmentBuilder:
                     f'FROM current_df WHERE ({sql_filter})'
                 ).fetchone()
                 actual_cnt, actual_evt = actual[0], actual[1] or 0
+                # Calculate actual lift for this candidate
+                actual_rate = (actual_evt / actual_cnt * 100.0) if actual_cnt > 0 else 0.0
+                actual_lift = (actual_rate / (original_base_rate * 100.0)) if original_base_rate > 0 else 0.0
 
-                if actual_cnt >= abs_min_sample_size and actual_evt >= abs_min_events:
+                if actual_cnt >= abs_min_sample_size and actual_evt >= abs_min_events and actual_lift >= abs_min_lift:
                     selected_candidate = {
                         **candidate,
                         "sql_filter": sql_filter,
@@ -688,7 +699,7 @@ class StrategicSegmentBuilder:
                 selected_candidate["actual_events"] / selected_candidate["actual_count"]
             ) * 100.0
             actual_lift = (
-                actual_rate / (base_rate * 100.0) if base_rate > 0 else 0.0
+                actual_rate / (original_base_rate * 100.0) if original_base_rate > 0 else 0.0
             )
 
             for var in winning_combo:
@@ -752,7 +763,7 @@ class StrategicSegmentBuilder:
         # Restore original config
         self.min_sample_size = abs_min_sample_size
         self.min_events = abs_min_events
-
+        self.min_lift = abs_min_lift 
         con.close()
         logger.info("🏁 Extraction complete.")
         return self.segments

@@ -1,5 +1,4 @@
 
-
 > [!IMPORTANT]
 > **Legal Disclaimer**  
 > This open‑source library (`RapidSegment`) is an independent, community‑driven predictive analytics framework. It is **completely unaffiliated** with any commercial products, SaaS platforms, or enterprise solutions of the same or similar name. Any overlap in nomenclature is purely coincidental.
@@ -40,7 +39,7 @@
 - **⚡ Hyper‑Efficient** – Leverages **DuckDB** for vectorised SQL aggregations and **NumPy** (or DuckDB’s native quantiles) for blazing‑fast scoring.
 - **☁️ BigQuery Ready** – Optional feature screening runs natively inside Google BigQuery, downloading only the most predictive columns.
 - **📦 Production‑Ready Outputs** – Exports pure ANSI SQL filters and a JSON scorecard with decile thresholds, ready for deployment.
-- **📊 Transparent Weighting** – Uses either the segment response rate or its log‑scaled variant to compute intuitive integer weights, while retaining lift, response rate, and capture rate for each segment.
+- **📊 Transparent Weighting** – Uses the segment response rate to compute intuitive integer weights, while retaining lift, response rate, and capture rate for each segment.
 - **🔬 Audit Trail** – Built‑in diagnostic (`explain_feature_journey`) to trace any feature’s lifecycle through the extraction process.
 
 ---
@@ -127,14 +126,14 @@ scorer = StrategicSegmentScore(
     target_col="default_flag",
     primary_key="cust_id",
     segment_cols=segment_cols,
-    weight_type="ln_response"
 )
 model = scorer.calculate_and_export_weights(scoring_df, "model.json")
 
 print("Deciles:", model["decile_min_thresholds"])
 ```
 
-`sort_priority` controls how candidate segments are ranked during extraction, while `weight_type` controls how the scorecard weights are derived. Use `"response"` for absolute response-rate weighting or `"ln_response"` for a more relative, log-scaled weighting scheme. The exported model retains each `weight` together with `lift`, `response_rate`, and `capture_rate` for auditability.
+`sort_priority` controls how candidate segments are ranked during extraction.
+The exported model retains each `weight` together with `lift`, `response_rate`, and `capture_rate` for auditability.
 
 ## 🧩 Components
 
@@ -170,7 +169,7 @@ flowchart LR
 
 ### 📊 `StrategicSegmentScore`
 - **Purpose**: Converts binary segment flags into a weighted scorecard with decile thresholds.
-- **Weighting**: Uses either the segment response rate or its log‑scaled variant, rounded to an integer weight.
+- **Weighting**: Uses the segment response rate rounded to an integer weight.
 - **Output**: A JSON artifact with model metadata, per-segment weights, and decile cutoffs.
 - **Active population handling**: Baseline customers with a zero total score are excluded from decile calibration so thresholds are derived from the active scored population.
 
@@ -298,7 +297,7 @@ This guarantees that the residual dataset exactly matches the `CASE`‑based hie
 Steps 1‑5 repeat until either `max_segments` is reached or no more rules can be found.
 
 ### 7. Scorecard Compilation
-Once all segments are extracted, they are converted to binary flags and passed to `StrategicSegmentScore`. This module computes weights from either the segment response rate or its log‑scaled variant and calibrates decile thresholds from the active scored population.
+Once all segments are extracted, they are converted to binary flags and passed to `StrategicSegmentScore`. This module computes weights from the segment response rate and calibrates decile thresholds from the active scored population.
 
 ---
 
@@ -321,12 +320,9 @@ For a segment $s$:
 
 The raw weight is:
 
-The raw weight is:
-
 ```text
 RawWeight_s =
-    RR_s × 100                     if weight_type == "response"
-    log(RR_s + 1e-8) × 100         if weight_type == "ln_response"
+    RR_s × 100        
 ```
 
 The exported weight is the rounded integer value of this raw weight. The scorer also retains the segment lift, response rate, and capture rate for auditability.
@@ -365,7 +361,6 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `target_col` | `str` | Binary target column. |
 | `primary_key` | `str` | Unique row identifier. |
 | `segment_cols` | `list` | List of binary segment flag columns. |
-| `weight_type` | `str` | Weighting scheme to use: `response` for response-rate scaling or `ln_response` for log-scaled response-rate scaling. |
 
 **Export** – JSON artifact with `model_metadata`, `segment_weights`, and `decile_min_thresholds`.
 

@@ -947,7 +947,6 @@ class StrategicSegmentBuilder:
                 (SUM(CAST("{self.target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
             FROM original_df
             GROUP BY 1
-            ORDER BY 1 DESC
         ),
         BASE_KPIS AS (
             SELECT *,

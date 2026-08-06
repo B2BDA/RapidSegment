@@ -70,7 +70,8 @@ class StrategicSegmentBuilder:
         ignore_features: Optional[List[str]] = None,
         sort_priority: str = "lift_rate_count",  # or "count_lift_rate", "lift_rate_count", etc.
         binning_method: str = "optimal",  
-        naive_bins: int = 5               
+        naive_bins: int = 5 ,
+        selection_metric: str = "iv"              
     ) -> None:
         """
         Args:
@@ -100,8 +101,10 @@ class StrategicSegmentBuilder:
                     - 'lift_count_rate': Lift → Sample Size → Response Rate
                     - 'count_rate_lift': Sample Size → Response Rate → Lift
             binning_method: Which binning engine to use for feature discretization and IV computation.
-                Supported values are 'optimal' for OptBinning and 'naive' for simple quantile/category heuristics.
+                    -  'optimal' for OptBinning 
+                    -  'naive' for simple quantile/category heuristics.
             naive_bins: Number of quantile bins used when binning_method is 'naive'.
+            selection_metric: Metric used to rank features for top_n_vars selection. Support "iv" or "response_rate".
         """
         self.target = target
         cpu_count = os.cpu_count() or 1
@@ -125,7 +128,8 @@ class StrategicSegmentBuilder:
         # Diagnostic repository (feature journey tracking)
         self.diagnostics_: List[Dict[str, Any]] = []
         self.binning_method = binning_method  
-        self.naive_bins = naive_bins          
+        self.naive_bins = naive_bins     
+        self.selection_metric = selection_metric      
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -247,7 +251,7 @@ class StrategicSegmentBuilder:
         """
         logger.info(f"🔍 Computing IV and bins for {len(eligible_cols)} features...")
 
-        def _worker(col: str) -> Tuple[str, float, Optional[np.ndarray]]:
+        def _worker(col: str) -> Tuple[str, float, float, Optional[np.ndarray]]:
             try:
                 thread_con = con.cursor()
                 data_dict = thread_con.execute(
@@ -257,7 +261,7 @@ class StrategicSegmentBuilder:
                 col_arr_raw = data_dict[col]
                 target_arr_raw = data_dict[self.target]
 
-                # Unmask DuckDB MaskedArrays into plain dense numpy ndarrays
+                # Unmask DuckDB MaskedArrays
                 if isinstance(col_arr_raw, np.ma.MaskedArray):
                     col_arr = col_arr_raw.filled(np.nan if np.issubdtype(col_arr_raw.dtype, np.number) else None)
                 else:
@@ -269,13 +273,35 @@ class StrategicSegmentBuilder:
                     target_arr = target_arr_raw
 
                 dtype = self._resolve_optb_dtype(columns_types[col])
+                
+                iv_val = 0.0
+                max_rr = 0.0
 
                 if self.binning_method == "naive":
                     total_events = np.sum(target_arr)
                     total_non_events = len(target_arr) - total_events
-                    iv_val = 0.0
-                    # Use plain np.empty so transformed_bins is a standard ndarray, not a MaskedArray
                     transformed_bins = np.empty(len(col_arr), dtype=object)
+                    
+                    # Helper function to compute both metrics per bin
+                    def _process_naive_bin_stats(mask, current_iv, current_max_rr):
+                        bin_events = np.sum(target_arr[mask])
+                        bin_total = np.sum(mask)
+                        bin_non_events = bin_total - bin_events
+                        
+                        if bin_total > 0:
+                            # Update max response rate (enforcing hard constraints)
+                            if bin_total >= self.min_sample_size and bin_events >= self.min_events:
+                                rr = bin_events / bin_total
+                                if rr > current_max_rr:
+                                    current_max_rr = rr
+                                    
+                            # Update IV chunk
+                            if bin_events > 0 or bin_non_events > 0:
+                                pct_events = max((bin_events / total_events) if total_events > 0 else 0, 1e-6)
+                                pct_non_events = max((bin_non_events / total_non_events) if total_non_events > 0 else 0, 1e-6)
+                                current_iv += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
+                                
+                        return current_iv, current_max_rr
 
                     if dtype == "numerical":
                         col_arr_float = col_arr.astype(float, copy=False)
@@ -295,36 +321,21 @@ class StrategicSegmentBuilder:
 
                         for i in range(len(edges) - 1):
                             lower, upper = edges[i], edges[i+1]
-                            
                             lower_str = "-inf" if np.isinf(lower) and lower < 0 else str(lower)
                             upper_str = "inf" if np.isinf(upper) and upper > 0 else str(upper)
-                            bin_label = f"[{lower_str}, {upper_str})"
                             
                             mask = (bin_indices == i) & valid_mask
-                            transformed_bins[mask] = bin_label
-                            
-                            bin_events = np.sum(target_arr[mask])
-                            bin_non_events = np.sum(~target_arr[mask].astype(bool))
-                            if bin_events == 0 and bin_non_events == 0:
-                                continue
-                                
-                            pct_events = max((bin_events / total_events) if total_events > 0 else 0, 1e-6)
-                            pct_non_events = max((bin_non_events / total_non_events) if total_non_events > 0 else 0, 1e-6)
-                            iv_val += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
+                            transformed_bins[mask] = f"[{lower_str}, {upper_str})"
+                            iv_val, max_rr = _process_naive_bin_stats(mask, iv_val, max_rr)
 
                         # Handle Missing for numerical
                         missing_mask = ~valid_mask
                         if np.any(missing_mask):
                             transformed_bins[missing_mask] = "Missing"
-                            bin_events = np.sum(target_arr[missing_mask])
-                            bin_non_events = np.sum(~target_arr[missing_mask].astype(bool))
-                            if bin_events > 0 or bin_non_events > 0:
-                                pct_events = max((bin_events / total_events) if total_events > 0 else 0, 1e-6)
-                                pct_non_events = max((bin_non_events / total_non_events) if total_non_events > 0 else 0, 1e-6)
-                                iv_val += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
+                            iv_val, max_rr = _process_naive_bin_stats(missing_mask, iv_val, max_rr)
 
                     else:
-                        # Handle categorical arrays with 'Missing' imputation
+                        # Handle categorical arrays
                         missing_mask = np.array([
                             x is None 
                             or (isinstance(x, float) and np.isnan(x)) 
@@ -338,41 +349,38 @@ class StrategicSegmentBuilder:
                             unique_vals = np.unique(valid_vals)
                             
                             for val in unique_vals:
-                                bin_label = f"['{val}']"
                                 mask = valid_mask & (col_arr.astype(str) == val)
-                                transformed_bins[mask] = bin_label
-                                
-                                bin_events = np.sum(target_arr[mask])
-                                bin_non_events = np.sum(~target_arr[mask].astype(bool))
-                                if bin_events == 0 and bin_non_events == 0:
-                                    continue
-                                pct_events = max((bin_events / total_events) if total_events > 0 else 0, 1e-6)
-                                pct_non_events = max((bin_non_events / total_non_events) if total_non_events > 0 else 0, 1e-6)
-                                iv_val += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
+                                transformed_bins[mask] = f"['{val}']"
+                                iv_val, max_rr = _process_naive_bin_stats(mask, iv_val, max_rr)
 
                         if np.any(missing_mask):
                             transformed_bins[missing_mask] = "Missing"
-                            bin_events = np.sum(target_arr[missing_mask])
-                            bin_non_events = np.sum(~target_arr[missing_mask].astype(bool))
-                            if bin_events > 0 or bin_non_events > 0:
-                                pct_events = max((bin_events / total_events) if total_events > 0 else 0, 1e-6)
-                                pct_non_events = max((bin_non_events / total_non_events) if total_non_events > 0 else 0, 1e-6)
-                                iv_val += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
+                            iv_val, max_rr = _process_naive_bin_stats(missing_mask, iv_val, max_rr)
 
                     transformed_bins = np.asarray(transformed_bins, dtype=str)
 
                 else:
+                    # Optimal binning fallback
                     optb = OptimalBinning(name=col, dtype=dtype)
                     optb.fit(col_arr, target_arr)
-
-                    iv_val = optb.binning_table.build()["IV"].values[-1]
+                    
+                    bin_table = optb.binning_table.build()
+                    iv_val = bin_table["IV"].values[-1]
                     transformed_bins = np.asarray(optb.transform(col_arr, metric="bins"), dtype=str)
+                    
+                    # Extract max response rate enforcing hard constraints
+                    valid_bins = bin_table[
+                        (bin_table["Count"] >= self.min_sample_size) & 
+                        (bin_table["Event"] >= self.min_events)
+                    ]
+                    if not valid_bins.empty:
+                        max_rr = valid_bins["Event rate"].max()
 
                 thread_con.close()
-                return col, float(iv_val) * 100, transformed_bins
+                return col, float(iv_val) * 100, float(max_rr), transformed_bins
             except Exception as e:
-                logger.debug(f"IV computation failed for {col}: {e}")
-                return col, 0.0, None
+                logger.debug(f"Computation failed for {col}: {e}")
+                return col, 0.0, 0.0, None
 
         results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
@@ -380,12 +388,17 @@ class StrategicSegmentBuilder:
 
         ranking = []
         precomputed_bins = {}
-        for col, iv, bins in results:
-            ranking.append({"variable": col, "iv": iv})
+        for col, iv, rr, bins in results:
+            ranking.append({"variable": col, "iv": iv, "max_rr": rr})
             if bins is not None:
                 precomputed_bins[col] = bins
 
-        ranking.sort(key=lambda x: x["iv"], reverse=True)
+        # Dynamic sorting based on user selection
+        if self.selection_metric == "response_rate":
+            ranking.sort(key=lambda x: x["max_rr"], reverse=True)
+        else:
+            ranking.sort(key=lambda x: x["iv"], reverse=True)
+            
         return ranking, precomputed_bins
 
     def _agg_combinations(
@@ -635,25 +648,34 @@ class StrategicSegmentBuilder:
             )
 
             # --- Diagnostic snapshot ---
-            current_iv_map = {row["variable"]: row["iv"] for row in iv_ranking}
+            # --- Diagnostic snapshot ---
+            if self.selection_metric == "response_rate":
+                current_score_map = {row["variable"]: row["max_rr"] for row in iv_ranking}
+            else:
+                current_score_map = {row["variable"]: row["iv"] for row in iv_ranking}
+                
             top_n_variable_names = [r["variable"] for r in iv_ranking[:self.top_n_vars]]
             iteration_snapshot = {}
             for col in eligible_cols:
                 used_count = self.feature_usage_counts.get(col, 0)
-                current_iv = current_iv_map.get(col, 0.0)
+                current_score = current_score_map.get(col, 0.0)
+                
                 if used_count >= self.max_feature_reuse:
                     status = "Excluded (Max Feature Reuse Exceeded)"
-                elif current_iv <= 0.0:
-                    status = "Excluded (Information Value is Zero/Invalid)"
+                elif current_score <= 0.0:
+                    status = f"Excluded ({self.selection_metric.upper()} is Zero/Invalid)"
                 elif col not in top_n_variable_names:
-                    status = "Excluded (Outside Top N Features by IV)"
+                    status = "Excluded (Outside Top N Features by Score)"
                 else:
                     status = "Eligible for Combination Search"
+                    
                 iteration_snapshot[col] = {
-                    "iv": current_iv,
+                    "metric_score": current_score,
+                    "metric_type": self.selection_metric,
                     "times_used_previously": used_count,
                     "status": status,
                 }
+                
             self.diagnostics_.append(
                 {
                     "iteration": i,
@@ -972,7 +994,11 @@ class StrategicSegmentBuilder:
                 continue
 
             print(f"\n[Iteration {iter_num}]")
-            print(f"  • Current dynamic IV   : {state['iv']:.4f}")
+            # Default fallback to 'iv' for backward compatibility on older states
+            metric_val = state.get('metric_score', state.get('iv', 0.0))
+            metric_name = state.get('metric_type', 'iv').upper()
+            
+            print(f"  • Current dynamic {metric_name}   : {metric_val:.4f}")
             print(f"  • Previous times used  : {state['times_used_previously']}")
             print(f"  • Selection Status     : {state['status']}")
 

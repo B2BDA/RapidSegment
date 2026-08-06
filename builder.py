@@ -19,6 +19,7 @@ import numpy as np
 import psutil
 from joblib import Parallel, delayed
 from optbinning import OptimalBinning
+import pandas as pd
 
 # -----------------------------------------------------------------------------
 # Module-level configuration
@@ -93,7 +94,7 @@ class StrategicSegmentBuilder:
             feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
             ignore_features: Explicit list of columns to drop prior to IV calculation.
             sort_priority: Ranking criteria for selecting champion segments. 
-                Can be a predefined shortcut string:
+                    Can be a predefined shortcut string:
                     - 'lift_rate_count': Lift → Response Rate → Sample Size
                     - 'count_lift_rate': Sample Size → Lift → Response Rate
                     - 'rate_lift_count': Response Rate → Lift → Sample Size
@@ -946,21 +947,39 @@ class StrategicSegmentBuilder:
                 (SUM(CAST("{self.target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
             FROM original_df
             GROUP BY 1
+            ORDER BY 1 DESC
         ),
         BASE_KPIS AS (
             SELECT *,
                 SUM(total_count) OVER() AS total_population,
+                SUM(target_events) OVER() AS total_target_events,
                 (SUM(target_events) OVER() * 1.0 / SUM(total_count) OVER()) * 100 AS base_response_rate
             FROM PER_SEG_KPIS
+        ),
+        CUMULATIVE_KPIS AS (
+            SELECT *,
+                SUM(total_count) OVER (
+                    ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS cum_count,
+                SUM(target_events) OVER (
+                    ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS cum_events
+            FROM BASE_KPIS
         )
         SELECT
-            PER_SEG_KPIS.*,
-            BASE_KPIS.base_response_rate,
-            (PER_SEG_KPIS.total_count * 1.0 / BASE_KPIS.total_population) * 100 AS capture_rate,
-            (PER_SEG_KPIS.response_rate / BASE_KPIS.base_response_rate) AS lift
-        FROM PER_SEG_KPIS
-        LEFT JOIN BASE_KPIS ON PER_SEG_KPIS.segment = BASE_KPIS.segment
-        ORDER BY segment
+            segment,
+            total_count,
+            target_events,
+            response_rate,
+            base_response_rate,
+            (total_count * 100.0 / total_population) AS capture_rate,
+            (response_rate / NULLIF(base_response_rate, 0)) AS lift,
+            (cum_count * 100.0 / NULLIF(total_population, 0)) AS cumulative_sample_capture,
+            (cum_events * 100.0 / NULLIF(total_target_events, 0)) AS cumulative_event_capture
+        FROM CUMULATIVE_KPIS
+        ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
         """
 
         res = con.execute(final_query)
@@ -1011,3 +1030,160 @@ class StrategicSegmentBuilder:
                     f"(Variables: {winner['variables_used']})"
                 )
         print("=" * 80)
+
+    def generate_feature_health_report(
+        self, original_data: Any, features: List[str]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Generates a feature health report on the original dataset for an explicitly provided
+        list of features using native DuckDB SQL naive binning (NTILE quantiles for numeric
+        features and direct grouping for categoricals). Robustly handles string targets.
+
+        Args:
+            original_data: The original (unfiltered) dataset.
+            features: List of feature column names to evaluate.
+
+        Returns:
+            Dictionary mapping each specified feature to its bin health details.
+        """
+        if not features:
+            logger.warning("⚠️ No features provided for health report generation.")
+            return {}
+
+        # Deduplicate features while preserving order
+        unique_features = list(dict.fromkeys(features))
+
+        logger.info(
+            f"📋 Generating DuckDB Naive Feature Health Report for {len(unique_features)} feature(s): "
+            f"{unique_features}"
+        )
+
+        con = duckdb.connect(":memory:")
+        con.execute("CREATE TABLE input_df AS SELECT * FROM original_data")
+
+        cols_info = con.execute("DESCRIBE input_df").fetchall()
+        columns_types = {row[0]: row[1] for row in cols_info}
+
+        # Safe target conversion expression for DuckDB SQL (handles numeric, string 'Yes'/'No', 'True'/'False')
+        target_expr = f"""
+        (CASE 
+            WHEN TRY_CAST("{self.target}" AS DOUBLE) IS NOT NULL THEN TRY_CAST("{self.target}" AS DOUBLE)
+            WHEN LOWER(TRIM(CAST("{self.target}" AS VARCHAR))) IN ('1', 'true', 'yes', 'y', 't') THEN 1.0
+            ELSE 0.0
+        END)
+        """
+
+        health_report: Dict[str, List[Dict[str, Any]]] = {}
+
+        for col in unique_features:
+            if col not in columns_types:
+                logger.warning(f"⚠️ Feature '{col}' not found in dataset columns. Skipping.")
+                continue
+
+            duckdb_type = columns_types[col].upper()
+            is_numeric = any(
+                t in duckdb_type
+                for t in [
+                    "INT",
+                    "BIGINT",
+                    "DOUBLE",
+                    "FLOAT",
+                    "DECIMAL",
+                    "REAL",
+                    "NUMERIC",
+                    "HUGEINT",
+                    "TINYINT",
+                    "SMALLINT",
+                ]
+            )
+
+            if is_numeric:
+                # DuckDB SQL Quantile binning via NTILE()
+                query = f"""
+                WITH ranked AS (
+                    SELECT
+                        "{col}" AS val,
+                        {target_expr} AS target_val,
+                        NTILE({self.naive_bins}) OVER (ORDER BY "{col}") AS tile
+                    FROM input_df
+                    WHERE "{col}" IS NOT NULL
+                ),
+                numeric_bins AS (
+                    SELECT
+                        '[' || ROUND(MIN(val), 4) || ', ' || ROUND(MAX(val), 4) || ']' AS bin,
+                        COUNT(*) AS total_count,
+                        SUM(target_val) AS event_count,
+                        (SUM(target_val) * 100.0 / COUNT(*)) AS response_rate,
+                        FALSE AS is_missing,
+                        MIN(val) AS sort_key
+                    FROM ranked
+                    GROUP BY tile
+                ),
+                missing_bin AS (
+                    SELECT
+                        'Missing' AS bin,
+                        COUNT(*) AS total_count,
+                        SUM({target_expr}) AS event_count,
+                        (SUM({target_expr}) * 100.0 / NULLIF(COUNT(*), 0)) AS response_rate,
+                        TRUE AS is_missing,
+                        1e18 AS sort_key
+                    FROM input_df
+                    WHERE "{col}" IS NULL
+                    HAVING COUNT(*) > 0
+                )
+                SELECT bin, total_count, event_count, response_rate, is_missing
+                FROM (
+                    SELECT * FROM numeric_bins
+                    UNION ALL
+                    SELECT * FROM missing_bin
+                )
+                ORDER BY sort_key
+                """
+            else:
+                # Direct SQL grouping for categorical values
+                query = f"""
+                SELECT
+                    CASE
+                        WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
+                        ELSE '[' || CAST("{col}" AS VARCHAR) || ']'
+                    END AS bin,
+                    COUNT(*) AS total_count,
+                    SUM({target_expr}) AS event_count,
+                    (SUM({target_expr}) * 100.0 / COUNT(*)) AS response_rate,
+                    CASE
+                        WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN TRUE
+                        ELSE FALSE
+                    END AS is_missing
+                FROM input_df
+                GROUP BY 1, 5
+                ORDER BY is_missing ASC, bin ASC
+                """
+
+            res = con.execute(query).fetchall()
+            col_report = [
+                {
+                    "bin": row[0],
+                    "total_count": int(row[1]),
+                    "event_count": int(row[2] or 0),
+                    "response_rate": round(float(row[3] or 0.0), 4),
+                    "is_missing": bool(row[4]),
+                }
+                for row in res
+            ]
+            health_report[col] = col_report
+
+        con.close()
+        rows = []
+        for feature, bins in health_report.items():
+            for b in bins:
+                rows.append({
+                    "feature": feature,
+                    "bin": b["bin"],
+                    "total_count": b["total_count"],
+                    "event_count": b["event_count"],
+                    "response_rate_%": b["response_rate"],
+                    "is_missing": b["is_missing"]
+                })
+    
+        health_report_df = pd.DataFrame(rows)
+        return health_report_df

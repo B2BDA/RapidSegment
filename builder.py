@@ -306,52 +306,84 @@ class StrategicSegmentBuilder:
 
                     if dtype == "numerical":
                         # ============================================================
-                        # NAIVE NUMERICAL BINNING — RESPONSE-RATE OPTIMIZED
+                        # NAIVE NUMERICAL BINNING
+                        # Response-rate optimized pre-binning + greedy merging
                         # ============================================================
 
                         col_arr_float = col_arr.astype(float, copy=False)
+                        transformed_bins = np.full(
+                        len(col_arr),
+                        "Missing",
+                        dtype=object
+                            )
+
                         valid_mask = ~np.isnan(col_arr_float)
 
                         if not np.any(valid_mask):
                             raise ValueError("Column contains only NaNs")
 
                         # ------------------------------------------------------------
-                        # Initial quantile bins
-                        # naive_bins = INITIAL number of bins
+                        # 1. INITIAL QUANTILE BINNING
+                        #
+                        # self.naive_bins = INITIAL number of bins.
+                        # These are only pre-bins. They are not necessarily final bins.
                         # ------------------------------------------------------------
-                        q = np.linspace(0, 100, self.naive_bins + 1)
+                        q = np.linspace(
+                            0,
+                            100,
+                            self.naive_bins + 1
+                        )
 
                         edges = np.unique(
-                            np.percentile(col_arr_float[valid_mask], q)
+                            np.percentile(
+                                col_arr_float[valid_mask],
+                                q
+                            )
                         )
 
                         if len(edges) < 2:
-                            edges = np.array([-np.inf, np.inf])
+                            edges = np.array(
+                                [-np.inf, np.inf]
+                            )
                         else:
                             edges[0] = -np.inf
                             edges[-1] = np.inf
 
                         # ------------------------------------------------------------
-                        # Constraints / reference response rate
+                        # 2. CONFIGURATION
                         # ------------------------------------------------------------
                         _min_sample = self.min_sample_size
                         _min_events = self.min_events
 
-                        # Current residual/base response rate.
-                        # target_arr represents the current population being evaluated.
-                        _reference_rr = float(np.mean(target_arr))
+                        # Current residual/base response rate
+                        _reference_rr = float(
+                            np.mean(target_arr)
+                        )
 
-                        # Minimum required lift over residual/base response rate.
-                        # Uses self.min_lift if available; otherwise defaults to 20%.
-                        _min_lift = float(getattr(self, "min_lift", 1.20))
+                        # Required minimum lift.
+                        # Existing RapidSegment setting is used when available.
+                        # Otherwise default to 20%.
+                        _min_lift = float(
+                            getattr(
+                                self,
+                                "min_lift",
+                                1.20
+                            )
+                        )
 
-                        _rr_threshold = _reference_rr * _min_lift
+                        _rr_threshold = (
+                            _reference_rr * _min_lift
+                        )
 
                         # ------------------------------------------------------------
-                        # Build initial bins
+                        # 3. BUILD INITIAL BINS
+                        #
+                        # Each bin:
+                        #
                         # [lower, upper, events, total]
                         # ------------------------------------------------------------
                         def _build_bins(edg):
+
                             result = []
 
                             bin_indices = np.digitize(
@@ -360,15 +392,24 @@ class StrategicSegmentBuilder:
                                 right=False
                             )
 
-                            for b_idx in range(len(edg) - 1):
+                            for b_idx in range(
+                                len(edg) - 1
+                            ):
 
                                 mask = (
                                     (bin_indices == b_idx)
                                     & valid_mask
                                 )
 
-                                total = int(np.sum(mask))
-                                events = int(np.sum(target_arr[mask]))
+                                total = int(
+                                    np.sum(mask)
+                                )
+
+                                events = int(
+                                    np.sum(
+                                        target_arr[mask]
+                                    )
+                                )
 
                                 result.append([
                                     edg[b_idx],
@@ -379,33 +420,36 @@ class StrategicSegmentBuilder:
 
                             return result
 
-
+                        # ------------------------------------------------------------
+                        # 4. HELPER FUNCTIONS
+                        # ------------------------------------------------------------
                         def _response_rate(bin_data):
-                            events = bin_data[2]
-                            total = bin_data[3]
 
-                            if total == 0:
+                            total = bin_data[3]
+                            events = bin_data[2]
+
+                            if total <= 0:
                                 return 0.0
 
                             return events / total
 
+                        def _is_valid(bin_data):
 
-                        def _is_constraint_valid(bin_data):
-                            """
-                            A bin is structurally valid when it satisfies
-                            minimum sample size and minimum event requirements.
-                            """
                             return (
                                 bin_data[3] >= _min_sample
                                 and
                                 bin_data[2] >= _min_events
                             )
 
+                        def _is_high_response(bin_data):
+
+                            return (
+                                _response_rate(bin_data)
+                                >= _rr_threshold
+                            )
 
                         def _merge_bins(b1, b2):
-                            """
-                            Merge two adjacent bins.
-                            """
+
                             return [
                                 b1[0],
                                 b2[1],
@@ -413,97 +457,111 @@ class StrategicSegmentBuilder:
                                 b1[3] + b2[3]
                             ]
 
-
                         # ------------------------------------------------------------
-                        # Initial bins
+                        # 5. CREATE INITIAL PRE-BINS
                         # ------------------------------------------------------------
                         bins = _build_bins(edges)
+                        print("\n" + "=" * 80)
+                        print(f"NAIVE BINNING DEBUG: {col}")
+                        print("=" * 80)
 
+                        print(f"Reference RR       : {_reference_rr:.6f}")
+                        print(f"Required RR (1.2x) : {_rr_threshold:.6f}")
+                        print(f"Min sample         : {_min_sample}")
+                        print(f"Min events         : {_min_events}")
+                        print(f"Initial bins       : {len(bins)}")
 
+                        for i, b in enumerate(bins):
+
+                            rr = _response_rate(b)
+
+                            print(
+                                f"Bin {i + 1}: "
+                                f"[{b[0]}, {b[1]}) | "
+                                f"N={b[3]} | "
+                                f"Events={b[2]} | "
+                                f"RR={rr:.4%} | "
+                                f"Valid={_is_valid(b)} | "
+                                f"Lift={rr / _reference_rr:.2f}x"
+                            )
+
+                        print("=" * 80)
                         # ------------------------------------------------------------
-                        # Constraint-driven greedy merging
+                        # 6. FORCE CONSTRAINT-DRIVEN MERGING
                         #
-                        # We ONLY merge when at least one bin violates:
-                        #   min_sample_size
-                        #   OR
-                        #   min_events
+                        # Hard constraints:
+                        #     total >= min_sample_size
+                        #     events >= min_events
                         #
-                        # Among possible adjacent merges, prefer:
+                        # Any invalid bin MUST be merged.
                         #
-                        #   1. Merge satisfying both constraints
-                        #   2. Highest resulting response rate
-                        #   3. Highest resulting event count
-                        #   4. Highest resulting sample size
-                        #
-                        # We deliberately DO NOT merge already-valid bins just
-                        # to reduce the number of bins. This preserves high-RR
-                        # segments.
+                        # During this stage we do NOT voluntarily protect bins yet,
+                        # because an invalid bin has to be repaired first.
                         # ------------------------------------------------------------
+
                         while True:
 
                             invalid_indices = [
                                 idx
                                 for idx, b in enumerate(bins)
-                                if not _is_constraint_valid(b)
+                                if not _is_valid(b)
                             ]
 
-                            # All bins satisfy minimum constraints.
                             if not invalid_indices:
                                 break
 
-                            candidate_merges = []
+                            candidates = []
 
                             for idx in invalid_indices:
 
                                 # ----------------------------------------------------
-                                # Candidate: merge invalid bin with left neighbour
+                                # Merge with left neighbour
                                 # ----------------------------------------------------
                                 if idx > 0:
 
-                                    left = bins[idx - 1]
-                                    current = bins[idx]
+                                    merged = _merge_bins(
+                                        bins[idx - 1],
+                                        bins[idx]
+                                    )
 
-                                    merged = _merge_bins(left, current)
-
-                                    candidate_merges.append({
-                                        "index": idx - 1,
+                                    candidates.append({
+                                        "idx": idx - 1,
                                         "bin": merged,
-                                        "valid": _is_constraint_valid(merged),
+                                        "valid": _is_valid(merged),
                                         "rr": _response_rate(merged),
                                         "events": merged[2],
-                                        "total": merged[3]
+                                        "total": merged[3],
                                     })
 
                                 # ----------------------------------------------------
-                                # Candidate: merge invalid bin with right neighbour
+                                # Merge with right neighbour
                                 # ----------------------------------------------------
                                 if idx < len(bins) - 1:
 
-                                    current = bins[idx]
-                                    right = bins[idx + 1]
+                                    merged = _merge_bins(
+                                        bins[idx],
+                                        bins[idx + 1]
+                                    )
 
-                                    merged = _merge_bins(current, right)
-
-                                    candidate_merges.append({
-                                        "index": idx,
+                                    candidates.append({
+                                        "idx": idx,
                                         "bin": merged,
-                                        "valid": _is_constraint_valid(merged),
+                                        "valid": _is_valid(merged),
                                         "rr": _response_rate(merged),
                                         "events": merged[2],
-                                        "total": merged[3]
+                                        "total": merged[3],
                                     })
 
-                            if not candidate_merges:
+                            if not candidates:
                                 break
 
                             # --------------------------------------------------------
-                            # First prefer merges that actually repair the
-                            # min_sample / min_events constraint.
-                            #
-                            # Then maximise response rate.
+                            # Prefer merges that immediately satisfy constraints.
+                            # Among valid candidates maximize response rate.
                             # --------------------------------------------------------
                             valid_candidates = [
-                                c for c in candidate_merges
+                                c
+                                for c in candidates
                                 if c["valid"]
                             ]
 
@@ -514,32 +572,28 @@ class StrategicSegmentBuilder:
                                     key=lambda c: (
                                         c["rr"],
                                         c["events"],
-                                        c["total"]
+                                        c["total"],
                                     )
                                 )
 
                             else:
 
                                 # ----------------------------------------------------
-                                # No single merge can immediately satisfy the
-                                # constraints.
+                                # No single merge satisfies the constraints.
                                 #
-                                # We still need to make progress, otherwise the
-                                # algorithm can get permanently stuck with small bins.
-                                #
-                                # Choose the merge producing the highest RR and
-                                # continue merging until the constraints are met.
+                                # We still have to make progress.
+                                # Choose the merge with the highest resulting RR.
                                 # ----------------------------------------------------
                                 best = max(
-                                    candidate_merges,
+                                    candidates,
                                     key=lambda c: (
                                         c["rr"],
                                         c["events"],
-                                        c["total"]
+                                        c["total"],
                                     )
                                 )
 
-                            merge_idx = best["index"]
+                            merge_idx = best["idx"]
 
                             bins = (
                                 bins[:merge_idx]
@@ -549,27 +603,270 @@ class StrategicSegmentBuilder:
 
 
                         # ------------------------------------------------------------
-                        # Write final bin labels into transformed_bins
+                        # 7. RESPONSE-RATE OPTIMIZATION
+                        #
+                        # HARD RULES:
+                        #
+                        # 1. min_sample_size and min_events are mandatory.
+                        # 2. Any valid bin with >= min_lift is protected.
+                        # 3. Protected bins can NEVER be merged.
+                        # 4. If no bin qualifies, protect the highest-RR valid bin.
+                        # 5. Among unprotected bins, choose the merge producing
+                        #    the highest resulting response rate.
+                        #
+                        # IMPORTANT:
+                        # Protection is based on the actual bin object, NOT its index.
+                        # This prevents protected bins from losing protection when
+                        # bins before them are merged.
+                        # ------------------------------------------------------------
+
+                        # ------------------------------------------------------------
+                        # 7A. Identify protected bins
+                        # ------------------------------------------------------------
+
+                        protected_bins = []
+
+                        for b in bins:
+
+                            if (
+                                _is_valid(b)
+                                and _is_high_response(b)
+                            ):
+                                protected_bins.append(b)
+
+
+                        # ------------------------------------------------------------
+                        # 7B. If nothing qualifies, protect the best valid bin
+                        # ------------------------------------------------------------
+
+                        if not protected_bins:
+
+                            valid_bins = [
+                                b
+                                for b in bins
+                                if _is_valid(b)
+                            ]
+
+                            if valid_bins:
+
+                                best_bin = max(
+                                    valid_bins,
+                                    key=lambda b: (
+                                        _response_rate(b),
+                                        b[2],
+                                        b[3],
+                                    )
+                                )
+
+                                protected_bins.append(best_bin)
+
+
+                        # ------------------------------------------------------------
+                        # DEBUG PROTECTION
+                        # ------------------------------------------------------------
+
+                        print(
+                            f"[NAIVE MERGE] {col}: "
+                            f"Protected bins = {len(protected_bins)}"
+                        )
+
+                        for i, b in enumerate(bins):
+
+                            if b in protected_bins:
+
+                                print(
+                                    f"[NAIVE MERGE] PROTECTED Bin {i + 1}: "
+                                    f"[{b[0]}, {b[1]}) | "
+                                    f"RR={_response_rate(b):.4%} | "
+                                    f"Lift="
+                                    f"{_response_rate(b) / _reference_rr:.2f}x"
+                                )
+
+
+                        # ------------------------------------------------------------
+                        # 7C. Residual optimization
+                        #
+                        # Only unprotected bins can be merged.
+                        #
+                        # We maximize:
+                        #
+                        #     1. resulting response rate
+                        #     2. events
+                        #     3. sample size
+                        # ------------------------------------------------------------
+
+                        while len(bins) > 1:
+
+                            candidates = []
+
+                            for idx in range(len(bins) - 1):
+
+                                left = bins[idx]
+                                right = bins[idx + 1]
+
+                                if (
+                                    left in protected_bins
+                                    or right in protected_bins
+                                ):
+                                    continue
+
+                                merged = _merge_bins(left, right)
+
+                                if not _is_valid(merged):
+                                    continue
+
+                                merged_rr = _response_rate(merged)
+
+                                candidates.append({
+                                    "idx": idx,
+                                    "bin": merged,
+                                    "rr": merged_rr,
+                                    "events": merged[2],
+                                    "total": merged[3],
+                                })
+
+                            if not candidates:
+                                break
+
+                            best = max(
+                                candidates,
+                                key=lambda c: (c["rr"], c["events"], c["total"])
+                            )
+
+                            # ← ADD THIS: stop if merging can't beat the current best unprotected RR
+                            current_unprotected_rr = max(
+                                (_response_rate(b) for b in bins if b not in protected_bins),
+                                default=0.0
+                            )
+                            if best["rr"] <= current_unprotected_rr:
+                                break                         # ← merging only makes things worse; stop
+
+                            merge_idx = best["idx"]
+
+
+                            old_left = bins[merge_idx]
+                            old_right = bins[merge_idx + 1]
+
+                            print(
+                                f"[NAIVE MERGE] {col}: "
+                                f"Merging bins {merge_idx + 1} "
+                                f"and {merge_idx + 2} | "
+                                f"RR: "
+                                f"{_response_rate(old_left):.4%} + "
+                                f"{_response_rate(old_right):.4%} "
+                                f"-> "
+                                f"{best['rr']:.4%}"
+                            )
+
+                            bins = (
+                                bins[:merge_idx]
+                                + [best["bin"]]
+                                + bins[merge_idx + 2:]
+                            )
+
+
+
+
+
+                        # ------------------------------------------------------------
+                        # 7D. FINAL NUMERICAL DEBUG
+                        # ------------------------------------------------------------
+
+                        print("\n" + "-" * 80)
+                        print(f"FINAL NAIVE BINNING: {col}")
+                        print("-" * 80)
+
+                        print(
+                            f"Initial bins : {len(edges) - 1}"
+                        )
+                        print(
+                            f"Final bins   : {len(bins)}"
+                        )
+                        print(
+                            f"Bins merged  : {(len(edges) - 1) - len(bins)}"
+                        )
+
+                        for i, b in enumerate(bins):
+
+                            rr = _response_rate(b)
+
+                            lift = (
+                                rr / _reference_rr
+                                if _reference_rr > 0
+                                else 0.0
+                            )
+
+                            status = (
+                                "QUALIFYING / PROTECTED"
+                                if i in protected_bins
+                                else "RESIDUAL"
+                            )
+
+                            print(
+                                f"Final Bin {i + 1}: "
+                                f"[{b[0]}, {b[1]}) | "
+                                f"N={b[3]} | "
+                                f"Events={b[2]} | "
+                                f"RR={rr:.4%} | "
+                                f"Lift={lift:.2f}x | "
+                                f"Status={status}"
+                            )
+
+                        print("=" * 80)
+
+                        # ------------------------------------------------------------
+                        # 8. WRITE FINAL BIN LABELS
+                        #
+                        # KEEP THIS FORMAT because downstream rule parsing expects
+                        # numerical intervals.
                         # ------------------------------------------------------------
                         for b in bins:
 
-                            lower, upper = b[0], b[1]
+                            for i, b in enumerate(bins):
+
+                                rr = _response_rate(b)
+
+                                lift = (
+                                    rr / _reference_rr
+                                    if _reference_rr > 0
+                                    else 0.0
+                                )
+
+                                if rr >= _rr_threshold:
+                                    status = "QUALIFYING / PROTECTED"
+                                else:
+                                    status = "RESIDUAL"
+
+                            lower = b[0]
+                            upper = b[1]
 
                             lower_str = (
                                 "-inf"
-                                if np.isinf(lower) and lower < 0
+                                if (
+                                    np.isinf(lower)
+                                    and lower < 0
+                                )
                                 else str(lower)
                             )
 
                             upper_str = (
                                 "inf"
-                                if np.isinf(upper) and upper > 0
+                                if (
+                                    np.isinf(upper)
+                                    and upper > 0
+                                )
                                 else str(upper)
                             )
 
-                            label = f"[{lower_str}, {upper_str})"
+                            label = (
+                                f"[{lower_str}, "
+                                f"{upper_str})"
+                            )
 
-                            if np.isinf(lower) and lower < 0:
+                            if (
+                                np.isinf(lower)
+                                and lower < 0
+                            ):
 
                                 mask = (
                                     (col_arr_float < upper)
@@ -593,40 +890,89 @@ class StrategicSegmentBuilder:
 
                             transformed_bins[mask] = label
 
-                            iv_val, max_rr = _process_naive_bin_stats(
-                                mask,
-                                iv_val,
-                                max_rr
+                            iv_val, max_rr = (
+                                _process_naive_bin_stats(
+                                    mask,
+                                    iv_val,
+                                    max_rr
+                                )
                             )
 
-
                         # ------------------------------------------------------------
-                        # Missing values remain a separate bin
+                        # 9. MISSING VALUES
                         # ------------------------------------------------------------
                         missing_mask = ~valid_mask
 
                         if np.any(missing_mask):
 
-                            transformed_bins[missing_mask] = "Missing"
+                            transformed_bins[
+                                missing_mask
+                            ] = "Missing"
 
-                            iv_val, max_rr = _process_naive_bin_stats(
-                                missing_mask,
-                                iv_val,
-                                max_rr
+                            iv_val, max_rr = (
+                                _process_naive_bin_stats(
+                                    missing_mask,
+                                    iv_val,
+                                    max_rr
+                                )
                             )
+                            # --------------------------------------------------------
+                            # 9. FINAL DEBUG
+                            # --------------------------------------------------------
+
+                            print("\n" + "-" * 80)
+                            print(f"FINAL NAIVE BINNING: {col}")
+                            print("-" * 80)
+
+                            initial_bin_count = len(edges) - 1
+
+                            print(f"Initial bins : {initial_bin_count}")
+                            print(f"Final bins   : {len(bins)}")
+                            print(f"Bins merged  : {initial_bin_count - len(bins)}")
+
+                            for i, b in enumerate(bins):
+
+                                rr = _response_rate(b)
+
+                                lift = (
+                                    rr / _reference_rr
+                                    if _reference_rr > 0
+                                    else 0.0
+                                )
+
+                                status = (
+                                    "QUALIFYING / PROTECTED"
+                                    if (b[0], b[1]) in protected_bins
+                                    else "RESIDUAL"
+                                )
+
+                                print(
+                                    f"Final Bin {i + 1}: "
+                                    f"[{b[0]}, {b[1]}) | "
+                                    f"N={b[3]} | "
+                                    f"Events={b[2]} | "
+                                    f"RR={rr:.4%} | "
+                                    f"Lift={lift:.2f}x | "
+                                    f"Status={status}"
+                                )
+
+                            print("=" * 80)
 
                     else:
-
                         # ============================================================
-                        # NAIVE CATEGORICAL BINNING — RESPONSE-RATE OPTIMIZED
+                        # NAIVE CATEGORICAL BINNING
+                        # Response-rate optimized categorical grouping
                         # ============================================================
 
                         # ------------------------------------------------------------
-                        # Identify missing values
+                        # 1. IDENTIFY MISSING VALUES
                         # ------------------------------------------------------------
                         missing_mask = np.array([
                             x is None
-                            or (isinstance(x, float) and np.isnan(x))
+                            or (
+                                isinstance(x, float)
+                                and np.isnan(x)
+                            )
                             or (
                                 isinstance(x, str)
                                 and x.strip() in (
@@ -644,195 +990,281 @@ class StrategicSegmentBuilder:
 
                         valid_mask = ~missing_mask
 
-                        if np.any(valid_mask):
+                        # ------------------------------------------------------------
+                        # Nothing but missing values
+                        # ------------------------------------------------------------
+                        if not np.any(valid_mask):
 
-                            # --------------------------------------------------------
-                            # Convert valid categories to strings.
-                            # This preserves the existing categorical representation
-                            # used by RapidSegment.
-                            # --------------------------------------------------------
-                            valid_vals = col_arr[valid_mask].astype(str)
+                            if np.any(missing_mask):
 
-                            unique_vals = np.unique(valid_vals)
+                                transformed_bins[
+                                    missing_mask
+                                ] = "Missing"
 
-                            # --------------------------------------------------------
-                            # Build category statistics:
-                            #
-                            # [category, events, total, response_rate]
-                            # --------------------------------------------------------
-                            category_stats = []
-
-                            col_as_str = col_arr.astype(str)
-
-                            for val in unique_vals:
-
-                                mask = valid_mask & (col_as_str == val)
-
-                                total = int(np.sum(mask))
-                                events = int(np.sum(target_arr[mask]))
-
-                                rr = (
-                                    events / total
-                                    if total > 0
-                                    else 0.0
+                                iv_val, max_rr = (
+                                    _process_naive_bin_stats(
+                                        missing_mask,
+                                        iv_val,
+                                        max_rr
+                                    )
                                 )
 
-                                category_stats.append([
-                                    val,
-                                    events,
-                                    total,
-                                    rr,
-                                ])
+                            transformed_bins = np.asarray(
+                                transformed_bins,
+                                dtype=str
+                            )
+
+                        else:
 
                             # --------------------------------------------------------
-                            # Sort categories by response rate.
+                            # 2. NORMALIZE CATEGORIES
                             #
-                            # This creates an artificial ordering so that categories
-                            # with similar response behaviour become "adjacent".
-                            #
-                            # Example:
-                            #
-                            # A = 2%
-                            # B = 8%
-                            # C = 3%
-                            # D = 10%
-                            #
-                            # becomes:
-                            #
-                            # A = 2%
-                            # C = 3%
-                            # B = 8%
-                            # D = 10%
+                            # Keep the existing RapidSegment behaviour of representing
+                            # categorical values as strings.
                             # --------------------------------------------------------
-                            category_stats.sort(
-                                key=lambda x: x[3]
+                            col_as_str = col_arr.astype(str)
+
+                            valid_vals = col_as_str[
+                                valid_mask
+                            ]
+
+                            unique_vals = np.unique(
+                                valid_vals
                             )
 
                             # --------------------------------------------------------
-                            # Helpers
-                            # --------------------------------------------------------
-                            def _cat_response_rate(group):
-                                events = group["events"]
-                                total = group["total"]
-
-                                if total <= 0:
-                                    return 0.0
-
-                                return events / total
-
-                            def _cat_is_valid(group):
-                                return (
-                                    group["total"] >= self.min_sample_size
-                                    and
-                                    group["events"] >= self.min_events
-                                )
-
-                            def _merge_category_groups(g1, g2):
-                                return {
-                                    "categories": g1["categories"] + g2["categories"],
-                                    "events": g1["events"] + g2["events"],
-                                    "total": g1["total"] + g2["total"],
-                                }
-
-                            # --------------------------------------------------------
-                            # Convert category statistics into mergeable groups.
+                            # 3. CALCULATE CATEGORY RESPONSE RATES
                             #
-                            # Each group contains one or more original categories.
+                            # Each category starts as its own pre-bin.
+                            #
+                            # Structure:
+                            #
+                            # {
+                            #     "categories": [...],
+                            #     "events": ...,
+                            #     "total": ...
+                            # }
                             # --------------------------------------------------------
                             groups = []
+                            for value in unique_vals:
 
-                            for val, events, total, rr in category_stats:
+                                category_mask = (
+                                    valid_mask
+                                    & (col_as_str == value)
+                                )
+
+                                total = int(
+                                    np.sum(category_mask)
+                                )
+
+                                events = int(
+                                    np.sum(
+                                        target_arr[
+                                            category_mask
+                                        ]
+                                    )
+                                )
 
                                 groups.append({
-                                    "categories": [val],
+                                    "categories": [value],
                                     "events": events,
                                     "total": total,
                                 })
 
                             # --------------------------------------------------------
-                            # Constraint-driven greedy merging
-                            #
-                            # We ONLY merge when a group violates:
-                            #
-                            #   min_sample_size
-                            #   OR
-                            #   min_events
-                            #
-                            # Among possible adjacent merges, prefer:
-                            #
-                            #   1. A merge that satisfies both constraints
-                            #   2. Highest resulting response rate
-                            #   3. Highest resulting event count
-                            #   4. Highest resulting sample size
-                            #
-                            # We deliberately do not merge already-valid groups.
-                            # This protects high-response categories/groups.
+                            # 4. RESPONSE-RATE HELPERS
                             # --------------------------------------------------------
+                            _min_sample = self.min_sample_size
+                            _min_events = self.min_events
+
+                            _reference_rr = float(
+                                np.mean(target_arr)
+                            )
+
+                            _min_lift = float(
+                                getattr(
+                                    self,
+                                    "min_lift",
+                                    1.20
+                                )
+                            )
+
+                            _rr_threshold = (
+                                _reference_rr * _min_lift
+                            )
+
+                            def _group_rr(group):
+
+                                total = group["total"]
+
+                                if total <= 0:
+                                    return 0.0
+
+                                return (
+                                    group["events"]
+                                    / total
+                                )
+
+                            def _group_valid(group):
+
+                                return (
+                                    group["total"]
+                                    >= _min_sample
+                                    and
+                                    group["events"]
+                                    >= _min_events
+                                )
+
+                            def _group_high_rr(group):
+
+                                return (
+                                    _group_rr(group)
+                                    >= _rr_threshold
+                                )
+
+                            def _merge_groups(
+                                group_1,
+                                group_2
+                            ):
+
+                                return {
+                                    "categories": (
+                                        group_1["categories"]
+                                        + group_2["categories"]
+                                    ),
+                                    "events": (
+                                        group_1["events"]
+                                        + group_2["events"]
+                                    ),
+                                    "total": (
+                                        group_1["total"]
+                                        + group_2["total"]
+                                    ),
+                                }
+
+                            # ------------------------------------------------------------
+                            # 5. ORDER CATEGORIES BY RESPONSE RATE
+                            #
+                            # Categories have no natural ordering.
+                            #
+                            # Therefore, order them by response rate so that categories
+                            # with similar response rates become adjacent.
+                            # ------------------------------------------------------------
+
+                            groups.sort(
+                                key=lambda group: _group_rr(group)
+                            )
+
+                            print("\n" + "=" * 80)
+                            print(f"NAIVE BINNING DEBUG: {col}")
+                            print("=" * 80)
+
+                            print(f"Reference RR       : {_reference_rr:.6f}")
+                            print(f"Required RR (1.2x) : {_rr_threshold:.6f}")
+                            print(f"Min sample         : {_min_sample}")
+                            print(f"Min events         : {_min_events}")
+                            print(f"Initial categories : {len(groups)}")
+
+                            for i, group in enumerate(groups):
+
+                                rr = _group_rr(group)
+
+                                print(
+                                    f"Group {i + 1}: "
+                                    f"{group['categories']} | "
+                                    f"N={group['total']} | "
+                                    f"Events={group['events']} | "
+                                    f"RR={rr:.4%} | "
+                                    f"Valid={_group_valid(group)} | "
+                                    f"Lift={rr / _reference_rr:.2f}x"
+                                )
+
+                            print("=" * 80)
+
+
+                            # ------------------------------------------------------------
+                            # 6. FORCE CONSTRAINT-DRIVEN MERGING
+                            #
+                            # Invalid groups MUST be repaired first.
+                            #
+                            # Hard constraints:
+                            #
+                            #     total  >= min_sample
+                            #     events >= min_events
+                            #
+                            # At this stage there is NO protection.
+                            # ------------------------------------------------------------
+
                             while True:
 
                                 invalid_indices = [
                                     idx
                                     for idx, group in enumerate(groups)
-                                    if not _cat_is_valid(group)
+                                    if not _group_valid(group)
                                 ]
 
-                                # All groups satisfy minimum constraints.
                                 if not invalid_indices:
                                     break
 
-                                candidate_merges = []
+                                candidates = []
 
                                 for idx in invalid_indices:
 
-                                    # ------------------------------------------------
-                                    # Candidate: merge with left neighbour
-                                    # ------------------------------------------------
+                                    # ----------------------------------------------------
+                                    # Merge with lower-RR neighbour
+                                    # ----------------------------------------------------
+
                                     if idx > 0:
 
-                                        merged = _merge_category_groups(
+                                        merged = _merge_groups(
                                             groups[idx - 1],
-                                            groups[idx],
+                                            groups[idx]
                                         )
 
-                                        candidate_merges.append({
-                                            "index": idx - 1,
+                                        candidates.append({
+                                            "idx": idx - 1,
                                             "group": merged,
-                                            "valid": _cat_is_valid(merged),
-                                            "rr": _cat_response_rate(merged),
+                                            "valid": _group_valid(merged),
+                                            "rr": _group_rr(merged),
                                             "events": merged["events"],
                                             "total": merged["total"],
                                         })
 
-                                    # ------------------------------------------------
-                                    # Candidate: merge with right neighbour
-                                    # ------------------------------------------------
+                                    # ----------------------------------------------------
+                                    # Merge with higher-RR neighbour
+                                    # ----------------------------------------------------
+
                                     if idx < len(groups) - 1:
 
-                                        merged = _merge_category_groups(
+                                        merged = _merge_groups(
                                             groups[idx],
-                                            groups[idx + 1],
+                                            groups[idx + 1]
                                         )
 
-                                        candidate_merges.append({
-                                            "index": idx,
+                                        candidates.append({
+                                            "idx": idx,
                                             "group": merged,
-                                            "valid": _cat_is_valid(merged),
-                                            "rr": _cat_response_rate(merged),
+                                            "valid": _group_valid(merged),
+                                            "rr": _group_rr(merged),
                                             "events": merged["events"],
                                             "total": merged["total"],
                                         })
 
-                                # No possible merge.
-                                if not candidate_merges:
+                                if not candidates:
                                     break
 
-                                # ----------------------------------------------------
-                                # Prefer merges that immediately satisfy the
-                                # minimum sample/event constraints.
-                                # ----------------------------------------------------
+                                # --------------------------------------------------------
+                                # Prefer a merge that immediately repairs the constraint.
+                                #
+                                # Among those:
+                                #     1. Highest resulting RR
+                                #     2. Highest events
+                                #     3. Highest sample size
+                                # --------------------------------------------------------
+
                                 valid_candidates = [
                                     candidate
-                                    for candidate in candidate_merges
+                                    for candidate in candidates
                                     if candidate["valid"]
                                 ]
 
@@ -844,28 +1276,28 @@ class StrategicSegmentBuilder:
                                             candidate["rr"],
                                             candidate["events"],
                                             candidate["total"],
-                                        ),
+                                        )
                                     )
 
                                 else:
 
-                                    # ------------------------------------------------
-                                    # No single merge can immediately satisfy the
-                                    # constraints.
+                                    # ----------------------------------------------------
+                                    # No single merge repairs the invalid group.
                                     #
-                                    # We still need to make progress. Choose the
-                                    # highest-RR merge and continue merging.
-                                    # ------------------------------------------------
+                                    # We still need to make progress.
+                                    # Choose the merge producing the highest RR.
+                                    # ----------------------------------------------------
+
                                     best = max(
-                                        candidate_merges,
+                                        candidates,
                                         key=lambda candidate: (
                                             candidate["rr"],
                                             candidate["events"],
                                             candidate["total"],
-                                        ),
+                                        )
                                     )
 
-                                merge_idx = best["index"]
+                                merge_idx = best["idx"]
 
                                 groups = (
                                     groups[:merge_idx]
@@ -873,58 +1305,336 @@ class StrategicSegmentBuilder:
                                     + groups[merge_idx + 2:]
                                 )
 
-                            # --------------------------------------------------------
-                            # Write final categorical groups into transformed_bins.
+
+                            # ------------------------------------------------------------
+                            # 7. RESPONSE-RATE PROTECTION
                             #
-                            # Existing RapidSegment categorical syntax is:
+                            # Protection is decided ONCE after constraint repair.
+                            #
+                            # Protect:
+                            #
+                            #   1. Every valid group whose RR >= required RR.
+                            #
+                            #   2. If no group qualifies, protect the highest-RR valid
+                            #      group.
+                            #
+                            # IMPORTANT:
+                            # We protect the actual group objects rather than their
+                            # integer positions. This prevents protection from being
+                            # lost when other groups are merged and list indices shift.
+                            # ------------------------------------------------------------
+
+                            protected_group_ids = set()
+
+
+                            # ------------------------------------------------------------
+                            # 7A. Protect every qualifying group
+                            # ------------------------------------------------------------
+
+                            for group in groups:
+
+                                if (
+                                    _group_valid(group)
+                                    and _group_high_rr(group)
+                                ):
+                                    protected_group_ids.add(
+                                        id(group)
+                                    )
+
+
+                            # ------------------------------------------------------------
+                            # 7B. If nothing qualifies, protect the best valid group
+                            # ------------------------------------------------------------
+
+                            if not protected_group_ids:
+
+                                valid_groups = [
+                                    group
+                                    for group in groups
+                                    if _group_valid(group)
+                                ]
+
+                                if valid_groups:
+
+                                    best_group = max(
+                                        valid_groups,
+                                        key=lambda group: (
+                                            _group_rr(group),
+                                            group["events"],
+                                            group["total"],
+                                        )
+                                    )
+
+                                    protected_group_ids.add(
+                                        id(best_group)
+                                    )
+
+
+                            # ------------------------------------------------------------
+                            # DEBUG: SHOW PROTECTED GROUPS
+                            # ------------------------------------------------------------
+
+                            print(
+                                f"[NAIVE MERGE] {col}: "
+                                f"Protected groups = {len(protected_group_ids)}"
+                            )
+
+                            for i, group in enumerate(groups):
+
+                                if id(group) in protected_group_ids:
+
+                                    rr = _group_rr(group)
+
+                                    print(
+                                        f"[NAIVE MERGE] PROTECTED Group {i + 1}: "
+                                        f"{group['categories']} | "
+                                        f"RR={rr:.4%} | "
+                                        f"Lift={rr / _reference_rr:.2f}x"
+                                    )
+
+
+                            # ------------------------------------------------------------
+                            # 7C. RESIDUAL CATEGORICAL MERGING
+                            #
+                            # Protected groups are NEVER merged.
+                            #
+                            # For every pair of unprotected adjacent groups:
+                            #
+                            #     1. calculate merged RR
+                            #     2. require the merged group to be valid
+                            #     3. maximize resulting RR
+                            #     4. maximize events
+                            #     5. maximize total population
+                            #
+                            # Because categories were sorted by RR, adjacent groups
+                            # represent the closest response-rate populations.
+                            # ------------------------------------------------------------
+
+                            while len(groups) > 1:
+
+                                candidates = []
+
+                                for idx in range(len(groups) - 1):
+
+                                    left = groups[idx]
+                                    right = groups[idx + 1]
+
+                                    # ----------------------------------------------------
+                                    # NEVER merge a protected group.
+                                    #
+                                    # Use object identity instead of list index.
+                                    # ----------------------------------------------------
+
+                                    if (
+                                        id(left) in protected_group_ids
+                                        or id(right) in protected_group_ids
+                                    ):
+                                        continue
+
+                                    merged = _merge_groups(
+                                        left,
+                                        right
+                                    )
+
+                                    # ----------------------------------------------------
+                                    # Safety check.
+                                    #
+                                    # The resulting residual group must satisfy the
+                                    # minimum sample/event constraints.
+                                    # ----------------------------------------------------
+
+                                    if not _group_valid(merged):
+                                        continue
+
+                                    merged_rr = _group_rr(merged)
+
+                                    candidates.append({
+                                        "idx": idx,
+                                        "group": merged,
+                                        "rr": merged_rr,
+                                        "events": merged["events"],
+                                        "total": merged["total"],
+                                    })
+
+                                # --------------------------------------------------------
+                                # No more safe residual merges.
+                                # --------------------------------------------------------
+
+                                if not candidates:
+                                    break
+
+                                # --------------------------------------------------------
+                                # Choose the merge with the highest resulting RR.
+                                #
+                                # Tie-break:
+                                #     1. Events
+                                #     2. Population
+                                # --------------------------------------------------------
+
+                                best = max(
+                                    candidates,
+                                    key=lambda candidate: (
+                                        candidate["rr"],
+                                        candidate["events"],
+                                        candidate["total"],
+                                    )
+                                )
+
+                                current_unprotected_rr = max(
+                                    (_group_rr(g) for g in groups if id(g) not in protected_group_ids),
+                                    default=0.0
+                                )
+                                if best["rr"] <= current_unprotected_rr:
+                                    break
+
+                                merge_idx = best["idx"]
+
+                                print(
+                                    f"[NAIVE MERGE] {col}: "
+                                    f"Merging groups "
+                                    f"{merge_idx + 1} and {merge_idx + 2} | "
+                                    f"RR: "
+                                    f"{_group_rr(groups[merge_idx]):.4%} + "
+                                    f"{_group_rr(groups[merge_idx + 1]):.4%} "
+                                    f"-> "
+                                    f"{best['rr']:.4%}"
+                                )
+
+                                # --------------------------------------------------------
+                                # Perform merge.
+                                #
+                                # IMPORTANT:
+                                # The newly-created merged group is NOT protected.
+                                # This is correct because only original qualifying
+                                # groups are protected.
+                                # --------------------------------------------------------
+
+                                groups = (
+                                    groups[:merge_idx]
+                                    + [best["group"]]
+                                    + groups[merge_idx + 2:]
+                                )
+
+
+                            # ------------------------------------------------------------
+                            # 7D. FINAL CATEGORICAL DEBUG
+                            # ------------------------------------------------------------
+
+                            print("\n" + "-" * 80)
+                            print(f"FINAL NAIVE BINNING: {col}")
+                            print("-" * 80)
+
+                            print(
+                                f"Initial categories : {len(unique_vals)}"
+                            )
+
+                            print(
+                                f"Final groups        : {len(groups)}"
+                            )
+
+                            print(
+                                f"Groups merged       : "
+                                f"{len(unique_vals) - len(groups)}"
+                            )
+
+                            for i, group in enumerate(groups):
+
+                                rr = _group_rr(group)
+
+                                if id(group) in protected_group_ids:
+                                    status = "QUALIFYING / PROTECTED"
+                                else:
+                                    status = "RESIDUAL"
+
+                                print(
+                                    f"Final Group {i + 1}: "
+                                    f"{group['categories']} | "
+                                    f"N={group['total']} | "
+                                    f"Events={group['events']} | "
+                                    f"RR={rr:.4%} | "
+                                    f"Lift={rr / _reference_rr:.2f}x | "
+                                    f"Status={status}"
+                                )
+
+                            print("-" * 80)
+
+                            protected_groups = set()
+
+
+                            
+                            # --------------------------------------------------------
+                            # 8. WRITE FINAL CATEGORICAL GROUPS
+                            #
+                            # Existing RapidSegment categorical syntax:
                             #
                             #     ['A']
                             #
-                            # For merged groups:
+                            # Multiple categories:
                             #
                             #     ['A', 'B', 'C']
                             #
-                            # This is compatible with parse_rule_to_sql().
+                            # This preserves compatibility with the downstream
+                            # categorical rule parser.
                             # --------------------------------------------------------
                             for group in groups:
 
-                                categories = group["categories"]
-
-                                label = "[" + ", ".join(
-                                    f"'{category}'"
-                                    for category in categories
-                                ) + "]"
-
-                                group_mask = valid_mask & np.isin(
-                                    col_as_str,
-                                    categories,
+                                categories = (
+                                    group["categories"]
                                 )
 
-                                transformed_bins[group_mask] = label
-
-                                iv_val, max_rr = _process_naive_bin_stats(
-                                    group_mask,
-                                    iv_val,
-                                    max_rr,
+                                label = (
+                                    "["
+                                    + ", ".join(
+                                        f"'{category}'"
+                                        for category in categories
+                                    )
+                                    + "]"
                                 )
 
-                        # ------------------------------------------------------------
-                        # Missing remains a separate category.
-                        # ------------------------------------------------------------
-                        if np.any(missing_mask):
+                                group_mask = (
+                                    valid_mask
+                                    & np.isin(
+                                        col_as_str,
+                                        categories
+                                    )
+                                )
 
-                            transformed_bins[missing_mask] = "Missing"
+                                transformed_bins[
+                                    group_mask
+                                ] = label
 
-                            iv_val, max_rr = _process_naive_bin_stats(
-                                missing_mask,
-                                iv_val,
-                                max_rr,
+                                iv_val, max_rr = (
+                                    _process_naive_bin_stats(
+                                        group_mask,
+                                        iv_val,
+                                        max_rr
+                                    )
+                                )
+
+                            # --------------------------------------------------------
+                            # 9. MISSING CATEGORY
+                            #
+                            # Missing remains separate and is never merged with
+                            # regular categories.
+                            # --------------------------------------------------------
+                            if np.any(missing_mask):
+
+                                transformed_bins[
+                                    missing_mask
+                                ] = "Missing"
+
+                                iv_val, max_rr = (
+                                    _process_naive_bin_stats(
+                                        missing_mask,
+                                        iv_val,
+                                        max_rr
+                                    )
+                                )
+
+                            transformed_bins = np.asarray(
+                                transformed_bins,
+                                dtype=str
                             )
-
-                        transformed_bins = np.asarray(
-                            transformed_bins,
-                            dtype=str,
-                        )
 
                 else:
                     # Optimal binning fallback

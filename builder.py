@@ -96,16 +96,21 @@ class StrategicSegmentBuilder:
             ignore_features: Explicit list of columns to drop prior to IV calculation.
             sort_priority: Ranking criteria for selecting champion segments.
                     Can be a predefined shortcut string:
-                    - 'lift_rate_count'  : Lift → Response Rate → Sample Size
-                    - 'count_lift_rate'  : Sample Size → Lift → Response Rate
-                    - 'rate_lift_count'  : Response Rate → Lift → Sample Size
-                    - 'rate_count_lift'  : Response Rate → Sample Size → Lift
-                    - 'lift_count_rate'  : Lift → Sample Size → Response Rate
-                    - 'count_rate_lift'  : Sample Size → Response Rate → Lift
-                    - 'events_lift_rate' : Events → Lift → Response Rate  (maximises event capture)
-                    - 'events_rate_lift' : Events → Response Rate → Lift
-                    - 'lift_events_rate' : Lift → Events → Response Rate
-                    - 'rate_events_lift' : Response Rate → Events → Lift
+                    - 'lift_rate_count'   : Lift → Response Rate → Sample Size
+                    - 'count_lift_rate'   : Sample Size → Lift → Response Rate
+                    - 'rate_lift_count'   : Response Rate → Lift → Sample Size
+                    - 'rate_count_lift'   : Response Rate → Sample Size → Lift
+                    - 'lift_count_rate'   : Lift → Sample Size → Response Rate
+                    - 'count_rate_lift'   : Sample Size → Response Rate → Lift
+                    - 'events_lift_rate'  : Events → Lift → Response Rate
+                    - 'events_rate_lift'  : Events → Response Rate → Lift
+                    - 'lift_events_rate'  : Lift → Events → Response Rate
+                    - 'rate_events_lift'  : Response Rate → Events → Lift
+                    - 'events_count_rate' : Events → Count → Rate  (lift-free ranking)
+                    - 'events_rate_count' : Events → Rate → Count  (lift-free ranking)
+                    - 'count_events_rate' : Count → Events → Rate  (lift-free ranking)
+                    - 'rate_events_count' : Rate → Events → Count  (lift-free ranking)
+                    Note: min_lift is always enforced as a hard constraint regardless of sort_priority.
             binning_method: Which binning engine to use for feature discretization and IV computation.
                     -  'optimal' for OptBinning 
                     -  'naive' for simple quantile/category heuristics.
@@ -247,9 +252,18 @@ class StrategicSegmentBuilder:
             return (rule["lift"], rule["events"], rule["rate"])
         elif priority == "rate_events_lift":
             return (rule["rate"], rule["events"], rule["lift"])
+        # lift-free priorities: lift enforced only as hard constraint, not in ranking
+        elif priority == "events_count_rate":
+            return (rule["events"], rule["count"], rule["rate"])
+        elif priority == "events_rate_count":
+            return (rule["events"], rule["rate"], rule["count"])
+        elif priority == "count_events_rate":
+            return (rule["count"], rule["events"], rule["rate"])
+        elif priority == "rate_events_count":
+            return (rule["rate"], rule["events"], rule["count"])
         else:
-            # Fallback: lift, count, rate
-            return (rule["lift"], rule["count"], rule["rate"])
+            # Fallback mirrors default sort_priority="lift_rate_count"
+            return (rule["lift"], rule["rate"], rule["count"])
 
     def compute_iv_ranking_and_bin(
         self,
@@ -1261,19 +1275,24 @@ class StrategicSegmentBuilder:
                     else:
                         # Walk the sort priority tuple to find the first deciding dimension
                         _dim_order = {
-                            "lift_count_rate":  ["lift", "count", "rate"],
-                            "count_lift_rate":  ["count", "lift", "rate"],
-                            "rate_lift_count":  ["rate", "lift", "count"],
-                            "lift_rate_count":  ["lift", "rate", "count"],
-                            "count_rate_lift":  ["count", "rate", "lift"],
-                            "rate_count_lift":  ["rate", "count", "lift"],
-                            "events_lift_rate": ["events", "lift", "rate"],
-                            "events_rate_lift": ["events", "rate", "lift"],
-                            "lift_events_rate": ["lift", "events", "rate"],
-                            "rate_events_lift": ["rate", "events", "lift"],
+                            "lift_count_rate":   ["lift", "count", "rate"],
+                            "count_lift_rate":   ["count", "lift", "rate"],
+                            "rate_lift_count":   ["rate", "lift", "count"],
+                            "lift_rate_count":   ["lift", "rate", "count"],
+                            "count_rate_lift":   ["count", "rate", "lift"],
+                            "rate_count_lift":   ["rate", "count", "lift"],
+                            "events_lift_rate":  ["events", "lift", "rate"],
+                            "events_rate_lift":  ["events", "rate", "lift"],
+                            "lift_events_rate":  ["lift", "events", "rate"],
+                            "rate_events_lift":  ["rate", "events", "lift"],
+                            "events_count_rate": ["events", "count", "rate"],
+                            "events_rate_count": ["events", "rate", "count"],
+                            "count_events_rate": ["count", "events", "rate"],
+                            "rate_events_count": ["rate", "events", "count"],
                         }
                         priority_order = _dim_order.get(
-                            self.sort_priority, ["lift", "count", "rate"]
+                            self.sort_priority, ["lift", "rate", "count"]
+                        )
                         )
                         champ_vals = {
                             "lift": actual_lift,

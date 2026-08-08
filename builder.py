@@ -1247,62 +1247,62 @@ class StrategicSegmentBuilder:
                 )
         
                 for idx, e in enumerate(top_exp, 1):
-                        # Decide why it lost (or would have won)
-                        champ_key = self._get_sort_key({
+                    # Decide why it lost (or would have won)
+                    champ_key = self._get_sort_key({
+                        "lift": actual_lift,
+                        "rate": actual_rate,
+                        "count": selected_candidate["actual_count"],
+                        "events": selected_candidate["actual_events"],
+                    })    
+                    cand_key = self._get_sort_key(e)
+        
+                    if cand_key > champ_key:
+                        reason = "would have beaten champion (but failed raw validation)"
+                    else:
+                        # Walk the sort priority tuple to find the first deciding dimension
+                        _dim_order = {
+                            "lift_count_rate":  ["lift", "count", "rate"],
+                            "count_lift_rate":  ["count", "lift", "rate"],
+                            "rate_lift_count":  ["rate", "lift", "count"],
+                            "lift_rate_count":  ["lift", "rate", "count"],
+                            "count_rate_lift":  ["count", "rate", "lift"],
+                            "rate_count_lift":  ["rate", "count", "lift"],
+                            "events_lift_rate": ["events", "lift", "rate"],
+                            "events_rate_lift": ["events", "rate", "lift"],
+                            "lift_events_rate": ["lift", "events", "rate"],
+                            "rate_events_lift": ["rate", "events", "lift"],
+                        }
+                        priority_order = _dim_order.get(
+                            self.sort_priority, ["lift", "count", "rate"]
+                        )
+                        champ_vals = {
                             "lift": actual_lift,
                             "rate": actual_rate,
                             "count": selected_candidate["actual_count"],
                             "events": selected_candidate["actual_events"],
-                        })    
-                        cand_key = self._get_sort_key(e)
-            
-                        if cand_key > champ_key:
-                            reason = "would have beaten champion (but failed raw validation)"
-                        else:
-                            # Walk the sort priority tuple to find the first deciding dimension
-                            _dim_order = {
-                                "lift_count_rate":  ["lift", "count", "rate"],
-                                "count_lift_rate":  ["count", "lift", "rate"],
-                                "rate_lift_count":  ["rate", "lift", "count"],
-                                "lift_rate_count":  ["lift", "rate", "count"],
-                                "count_rate_lift":  ["count", "rate", "lift"],
-                                "rate_count_lift":  ["rate", "count", "lift"],
-                                "events_lift_rate": ["events", "lift", "rate"],
-                                "events_rate_lift": ["events", "rate", "lift"],
-                                "lift_events_rate": ["lift", "events", "rate"],
-                                "rate_events_lift": ["rate", "events", "lift"],
-                            }
-                            priority_order = _dim_order.get(
-                                self.sort_priority, ["lift", "count", "rate"]
-                            )
-                            champ_vals = {
-                                "lift": actual_lift,
-                                "rate": actual_rate,
-                                "count": selected_candidate["actual_count"],
-                                "events": selected_candidate["actual_events"],
-                            }
-                            cand_vals = {
-                                "lift": e["lift"],
-                                "rate": e["rate"],
-                                "count": e["count"],
-                                "events": e["events"],
-                            }
-                            reason = "ranked lower by sort_priority"  # fallback
-                            for dim in priority_order:
-                                if cand_vals[dim] < champ_vals[dim]:
-                                    label = {
-                                        "lift": "lower lift",
-                                        "count": "smaller count",
-                                        "rate": "lower rate",
-                                        "events": "fewer events",
-                                    }[dim]
-                                    reason = (
-                                        f"{label} ({cand_vals[dim]:.2f} < {champ_vals[dim]:.2f})"
-                                    )
-                                    break
-                                elif cand_vals[dim] > champ_vals[dim]:
-                                    # candidate beats champ on this dim — next dim decided it
-                                    break
+                        }
+                        cand_vals = {
+                            "lift": e["lift"],
+                            "rate": e["rate"],
+                            "count": e["count"],
+                            "events": e["events"],
+                        }
+                        reason = "ranked lower by sort_priority"  # fallback
+                        for dim in priority_order:
+                            if cand_vals[dim] < champ_vals[dim]:
+                                label = {
+                                    "lift": "lower lift",
+                                    "count": "smaller count",
+                                    "rate": "lower rate",
+                                    "events": "fewer events",
+                                }[dim]
+                                reason = (
+                                    f"{label} ({cand_vals[dim]:.2f} < {champ_vals[dim]:.2f})"
+                                )
+                                break
+                            elif cand_vals[dim] > champ_vals[dim]:
+                                # candidate beats champ on this dim — next dim decided it
+                                break
             
                         logger.info(
                             f"   {idx:<5} {'expanded':<10} "

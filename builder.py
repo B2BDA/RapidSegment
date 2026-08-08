@@ -1234,33 +1234,51 @@ class StrategicSegmentBuilder:
                 )
         
                 for idx, e in enumerate(top_exp, 1):
-                    # Decide why it lost (or would have won)
-                    champ_key = self._get_sort_key({
-                        "lift": actual_lift,
-                        "rate": actual_rate,
-                        "count": selected_candidate["actual_count"]
-                    })
-                    cand_key = self._get_sort_key(e)
-        
-                    if cand_key > champ_key:
-                        reason = "would have beaten champion (but failed raw validation)"
-                    else:
-                        # Explain the first dimension that decided the ranking
-                        if self.sort_priority.startswith("lift"):
-                            reason = f"lower lift ({e['lift']:.2f} < {actual_lift:.2f})"
-                        elif self.sort_priority.startswith("count"):
-                            reason = f"smaller count ({e['count']} < {selected_candidate['actual_count']})"
-                        elif self.sort_priority.startswith("rate"):
-                            reason = f"lower rate ({e['rate']:.1f} < {actual_rate:.1f})"
+                        # Decide why it lost (or would have won)
+                        champ_key = self._get_sort_key({
+                            "lift": actual_lift,
+                            "rate": actual_rate,
+                            "count": selected_candidate["actual_count"]
+                        })
+                        cand_key = self._get_sort_key(e)
+            
+                        if cand_key > champ_key:
+                            reason = "would have beaten champion (but failed raw validation)"
                         else:
-                            reason = "ranked lower by sort_priority"
-        
-                    logger.info(
-                        f"   {idx:<5} {'expanded':<10} "
-                        f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
-                        f"{e['count']:>8} {e['events']:>8.0f}  "
-                        f"{e['rule'][:55]}  → {reason}"
-                    )
+                            # Walk the sort priority tuple to find the first deciding dimension
+                            priority_order = self.sort_priority.split("_")
+                            champ_vals = {
+                                "lift": actual_lift,
+                                "rate": actual_rate,
+                                "count": selected_candidate["actual_count"],
+                            }
+                            cand_vals = {
+                                "lift": e["lift"],
+                                "rate": e["rate"],
+                                "count": e["count"],
+                            }
+                            reason = "ranked lower by sort_priority"  # fallback
+                            for dim in priority_order:
+                                if cand_vals[dim] < champ_vals[dim]:
+                                    label = {
+                                        "lift": "lower lift",
+                                        "count": "smaller count",
+                                        "rate": "lower rate",
+                                    }[dim]
+                                    reason = (
+                                        f"{label} ({cand_vals[dim]:.2f} < {champ_vals[dim]:.2f})"
+                                    )
+                                    break
+                                elif cand_vals[dim] > champ_vals[dim]:
+                                    # candidate beats champ on this dim — next dim decided it
+                                    break
+            
+                        logger.info(
+                            f"   {idx:<5} {'expanded':<10} "
+                            f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
+                            f"{e['count']:>8} {e['events']:>8.0f}  "
+                            f"{e['rule'][:55]}  → {reason}"
+                        )
 
             self.diagnostics_[-1]["winning_segment"] = {
                 "rule": best_rule,

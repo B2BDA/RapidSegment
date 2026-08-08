@@ -691,7 +691,7 @@ class StrategicSegmentBuilder:
             if bracket_match:
                 content = bracket_match.group(1)
                 if interval.startswith("[") and ")," in interval:
-                    # Expanded numerical bin list produced by _expanded_adjacent_bins
+                    # Expanded numerical bin list produced by _expand_adjacent_bins
                     # e.g. [[1.0,5.0),[5.0,10.0)] - NOT categorical, handled below
                     is_categorical = False
                 elif any(

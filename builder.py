@@ -666,7 +666,8 @@ class StrategicSegmentBuilder:
                 lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
                 combo_key = tuple(combo_vars_str.split(","))
 
-                if lift >= self.min_lift and events >= self.min_events:
+                # if lift >= self.min_lift and events >= self.min_events:
+                if events >= self.min_events:
                     entry = {
                         "rule": rule,
                         "count": count,

@@ -483,6 +483,8 @@ class StrategicSegmentBuilder:
                 for neighbour_bin in neighbours:
                     # Build the expanded bin set for this variable:
                     # the original bin + the neighbour bin.
+                    if current_bin == "Missing" or neighbour_bin == "Missing":
+                        continue
                     expanded_bins_for_col = [current_bin, neighbour_bin]
 
                     # Construct the WHERE clause for the expanded query.
@@ -688,7 +690,11 @@ class StrategicSegmentBuilder:
             is_categorical = False
             if bracket_match:
                 content = bracket_match.group(1)
-                if any(
+                if interval.startswith("[") and ")," in interval:
+                    # Expanded numerical bin list produced by _expanded_adjacent_bins
+                    # e.g. [[1.0,5.0),[5.0,10.0)] - NOT categorical, handled below
+                    is_categorical = False
+                elif any(
                     k in interval for k in ("'", '"', "Array", "Categorical")
                 ) or not interval.startswith(("[", "(")):
                     is_categorical = True

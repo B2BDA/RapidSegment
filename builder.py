@@ -94,14 +94,18 @@ class StrategicSegmentBuilder:
             enable_3way: Allow 3‑dimensional intersection rules.
             feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
             ignore_features: Explicit list of columns to drop prior to IV calculation.
-            sort_priority: Ranking criteria for selecting champion segments. 
+            sort_priority: Ranking criteria for selecting champion segments.
                     Can be a predefined shortcut string:
-                    - 'lift_rate_count': Lift → Response Rate → Sample Size
-                    - 'count_lift_rate': Sample Size → Lift → Response Rate
-                    - 'rate_lift_count': Response Rate → Lift → Sample Size
-                    - 'rate_count_lift': Response Rate → Sample Size → Lift
-                    - 'lift_count_rate': Lift → Sample Size → Response Rate
-                    - 'count_rate_lift': Sample Size → Response Rate → Lift
+                    - 'lift_rate_count'  : Lift → Response Rate → Sample Size
+                    - 'count_lift_rate'  : Sample Size → Lift → Response Rate
+                    - 'rate_lift_count'  : Response Rate → Lift → Sample Size
+                    - 'rate_count_lift'  : Response Rate → Sample Size → Lift
+                    - 'lift_count_rate'  : Lift → Sample Size → Response Rate
+                    - 'count_rate_lift'  : Sample Size → Response Rate → Lift
+                    - 'events_lift_rate' : Events → Lift → Response Rate  (maximises event capture)
+                    - 'events_rate_lift' : Events → Response Rate → Lift
+                    - 'lift_events_rate' : Lift → Events → Response Rate
+                    - 'rate_events_lift' : Response Rate → Events → Lift
             binning_method: Which binning engine to use for feature discretization and IV computation.
                     -  'optimal' for OptBinning 
                     -  'naive' for simple quantile/category heuristics.
@@ -234,6 +238,15 @@ class StrategicSegmentBuilder:
             return (rule["count"], rule["rate"], rule["lift"])
         elif priority == "rate_count_lift":
             return (rule["rate"], rule["count"], rule["lift"])
+        # events-based priorities: favour high event-capture segments
+        elif priority == "events_lift_rate":
+            return (rule["events"], rule["lift"], rule["rate"])
+        elif priority == "events_rate_lift":
+            return (rule["events"], rule["rate"], rule["lift"])
+        elif priority == "lift_events_rate":
+            return (rule["lift"], rule["events"], rule["rate"])
+        elif priority == "rate_events_lift":
+            return (rule["rate"], rule["events"], rule["lift"])
         else:
             # Fallback: lift, count, rate
             return (rule["lift"], rule["count"], rule["rate"])
@@ -1238,8 +1251,9 @@ class StrategicSegmentBuilder:
                         champ_key = self._get_sort_key({
                             "lift": actual_lift,
                             "rate": actual_rate,
-                            "count": selected_candidate["actual_count"]
-                        })
+                            "count": selected_candidate["actual_count"],
+                            "events": selected_candidate["actual_events"],
+                        })    
                         cand_key = self._get_sort_key(e)
             
                         if cand_key > champ_key:
@@ -1247,23 +1261,31 @@ class StrategicSegmentBuilder:
                         else:
                             # Walk the sort priority tuple to find the first deciding dimension
                             _dim_order = {
-                                "lift_count_rate": ["lift", "count", "rate"],
-                                "count_lift_rate": ["count", "lift", "rate"],
-                                "rate_lift_count": ["rate", "lift", "count"],
-                                "lift_rate_count": ["lift", "rate", "count"],
-                                "count_rate_lift": ["count", "rate", "lift"],
-                                "rate_count_lift": ["rate", "count", "lift"],
+                                "lift_count_rate":  ["lift", "count", "rate"],
+                                "count_lift_rate":  ["count", "lift", "rate"],
+                                "rate_lift_count":  ["rate", "lift", "count"],
+                                "lift_rate_count":  ["lift", "rate", "count"],
+                                "count_rate_lift":  ["count", "rate", "lift"],
+                                "rate_count_lift":  ["rate", "count", "lift"],
+                                "events_lift_rate": ["events", "lift", "rate"],
+                                "events_rate_lift": ["events", "rate", "lift"],
+                                "lift_events_rate": ["lift", "events", "rate"],
+                                "rate_events_lift": ["rate", "events", "lift"],
                             }
-                            priority_order = _dim_order.get(self.sort_priority, ["lift", "count", "rate"])
+                            priority_order = _dim_order.get(
+                                self.sort_priority, ["lift", "count", "rate"]
+                            )
                             champ_vals = {
                                 "lift": actual_lift,
                                 "rate": actual_rate,
                                 "count": selected_candidate["actual_count"],
+                                "events": selected_candidate["actual_events"],
                             }
                             cand_vals = {
                                 "lift": e["lift"],
                                 "rate": e["rate"],
                                 "count": e["count"],
+                                "events": e["events"],
                             }
                             reason = "ranked lower by sort_priority"  # fallback
                             for dim in priority_order:
@@ -1272,6 +1294,7 @@ class StrategicSegmentBuilder:
                                         "lift": "lower lift",
                                         "count": "smaller count",
                                         "rate": "lower rate",
+                                        "events": "fewer events",
                                     }[dim]
                                     reason = (
                                         f"{label} ({cand_vals[dim]:.2f} < {champ_vals[dim]:.2f})"

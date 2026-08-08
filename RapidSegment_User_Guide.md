@@ -186,6 +186,3 @@ Remove matching rows → new residual
 - `expand_log_mode` → `"summary"` (default), `"full"`, or `"none"`
 
 ---
-
-This is the complete data-flow picture of the current engine on the Test branch.  
-If anything is still unclear, just ask and we can zoom into that specific part.

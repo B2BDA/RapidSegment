@@ -1246,7 +1246,15 @@ class StrategicSegmentBuilder:
                             reason = "would have beaten champion (but failed raw validation)"
                         else:
                             # Walk the sort priority tuple to find the first deciding dimension
-                            priority_order = self.sort_priority.split("_")
+                            _dim_order = {
+                                "lift_count_rate": ["lift", "count", "rate"],
+                                "count_lift_rate": ["count", "lift", "rate"],
+                                "rate_lift_count": ["rate", "lift", "count"],
+                                "lift_rate_count": ["lift", "rate", "count"],
+                                "count_rate_lift": ["count", "rate", "lift"],
+                                "rate_count_lift": ["rate", "count", "lift"],
+                            }
+                            priority_order = _dim_order.get(self.sort_priority, ["lift", "count", "rate"])
                             champ_vals = {
                                 "lift": actual_lift,
                                 "rate": actual_rate,

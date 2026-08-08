@@ -630,7 +630,7 @@ class StrategicSegmentBuilder:
 
         for i in range(0, len(queries), chunk_size):
             chunk = queries[i:i + chunk_size]
-            combos_chunk = combo_for_query[i:i + chunk_size]
+            # combos_chunk = combo_for_query[i:i + chunk_size]
             union_query = " UNION ALL ".join(chunk)
 
             res = con.execute(union_query).fetchall()

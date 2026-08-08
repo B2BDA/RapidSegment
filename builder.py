@@ -717,13 +717,13 @@ class StrategicSegmentBuilder:
 
     def parse_rule_to_sql(self, rule_str: str) -> str:
         """
-        Translates OptBinning string syntax into a production SQL WHERE clause.
+        Translates OptBinning / naive / expanded rule strings into a production SQL WHERE clause.
 
-        Args:
-            rule_str: Rule string like "col1='A' & col2=[1,2,3]".
-
-        Returns:
-            SQL condition string (e.g., `col1 IN ('A') AND col2 IN (1,2,3)`).
+        Handles:
+        - Normal numerical ranges:  col=[10.0, 20.0)
+        - Expanded adjacent bins:  col=[[10.0, 20.0), [20.0, 30.0)]
+        - Categorical:             col=['A', 'B']  or  col=['success']
+        - Missing / Special
         """
         parts = [p.strip() for p in rule_str.split("&")]
         sql_conditions: List[str] = []
@@ -735,24 +735,75 @@ class StrategicSegmentBuilder:
             col, interval = [x.strip() for x in part.split("=", 1)]
             bracket_match = _BRACKET_REGEX.search(interval)
 
+            # ------------------------------------------------------------------
+            # 1. Detect expanded numerical form produced by _expand_adjacent_bins
+            #    Example: [[2.0, 3.0), [3.0, inf)]
+            # ------------------------------------------------------------------
+            if interval.startswith("[[") or (interval.startswith("[") and ")," in interval and interval.count("[") >= 2):
+                # Extract all individual ranges
+                # Remove outer [ ] first
+                inner = interval.strip()
+                if inner.startswith("[") and inner.endswith("]"):
+                    inner = inner[1:-1]
+
+                # Split on "), " while keeping the closing )
+                raw_tokens = re.split(r"\),\s*", inner)
+                ranges = []
+                for tok in raw_tokens:
+                    tok = tok.strip()
+                    if not tok:
+                        continue
+                    if not tok.endswith(")"):
+                        tok = tok + ")"
+                    # Now tok is something like "[2.0, 3.0)" or "[3.0, inf)"
+                    if tok[0] in ("[", "(") and tok[-1] in ("]", ")"):
+                        left_char = tok[0]
+                        right_char = tok[-1]
+                        content = tok[1:-1]
+                        lo, hi = [x.strip() for x in content.split(",", 1)]
+                        ranges.append((left_char, lo, hi, right_char))
+
+                if ranges:
+                    # Take outermost bounds
+                    # Sort by lower bound so we get the true min/max even if expansion order was wrong
+                    def _sort_key(r):
+                        val = r[1]
+                        if val.lower() == "-inf":
+                            return float("-inf")
+                        try:
+                            return float(val)
+                        except Exception:
+                            return 0.0
+
+                    ranges_sorted = sorted(ranges, key=_sort_key)
+                    overall_lower_char, overall_lower = ranges_sorted[0][0], ranges_sorted[0][1]
+                    overall_upper_char, overall_upper = ranges_sorted[-1][3], ranges_sorted[-1][2]
+
+                    range_conds = []
+                    if overall_lower.lower() != "-inf":
+                        op = ">=" if overall_lower_char == "[" else ">"
+                        range_conds.append(f"{col} {op} {overall_lower}")
+                    if overall_upper.lower() != "inf":
+                        op = "<" if overall_upper_char == ")" else "<="
+                        range_conds.append(f"{col} {op} {overall_upper}")
+
+                    if range_conds:
+                        sql_conditions.append(" AND ".join(range_conds))
+                    continue
+
+            # ------------------------------------------------------------------
+            # 2. Categorical detection
+            # ------------------------------------------------------------------
             is_categorical = False
             if bracket_match:
                 content = bracket_match.group(1)
-                if interval.startswith("[") and ")," in interval:
-                    # Expanded numerical bin list produced by _expand_adjacent_bins
-                    # e.g. [[1.0,5.0),[5.0,10.0)] - NOT categorical, handled below
-                    is_categorical = False
-                elif any(
-                    k in interval for k in ("'", '"', "Array", "Categorical")
-                ) or not interval.startswith(("[", "(")):
+                if any(k in interval for k in ("'", '"', "Array", "Categorical")) or not interval.startswith(("[", "(")):
                     is_categorical = True
                 elif len(content.split(",")) > 2:
                     is_categorical = True
 
-            # --- Categorical set handling ---
             if is_categorical and bracket_match:
                 import ast
-
                 try:
                     raw_items = ast.literal_eval(bracket_match.group(0))
                 except Exception:
@@ -761,7 +812,6 @@ class StrategicSegmentBuilder:
                         raw_content = re.sub(r"'\s+'", "','", raw_content)
                         raw_content = re.sub(r'"\s+"', '","', raw_content)
                         raw_content = re.sub(r"\s+", ",", raw_content)
-
                     raw_items = [
                         i.strip().strip("'").strip('"')
                         for i in raw_content.split(",")
@@ -771,50 +821,20 @@ class StrategicSegmentBuilder:
                 formatted_items = ", ".join(
                     [f"'{item}'" if isinstance(item, str) else str(item) for item in raw_items]
                 )
-
                 if formatted_items:
                     sql_conditions.append(f"{col} IN ({formatted_items})")
                 continue
 
-            # --- Special / Missing ---
+            # ------------------------------------------------------------------
+            # 3. Missing / Special
+            # ------------------------------------------------------------------
             if interval in ["Special", "Missing"]:
                 sql_conditions.append(f"{col} IS NULL")
                 continue
 
-            # --- Expanded numerical bin list: col=[(-inf, x), [x, y)] ---
-            # Produced by _expand_adjacent_bins when two adjacent numerical bins
-            # are merged. The interval looks like "[(-inf, 30.0), [30.0, 32.0)]".
-            # We extract the outer lower bound of the first range and the outer
-            # upper bound of the last range and emit a single range condition.
-            if interval.startswith("[") and ")," in interval:
-                # Split on "), " to get individual range tokens
-                range_tokens = [t.strip() for t in re.split(r"\),\s*", interval.strip("[]"))]
-                range_tokens = [t if t.endswith(")") else t + ")" for t in range_tokens]
-                bounds = []
-                for token in range_tokens:
-                    if not token or token[0] not in ("(", "["):
-                        continue
-                    lc = token[0]
-                    rc = token[-1]
-                    inner = token[1:-1]
-                    parts_inner = [p.strip() for p in inner.split(",", 1)]
-                    if len(parts_inner) == 2:
-                        bounds.append((lc, parts_inner[0], parts_inner[1], rc))
-                if bounds:
-                    overall_lower_char, overall_lower = bounds[0][0], bounds[0][1]
-                    overall_upper_char, overall_upper = bounds[-1][3], bounds[-1][2]
-                    range_conds = []
-                    if overall_lower.lower() != "-inf":
-                        op = ">=" if overall_lower_char == "[" else ">"
-                        range_conds.append(f"{col} {op} {overall_lower}")
-                    if overall_upper.lower() != "inf":
-                        op = "<" if overall_upper_char == ")" else "<="
-                        range_conds.append(f"{col} {op} {overall_upper}")
-                    if range_conds:
-                        sql_conditions.append(" AND ".join(range_conds))
-                continue
-
-            # --- Continuous range ---
+            # ------------------------------------------------------------------
+            # 4. Normal continuous range  e.g. [10.0, 20.0)  or  (-inf, 5.0]
+            # ------------------------------------------------------------------
             if interval.startswith(("[", "(")):
                 left_char, right_char = interval[0], interval[-1]
                 lower_str, upper_str = [x.strip() for x in interval[1:-1].split(",", 1)]
@@ -823,7 +843,6 @@ class StrategicSegmentBuilder:
                 if lower_str.lower() != "-inf":
                     op = ">=" if left_char == "[" else ">"
                     range_conds.append(f"{col} {op} {lower_str}")
-
                 if upper_str.lower() != "inf":
                     op = "<=" if right_char == "]" else "<"
                     range_conds.append(f"{col} {op} {upper_str}")

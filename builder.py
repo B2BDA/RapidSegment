@@ -1205,6 +1205,63 @@ class StrategicSegmentBuilder:
                 f"  Rule: {best_rule}\n"
                 f"  SQL: {best_raw_sql}"
             )
+            # ------------------------------------------------------------------
+            # Clear comparison of top expanded candidates vs the final champion
+            # ------------------------------------------------------------------
+            if getattr(self, "expand_log_mode", "summary") in ("summary", "full"):
+                # Collect the top expanded candidates that were available in this iteration
+                expanded_in_this_iter = [
+                    r for r in all_candidate_rules
+                    if "base_events" in r          # only expanded rules carry this key
+                ]
+                if expanded_in_this_iter:
+                    # Sort them the same way the engine ranked everything
+                    expanded_in_this_iter.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                    top_exp = expanded_in_this_iter[:5]   # show top 5
+            
+                    logger.info("📊 Top adjacent-merge candidates vs final champion")
+                    logger.info(
+                        f"   {'Rank':<5} {'Type':<10} {'Lift':>6} {'Rate%':>7} {'Count':>8} {'Events':>8}  Rule"
+                    )
+                    logger.info("   " + "-" * 90)
+            
+                    # First line = the actual winner
+                    logger.info(
+                        f"   {'★':<5} {'CHAMPION':<10} "
+                        f"{actual_lift:>6.2f}x {actual_rate:>6.1f}% "
+                        f"{selected_candidate['actual_count']:>8} "
+                        f"{selected_candidate['actual_events']:>8.0f}  "
+                        f"{best_rule[:60]}"
+                    )
+            
+                    for idx, e in enumerate(top_exp, 1):
+                        # Decide why it lost (or would have won)
+                        champ_key = self._get_sort_key({
+                            "lift": actual_lift,
+                            "rate": actual_rate,
+                            "count": selected_candidate["actual_count"]
+                        })
+                        cand_key = self._get_sort_key(e)
+            
+                        if cand_key > champ_key:
+                            reason = "would have beaten champion (but failed raw validation)"
+                        else:
+                            # Explain the first dimension that decided the ranking
+                            if self.sort_priority.startswith("lift"):
+                                reason = f"lower lift ({e['lift']:.2f} < {actual_lift:.2f})"
+                            elif self.sort_priority.startswith("count"):
+                                reason = f"smaller count ({e['count']} < {selected_candidate['actual_count']})"
+                            elif self.sort_priority.startswith("rate"):
+                                reason = f"lower rate ({e['rate']:.1f} < {actual_rate:.1f})"
+                            else:
+                                reason = "ranked lower by sort_priority"
+            
+                        logger.info(
+                            f"   {idx:<5} {'expanded':<10} "
+                            f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
+                            f"{e['count']:>8} {e['events']:>8.0f}  "
+                            f"{e['rule'][:55]}  → {reason}"
+                        )
 
             self.diagnostics_[-1]["winning_segment"] = {
                 "rule": best_rule,

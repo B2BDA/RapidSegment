@@ -1291,9 +1291,7 @@ class StrategicSegmentBuilder:
                             "rate_events_count": ["rate", "events", "count"],
                         }
                         priority_order = _dim_order.get(
-                            self.sort_priority, ["lift", "rate", "count"]
-                        )
-                        )
+                            self.sort_priority, ["lift", "rate", "count"])
                         champ_vals = {
                             "lift": actual_lift,
                             "rate": actual_rate,

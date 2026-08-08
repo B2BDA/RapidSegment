@@ -402,6 +402,175 @@ class StrategicSegmentBuilder:
             
         return ranking, precomputed_bins
 
+    def _expand_adjacent_bins(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        combo: Tuple[str, ...],
+        base_rate: float,
+        base_results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        For each qualifying bin result, attempts to merge it with its adjacent
+        neighbour bin on every variable in the combo, producing expanded candidates
+        that capture more events while still clearing min_lift and min_events.
+
+        The expansion is per-variable: for a combo (A, B), for each qualifying
+        (bin_A, bin_B) result, we try expanding bin_A to include its neighbour,
+        and separately try expanding bin_B to include its neighbour, keeping the
+        other variable's bin fixed. Expanded candidates that improve event capture
+        over the base result while maintaining lift are added as additional
+        candidates.
+
+        Args:
+            con:          DuckDB connection.
+            combo:        Tuple of feature names for this combination.
+            base_rate:    Global event rate (used to compute lift).
+            base_results: Already-qualifying results from the base GROUP BY pass.
+
+        Returns:
+            List of additional expanded rule dicts (same schema as _agg_combinations
+            output). May be empty if no expansion improves results.
+        """
+        if not base_results:
+            return []
+
+        # Build a lookup: variable -> sorted list of unique bin labels in binned_df.
+        # We only do this once per combo and only for variables that appear in combo.
+        bin_labels: Dict[str, List[str]] = {}
+        for col in combo:
+            rows = con.execute(
+                f'SELECT DISTINCT CAST("{col}" AS VARCHAR) AS b '
+                f'FROM binned_df ORDER BY b'
+            ).fetchall()
+            bin_labels[col] = [r[0] for r in rows]
+
+        expanded: List[Dict[str, Any]] = []
+        seen_rules: set = set()
+
+        # Index base results by their rule string to avoid exact duplicates
+        for r in base_results:
+            seen_rules.add(r["rule"])
+
+        for result in base_results:
+            # Parse the current bin assignment per variable from the rule string.
+            # Rule format: "colA=<bin> & colB=<bin> & ..."
+            current_bins: Dict[str, str] = {}
+            for part in result["rule"].split(" & "):
+                if "=" not in part:
+                    continue
+                col, bin_val = part.split("=", 1)
+                current_bins[col.strip()] = bin_val.strip()
+
+            # For each variable in the combo, try expanding to include the
+            # adjacent neighbour bin (both directions: left and right).
+            for col in combo:
+                if col not in current_bins or col not in bin_labels:
+                    continue
+
+                labels = bin_labels[col]
+                current_bin = current_bins[col]
+
+                if current_bin not in labels:
+                    continue
+
+                idx = labels.index(current_bin)
+                neighbours = []
+                if idx > 0:
+                    neighbours.append(labels[idx - 1])   # left neighbour
+                if idx < len(labels) - 1:
+                    neighbours.append(labels[idx + 1])   # right neighbour
+
+                for neighbour_bin in neighbours:
+                    # Build the expanded bin set for this variable:
+                    # the original bin + the neighbour bin.
+                    expanded_bins_for_col = [current_bin, neighbour_bin]
+
+                    # Construct the WHERE clause for the expanded query.
+                    # For the expanding variable: bin IN (current, neighbour).
+                    # For all other variables: bin = their fixed value.
+                    where_parts = []
+                    rule_parts = []
+                    for c in combo:
+                        if c == col:
+                            in_list = ", ".join(
+                                f"'{b}'" for b in expanded_bins_for_col
+                            )
+                            where_parts.append(
+                                f'CAST("{c}" AS VARCHAR) IN ({in_list})'
+                            )
+                            # Rule label: show both bins joined
+                            rule_parts.append(
+                                f"{c}=[{', '.join(sorted(expanded_bins_for_col))}]"
+                            )
+                        else:
+                            fixed_bin = current_bins[c]
+                            where_parts.append(
+                                f'CAST("{c}" AS VARCHAR) = \'{fixed_bin}\''
+                            )
+                            rule_parts.append(f"{c}={fixed_bin}")
+
+                    rule_str = " & ".join(rule_parts)
+
+                    # Skip if we've already produced this rule
+                    if rule_str in seen_rules:
+                        continue
+                    seen_rules.add(rule_str)
+
+                    where_clause = " AND ".join(where_parts)
+                    try:
+                        row = con.execute(
+                            f"""
+                            SELECT
+                                COUNT("{self.target}")::BIGINT AS cnt,
+                                SUM(CAST("{self.target}" AS DOUBLE)) AS evt
+                            FROM binned_df
+                            WHERE {where_clause}
+                            """
+                        ).fetchone()
+                    except Exception:
+                        continue
+
+                    if row is None:
+                        continue
+
+                    exp_count, exp_events = row[0] or 0, row[1] or 0.0
+                    if exp_count == 0:
+                        continue
+
+                    exp_rate = (exp_events / exp_count) * 100.0
+                    exp_lift = exp_rate / (base_rate * 100.0) if base_rate > 0 else 0.0
+
+                    # Only keep if it still clears hard constraints AND captures
+                    # more events than the base result it was derived from.
+                    if (
+                        exp_lift >= self.min_lift
+                        and exp_events >= self.min_events
+                        and exp_count >= self.min_sample_size
+                        and exp_events > result["events"]
+                    ):
+                        expanded.append(
+                            {
+                                "rule": rule_str,
+                                "count": exp_count,
+                                "rate": exp_rate,
+                                "lift": exp_lift,
+                                "events": exp_events,
+                                "combo_vars": combo,
+                            }
+                        )
+                        logger.info(
+                            f"🔀 Expanded candidate: {rule_str} | "
+                            f"events: {result['events']:.0f} -> {exp_events:.0f} | "
+                            f"lift: {exp_lift:.2f}x | "
+                            f"count: {exp_count}"
+                        )
+                        
+
+        if not expanded:
+            logger.debug(f"↩️ No expansion candidates found for combo {combo}")
+
+        return expanded
+
     def _agg_combinations(
         self,
         con: duckdb.DuckDBPyConnection,
@@ -443,29 +612,56 @@ class StrategicSegmentBuilder:
             """
             queries.append(query)
 
+        # Map each query back to its combo so we can run expansion per combo.
+        combo_for_query = []
+        for combo in combo_list:
+            combo_for_query.append(combo)
+
         valid_results = []
         chunk_size = 100
 
+        # We need per-combo base results for the expansion step, so collect them
+        # before merging into valid_results.
+        per_combo_base: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {
+            combo: [] for combo in combo_list
+        }
+
         for i in range(0, len(queries), chunk_size):
             chunk = queries[i:i + chunk_size]
+            combos_chunk = combo_for_query[i:i + chunk_size]
             union_query = " UNION ALL ".join(chunk)
 
             res = con.execute(union_query).fetchall()
-            for rule, count, events, combo_vars_str in res:
+            for row_idx, (rule, count, events, combo_vars_str) in enumerate(res):
                 rate = (events / count) * 100.0 if count > 0 else 0
                 lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
+                combo_key = tuple(combo_vars_str.split(","))
 
                 if lift >= self.min_lift and events >= self.min_events:
-                    valid_results.append(
-                        {
-                            "rule": rule,
-                            "count": count,
-                            "rate": rate,
-                            "lift": lift,
-                            "events": events,
-                            "combo_vars": tuple(combo_vars_str.split(",")),
-                        }
-                    )
+                    entry = {
+                        "rule": rule,
+                        "count": count,
+                        "rate": rate,
+                        "lift": lift,
+                        "events": events,
+                        "combo_vars": combo_key,
+                    }
+                    valid_results.append(entry)
+                    if combo_key in per_combo_base:
+                        per_combo_base[combo_key].append(entry)
+
+        # --- Adjacent bin expansion ---
+        # For each combo that produced at least one qualifying result, try to
+        # find expanded candidates that capture more events while keeping lift.
+        for combo in combo_list:
+            base = per_combo_base.get(combo, [])
+            if not base:
+                continue
+            # Only perform adjacent bin expansion if we are using naive binning
+            if getattr(self, 'binning_method', 'naive') == 'naive':
+                expanded = self._expand_adjacent_bins(con, combo, base_rate, base)
+                if expanded:
+                    valid_results.extend(expanded)
 
         return valid_results
 
@@ -529,6 +725,39 @@ class StrategicSegmentBuilder:
             # --- Special / Missing ---
             if interval in ["Special", "Missing"]:
                 sql_conditions.append(f"{col} IS NULL")
+                continue
+
+            # --- Expanded numerical bin list: col=[(-inf, x), [x, y)] ---
+            # Produced by _expand_adjacent_bins when two adjacent numerical bins
+            # are merged. The interval looks like "[(-inf, 30.0), [30.0, 32.0)]".
+            # We extract the outer lower bound of the first range and the outer
+            # upper bound of the last range and emit a single range condition.
+            if interval.startswith("[") and ")," in interval:
+                # Split on "), " to get individual range tokens
+                range_tokens = [t.strip() for t in re.split(r"\),\s*", interval.strip("[]"))]
+                range_tokens = [t if t.endswith(")") else t + ")" for t in range_tokens]
+                bounds = []
+                for token in range_tokens:
+                    if not token or token[0] not in ("(", "["):
+                        continue
+                    lc = token[0]
+                    rc = token[-1]
+                    inner = token[1:-1]
+                    parts_inner = [p.strip() for p in inner.split(",", 1)]
+                    if len(parts_inner) == 2:
+                        bounds.append((lc, parts_inner[0], parts_inner[1], rc))
+                if bounds:
+                    overall_lower_char, overall_lower = bounds[0][0], bounds[0][1]
+                    overall_upper_char, overall_upper = bounds[-1][3], bounds[-1][2]
+                    range_conds = []
+                    if overall_lower.lower() != "-inf":
+                        op = ">=" if overall_lower_char == "[" else ">"
+                        range_conds.append(f"{col} {op} {overall_lower}")
+                    if overall_upper.lower() != "inf":
+                        op = "<" if overall_upper_char == ")" else "<="
+                        range_conds.append(f"{col} {op} {overall_upper}")
+                    if range_conds:
+                        sql_conditions.append(" AND ".join(range_conds))
                 continue
 
             # --- Continuous range ---
@@ -722,69 +951,86 @@ class StrategicSegmentBuilder:
 
             # --- Grid search over parameter configurations ---
             grid_candidates: List[Dict[str, Any]] = []
+            # Build binned table (ensure target array is standard ndarray)
+            raw_target_arr = con.execute(
+                f'SELECT "{self.target}" FROM current_df'
+            ).fetchnumpy()[self.target]
+
+            if isinstance(raw_target_arr, np.ma.MaskedArray):
+                clean_target_arr = raw_target_arr.filled(0)
+            else:
+                clean_target_arr = raw_target_arr
+
+            binned_data = {self.target: clean_target_arr}
+            valid_vars = []
+            for v in top_vars:
+                if v in precomputed_bins and len(np.unique(precomputed_bins[v])) > 1:
+                    binned_data[v] = precomputed_bins[v]
+                    valid_vars.append(v)
+            if not valid_vars:
+                logger.warning("⚠️ No valid binned variables found. Stopping.")
+                break
+
+            con.execute("DROP TABLE IF EXISTS binned_df")
+            con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
+
+            # -------------------------------------------------------------------------
+            # THE FIX: Hoist rule generation outside the grid loop to prevent duplicate 
+            # SQL execution and redundant _expand_adjacent_bins calls.
+            # -------------------------------------------------------------------------
+            # 1. Determine global floor constraints across all experiments
+            global_min_sample = min(exp["min_sample_size"] for exp in experiments)
+            global_min_lift = min(exp["min_lift"] for exp in experiments)
+            
+            # Temporarily set instance variables for the SQL generation pass
+            self.min_sample_size = global_min_sample
+            self.min_lift = global_min_lift
+            
+            all_candidate_rules: List[Dict[str, Any]] = []
+
+            # Level 1 (Singles)
+            res_1 = self._agg_combinations(con, [(c,) for c in valid_vars], original_base_rate)
+            valid_1way_vars = set()
+            if res_1:
+                valid_1way_vars = {c["combo_vars"][0] for c in res_1}
+                if self.enable_1way:
+                    all_candidate_rules.extend(res_1)
+
+            # Level 2 (Pairs)
+            valid_2way_sets = set()
+            if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
+                combos_2 = [c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)]
+                if combos_2:
+                    res_2 = self._agg_combinations(con, combos_2, original_base_rate)
+                    if res_2:
+                        valid_2way_sets = {frozenset(c["combo_vars"]) for c in res_2}
+                        if self.enable_2way:
+                            all_candidate_rules.extend(res_2)
+
+            # Level 3 (Triplets)
+            if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
+                combos_3 = [
+                    c for c in combinations(valid_1way_vars, 3)
+                    if self.is_diverse(c) and all(frozenset(p) in valid_2way_sets for p in combinations(c, 2))
+                ]
+                if combos_3:
+                    res_3 = self._agg_combinations(con, combos_3, original_base_rate)
+                    if res_3:
+                        all_candidate_rules.extend(res_3)
+
+            # 2. Grid search over parameter configurations (In-Memory Filtering)
+            grid_candidates: List[Dict[str, Any]] = []
             for config in experiments:
-                self.min_sample_size = config["min_sample_size"]
-                self.min_lift = config["min_lift"]
-
-                all_rules: List[Dict[str, Any]] = []
-
-                # Level 1 (Singles)
-                res_1 = self._agg_combinations(
-                    con, [(c,) for c in valid_vars], original_base_rate
-                )
-                valid_1way_vars = set()
-                if res_1:
-                    valid_1way_vars = {c["combo_vars"][0] for c in res_1}
-                    if self.enable_1way:
-                        all_rules.extend(res_1)
-
-                if not valid_1way_vars:
-                    continue
-
-                # Level 2 (Pairs)
-                valid_2way_sets = set()
-                if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
-                    combos_2 = [
-                        c
-                        for c in combinations(valid_1way_vars, 2)
-                        if self.is_diverse(c)
-                    ]
-                    if combos_2:
-                        res_2 = self._agg_combinations(con, combos_2, original_base_rate)
-                        if res_2:
-                            valid_2way_sets = {
-                                frozenset(c["combo_vars"]) for c in res_2
-                            }
-                            if self.enable_2way:
-                                all_rules.extend(res_2)
-
-                # Level 3 (Triplets)
-                if (
-                    self.enable_3way
-                    and len(valid_1way_vars) >= 3
-                    and valid_2way_sets
-                ):
-                    combos_3 = [
-                        c
-                        for c in combinations(valid_1way_vars, 3)
-                        if self.is_diverse(c)
-                        and all(
-                            frozenset(p) in valid_2way_sets
-                            for p in combinations(c, 2)
-                        )
-                    ]
-                    if combos_3:
-                        res_3 = self._agg_combinations(con, combos_3, original_base_rate)
-                        if res_3:
-                            all_rules.extend(res_3)
-
-                if all_rules:
-                    # Sort by lift first, then count, then rate (prioritise lift)
-                    all_rules.sort(
-                        key=lambda x: self._get_sort_key(x),
-                        reverse=True,
-                    )
-                    top_match = all_rules[0].copy()
+                # Filter the globally generated rules against this config's strict thresholds
+                valid_for_config = [
+                    r for r in all_candidate_rules
+                    if r["count"] >= config["min_sample_size"] and r["lift"] >= config["min_lift"]
+                ]
+                
+                if valid_for_config:
+                    # Sort by priority and take the top match for this grid config
+                    valid_for_config.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                    top_match = valid_for_config[0].copy()
                     top_match["grid_min_sample_size"] = config["min_sample_size"]
                     top_match["grid_min_lift"] = config["min_lift"]
                     grid_candidates.append(top_match)
@@ -792,6 +1038,12 @@ class StrategicSegmentBuilder:
             if not grid_candidates:
                 logger.info("⏹️ No candidates cleared the grid. Stopping.")
                 break
+
+            # 3. Rank the final candidates out of the grid
+            grid_candidates.sort(
+                key=lambda x: self._get_sort_key(x), reverse=True
+            )
+            # ... Resume raw validation (selected_candidate loop) ...
 
             # Rank candidates by (lift, count, rate)
             grid_candidates.sort(

@@ -72,7 +72,8 @@ class StrategicSegmentBuilder:
         sort_priority: str = "lift_rate_count",  # or "count_lift_rate", "lift_rate_count", etc.
         binning_method: str = "optimal",  
         naive_bins: int = 5 ,
-        selection_metric: str = "iv"              
+        selection_metric: str = "iv",
+        expand_log_mode: str = "summary",  # "none" | "summary" | "full"
     ) -> None:
         """
         Args:
@@ -106,6 +107,10 @@ class StrategicSegmentBuilder:
                     -  'naive' for simple quantile/category heuristics.
             naive_bins: Number of quantile bins used when binning_method is 'naive'.
             selection_metric: Metric used to rank features for top_n_vars selection. Support "iv" or "response_rate".
+            expand_log_mode: Controls verbosity of adjacent-bin expansion logging.
+                    - "summary" (default): neat table summary per iteration
+                    - "full": table + top expanded candidates at INFO level
+                    - "none": only DEBUG messages
         """
         self.target = target
         cpu_count = os.cpu_count() or 1
@@ -130,7 +135,8 @@ class StrategicSegmentBuilder:
         self.diagnostics_: List[Dict[str, Any]] = []
         self.binning_method = binning_method  
         self.naive_bins = naive_bins     
-        self.selection_metric = selection_metric      
+        self.selection_metric = selection_metric
+        self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "full") else "summary"      
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -558,15 +564,9 @@ class StrategicSegmentBuilder:
                                 "lift": exp_lift,
                                 "events": exp_events,
                                 "combo_vars": combo,
+                                "base_events": result["events"],  # for Δ calculation
                             }
                         )
-                        logger.info(
-                            f"🔀 Expanded candidate: {rule_str} | "
-                            f"events: {result['events']:.0f} -> {exp_events:.0f} | "
-                            f"lift: {exp_lift:.2f}x | "
-                            f"count: {exp_count}"
-                        )
-                        
 
         if not expanded:
             logger.debug(f"↩️ No expansion candidates found for combo {combo}")
@@ -655,15 +655,63 @@ class StrategicSegmentBuilder:
         # --- Adjacent bin expansion ---
         # For each combo that produced at least one qualifying result, try to
         # find expanded candidates that capture more events while keeping lift.
+        all_expanded: List[Dict[str, Any]] = []
+        expansion_stats: Dict[str, Dict[str, Any]] = {}  # combo_str -> stats
+
         for combo in combo_list:
             base = per_combo_base.get(combo, [])
             if not base:
                 continue
             # Only perform adjacent bin expansion if we are using naive binning
-            if getattr(self, 'binning_method', 'naive') == 'naive':
+            if getattr(self, "binning_method", "naive") == "naive":
                 expanded = self._expand_adjacent_bins(con, combo, base_rate, base)
                 if expanded:
                     valid_results.extend(expanded)
+                    all_expanded.extend(expanded)
+
+                    combo_key = " & ".join(combo)
+                    best = max(expanded, key=lambda x: x["events"])
+                    delta = best["events"] - best.get("base_events", best["events"])
+                    expansion_stats[combo_key] = {
+                        "n_exp": len(expanded),
+                        "best_delta": delta,
+                        "best_lift": best["lift"],
+                        "best_rule": best["rule"],
+                        "best_events": best["events"],
+                    }
+
+        # ---- Nice expansion logging ----
+        mode = getattr(self, "expand_log_mode", "summary")
+        if expansion_stats and mode != "none":
+            # Table header
+            logger.info("🔀 Adjacent-bin expansion summary")
+            logger.info(
+                f"   {'Combo':<42} {'#exp':>5}  {'Best Δevents':>12}  {'Best lift':>9}"
+            )
+            logger.info("   " + "-" * 72)
+
+            # Sort by best event gain descending
+            for combo_key, st in sorted(
+                expansion_stats.items(), key=lambda x: x[1]["best_delta"], reverse=True
+            ):
+                logger.info(
+                    f"   {combo_key:<42} {st['n_exp']:>5}  "
+                    f"{st['best_delta']:>+12.0f}  {st['best_lift']:>8.2f}x"
+                )
+
+            total_exp = sum(s["n_exp"] for s in expansion_stats.values())
+            logger.info(f"   → Total expanded candidates generated: {total_exp}")
+
+            # Full mode: also show the top 3 concrete rules
+            if mode == "full":
+                top = sorted(all_expanded, key=lambda x: x["events"], reverse=True)[:3]
+                logger.info("   Top expanded rules:")
+                for i, e in enumerate(top, 1):
+                    delta = e["events"] - e.get("base_events", e["events"])
+                    logger.info(
+                        f"     {i}. {e['rule'][:90]}"
+                        f"  | events {e['events']:.0f} (Δ{delta:+.0f}) | lift {e['lift']:.2f}x"
+                    )
 
         return valid_results
 
@@ -801,18 +849,17 @@ class StrategicSegmentBuilder:
         """
         logger.info("🚀 Starting hierarchical segment extraction...")
 
-        # Use file‑backed storage for performance
-        if os.path.exists(f"experiment_{timestamp}.db"):
-            os.remove(f"experiment_{timestamp}.db")
-        con = duckdb.connect(f"experiment_{timestamp}.db")
+        # Use in-memory for constrained environments
+        con = duckdb.connect(":memory:")
 
         total_cores = os.cpu_count() or 1
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
         total_memory_bytes = psutil.virtual_memory().total
-        target_memory_gb = int((total_memory_bytes * 0.5) / (1024 ** 3))
+        target_memory_gb = max(1, int((total_memory_bytes * 0.6) / (1024 ** 3)))
 
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
+        con.execute("SET preserve_insertion_order = false;")
         logger.info(
             f"⚙️ DuckDB Configured: Threads={target_threads}/{total_cores}, "
             f"MemoryLimit={target_memory_gb}GB"
@@ -1186,7 +1233,7 @@ class StrategicSegmentBuilder:
             return []
 
         logger.info("📊 Evaluating final hierarchical coverage on original data...")
-        con = duckdb.connect(f"experiment_{timestamp}.db")
+        con = duckdb.connect(":memory:")
         con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM original_data")
 
         # Build CASE statement with raw SQL filters in order

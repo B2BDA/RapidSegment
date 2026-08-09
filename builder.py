@@ -12,7 +12,7 @@ import logging
 import os
 import re
 from datetime import datetime
-from itertools import combinations, product
+from itertools import combinations, product, groupby
 from typing import Any, Dict, List, Optional, Tuple, Union
 import duckdb
 import numpy as np
@@ -419,7 +419,7 @@ class StrategicSegmentBuilder:
                         max_rr = valid_bins["Event rate"].max()
 
                 thread_con.close()
-                return col, float(iv_val) * 100, float(max_rr), transformed_bins
+                return col, float(iv_val), float(max_rr), transformed_bins
             except Exception as e:
                 logger.debug(f"Computation failed for {col}: {e}")
                 return col, 0.0, 0.0, None
@@ -561,38 +561,47 @@ class StrategicSegmentBuilder:
             if not rows:
                 continue
 
-            gdf = pd.DataFrame(rows, columns=other_cols + [col, "cnt", "evt"])
-            # Drop Missing bins from the mergeable sequence -- adjacency
-            # merging into/out of "Missing" is not meaningful (mirrors the
-            # original behaviour, which explicitly skipped Missing bins).
-            gdf = gdf[gdf[col] != "Missing"]
-            if gdf.empty:
+            # Native Python processing (No Pandas)
+            columns = other_cols + [col, "cnt", "evt"]
+            
+            processed = []
+            for r in rows:
+                row_dict = dict(zip(columns, r))
+                if row_dict[col] == "Missing":
+                    continue
+                row_dict["_sort_key"] = self._bin_sort_key(row_dict[col])
+                processed.append(row_dict)
+
+            if not processed:
                 continue
 
-            gdf["_sort_key"] = gdf[col].map(self._bin_sort_key)
-
             if other_cols:
-                gdf = gdf.sort_values(other_cols + ["_sort_key"])
-                group_iter = gdf.groupby(other_cols, sort=False)
+                # Sort by other_cols, then by the numeric sort key
+                processed.sort(key=lambda x: tuple(x[c] for c in other_cols) + (x["_sort_key"],))
+                
+                # Group by other_cols
+                group_iter = []
+                for k, g in groupby(processed, key=lambda x: tuple(x[c] for c in other_cols)):
+                    group_iter.append((k, list(g)))
             else:
-                gdf = gdf.sort_values("_sort_key")
-                group_iter = [((), gdf)]
+                processed.sort(key=lambda x: x["_sort_key"])
+                group_iter = [((), processed)]
 
-            for group_key, g in group_iter:
+            for group_key, g_list in group_iter:
                 if other_cols:
                     key_tuple = group_key if isinstance(group_key, tuple) else (group_key,)
                     other_val = dict(zip(other_cols, key_tuple))
                 else:
                     other_val = {}
 
-                g = g.reset_index(drop=True)
-                n = len(g)
+                n = len(g_list)
                 if n < 2:
                     continue
 
-                bins = g[col].tolist()
-                cnt = g["cnt"].to_numpy(dtype=float)
-                evt = g["evt"].to_numpy(dtype=float)
+                # Extract as native lists/numpy arrays
+                bins = [x[col] for x in g_list]
+                cnt = np.array([x["cnt"] for x in g_list], dtype=float)
+                evt = np.array([x["evt"] for x in g_list], dtype=float)
                 cum_cnt = np.concatenate(([0.0], np.cumsum(cnt)))
                 cum_evt = np.concatenate(([0.0], np.cumsum(evt)))
 
@@ -1061,7 +1070,6 @@ class StrategicSegmentBuilder:
                 con, eligible_cols, columns_types
             )
 
-            # --- Diagnostic snapshot ---
             # --- Diagnostic snapshot ---
             if self.selection_metric == "response_rate":
                 current_score_map = {row["variable"]: row["max_rr"] for row in iv_ranking}

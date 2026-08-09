@@ -35,6 +35,7 @@ logger = logging.getLogger("StrategicEngine")
 # Pre-compiled regex for fast parsing inside loops
 _BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags=re.DOTALL)
 
+
 def setup_disk_backed_db(base_dir: str = "experiments") -> tuple[str, str]:
     """
     Creates an experiment directory and generates a unique DuckDB file path.
@@ -105,9 +106,7 @@ class StrategicSegmentBuilder:
             n_jobs: Number of parallel jobs for IV computation. -1 uses all but one core.
             min_sample_size: Absolute minimum row count for a valid rule. Used as a fallback when param_grid is None.
             min_lift: Absolute minimum lift threshold (hard constraint).
-                Enforced on all final segments, calculated relative to the locked original base response rate. 
-                Not relaxed during param_grid exploration.: Minimum lift threshold. Used as a fallback when param_grid is None.
-            min_events: Minimum number of positive events for a valid rule. Used as a fallback when param_grid is None.
+            min_events: Minimum number of positive events for a valid rule.
             top_n_vars: Number of highest‑IV features passed into the Apriori engine.
             max_segments: Maximum number of segments to extract.
             max_feature_reuse: Max times a feature can appear across segments.
@@ -119,37 +118,11 @@ class StrategicSegmentBuilder:
             feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
             ignore_features: Explicit list of columns to drop prior to IV calculation.
             sort_priority: Ranking criteria for selecting champion segments.
-                    Can be a predefined shortcut string:
-                    - 'lift_rate_count'   : Lift → Response Rate → Sample Size
-                    - 'count_lift_rate'   : Sample Size → Lift → Response Rate
-                    - 'rate_lift_count'   : Response Rate → Lift → Sample Size
-                    - 'rate_count_lift'   : Response Rate → Sample Size → Lift
-                    - 'lift_count_rate'   : Lift → Sample Size → Response Rate
-                    - 'count_rate_lift'   : Sample Size → Response Rate → Lift
-                    - 'events_lift_rate'  : Events → Lift → Response Rate
-                    - 'events_rate_lift'  : Events → Response Rate → Lift
-                    - 'lift_events_rate'  : Lift → Events → Response Rate
-                    - 'rate_events_lift'  : Response Rate → Events → Lift
-                    - 'events_count_rate' : Events → Count → Rate  (lift-free ranking)
-                    - 'events_rate_count' : Events → Rate → Count  (lift-free ranking)
-                    - 'count_events_rate' : Count → Events → Rate  (lift-free ranking)
-                    - 'rate_events_count' : Rate → Events → Count  (lift-free ranking)
-                    Note: min_lift is always enforced as a hard constraint regardless of sort_priority.
-            binning_method: Which binning engine to use for feature discretization and IV computation.
-                    -  'optimal' for OptBinning 
-                    -  'naive' for simple quantile/category heuristics.
+            binning_method: Which binning engine to use ('optimal' or 'naive').
             naive_bins: Number of quantile bins used when binning_method is 'naive'.
-            selection_metric: Metric used to rank features for top_n_vars selection. Support "iv" or "response_rate".
-            max_expansion_hops: For binning_method="naive" adjacent-bin merging, how many
-                    neighbouring bins may be folded into a merge window, per direction
-                    (left/right), around a qualifying base bin. 1 (default) reproduces the
-                    original single-neighbour-only merge behaviour. Values > 1 allow wider,
-                    multi-bin contiguous merges to be considered (more event capture
-                    potential, more candidates evaluated).
-            expand_log_mode: Controls verbosity of adjacent-bin expansion logging.
-                    - "summary" (default): neat table summary per iteration
-                    - "full": table + top expanded candidates at INFO level
-                    - "none": only DEBUG messages
+            selection_metric: Metric used to rank features for top_n_vars selection ("iv" or "response_rate").
+            max_expansion_hops: Adjacent-bin merging hop distance limit.
+            expand_log_mode: Controls verbosity of adjacent-bin expansion logging ("none", "summary", "full").
         """
         self.target = target
         cpu_count = os.cpu_count() or 1
@@ -170,13 +143,13 @@ class StrategicSegmentBuilder:
         self.ignore_features = ignore_features or []
         self.feature_usage_counts: Dict[str, int] = {}
         self.sort_priority = sort_priority
-        # Diagnostic repository (feature journey tracking)
         self.diagnostics_: List[Dict[str, Any]] = []
         self.binning_method = binning_method  
         self.naive_bins = naive_bins     
         self.max_expansion_hops = max(1, int(max_expansion_hops))
         self.selection_metric = selection_metric
         self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "full") else "summary"   
+        
         # Set up disk-backed DuckDB automatically if not provided
         if db_path is None or db_temp_dir is None:
             self.db_path, self.db_temp_dir = setup_disk_backed_db("experiments")
@@ -185,19 +158,10 @@ class StrategicSegmentBuilder:
             self.db_path = db_path
             self.db_temp_dir = db_temp_dir
 
-  
-
-
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
         """
         Determines the correct OptBinning data type flag from a DuckDB type string.
-
-        Args:
-            duckdb_type: DuckDB column type as string.
-
-        Returns:
-            'categorical' or 'numerical'.
         """
         dtype_upper = duckdb_type.upper()
         if any(t in dtype_upper for t in ["VARCHAR", "CHAR", "STRING", "TEXT", "UUID"]):
@@ -207,12 +171,6 @@ class StrategicSegmentBuilder:
     def _validate_feature_groups(self, columns: List[str]) -> None:
         """
         Validates that all declared feature group variables exist in the target dataset.
-
-        Args:
-            columns: List of all column names from the table.
-
-        Raises:
-            ValueError: If any feature in a group is not found.
         """
         if not self.feature_groups:
             return
@@ -234,12 +192,6 @@ class StrategicSegmentBuilder:
     def get_group(self, var: str) -> str:
         """
         Returns the assigned business category for a feature, or the feature name itself.
-
-        Args:
-            var: Feature name.
-
-        Returns:
-            Group name or the feature name.
         """
         for group, vars_list in self.feature_groups.items():
             if var in vars_list:
@@ -249,12 +201,6 @@ class StrategicSegmentBuilder:
     def is_diverse(self, combo: Tuple[str, ...]) -> bool:
         """
         Ensures a tuple of features spans strictly distinct analytical groups.
-
-        Args:
-            combo: Tuple of feature names.
-
-        Returns:
-            True if all features belong to different groups (or diversity is disabled).
         """
         if not self.enable_diversity:
             return True
@@ -263,13 +209,7 @@ class StrategicSegmentBuilder:
 
     def _get_sort_key(self, rule: Dict[str, Any]) -> Tuple[float, ...]:
         """
-        Utility function to shorlist rules based on users choice on which metric to prioritize.
-
-        Args:
-            rule: Dictionary of Rules that was captured and passed hard constraints.
-
-        Returns:
-            Returns a tuple for sorting rules based on self.sort_priority.
+        Utility function to shortlist rules based on users choice on which metric to prioritize.
         """
         priority = self.sort_priority
         if priority == "lift_count_rate":
@@ -284,7 +224,6 @@ class StrategicSegmentBuilder:
             return (rule["count"], rule["rate"], rule["lift"])
         elif priority == "rate_count_lift":
             return (rule["rate"], rule["count"], rule["lift"])
-        # events-based priorities: favour high event-capture segments
         elif priority == "events_lift_rate":
             return (rule["events"], rule["lift"], rule["rate"])
         elif priority == "events_rate_lift":
@@ -293,7 +232,6 @@ class StrategicSegmentBuilder:
             return (rule["lift"], rule["events"], rule["rate"])
         elif priority == "rate_events_lift":
             return (rule["rate"], rule["events"], rule["lift"])
-        # lift-free priorities: lift enforced only as hard constraint, not in ranking
         elif priority == "events_count_rate":
             return (rule["events"], rule["count"], rule["rate"])
         elif priority == "events_rate_count":
@@ -303,7 +241,6 @@ class StrategicSegmentBuilder:
         elif priority == "rate_events_count":
             return (rule["rate"], rule["events"], rule["count"])
         else:
-            # Fallback mirrors default sort_priority="lift_rate_count"
             return (rule["lift"], rule["rate"], rule["count"])
 
     def compute_iv_ranking_and_bin(
@@ -313,146 +250,139 @@ class StrategicSegmentBuilder:
         columns_types: Dict[str, str],
     ) -> Tuple[List[Dict[str, Union[str, float]]], Dict[str, np.ndarray]]:
         """
-        Computes Information Value (IV) and pre‑computed bins in a single parallel pass.
-
-        Args:
-            con: DuckDB connection.
-            eligible_cols: List of feature columns to evaluate.
-            columns_types: Mapping of column name to its DuckDB type.
-
-        Returns:
-            - Ranking: List of dicts with 'variable' and 'iv' (IV * 100).
-            - Precomputed bins: Dict mapping feature name to transformed bin array.
+        Computes Information Value (IV) and pre-computed bins using SQL-native DuckDB execution.
         """
         logger.info(f"🔍 Computing IV and bins for {len(eligible_cols)} features...")
 
         def _worker(col: str) -> Tuple[str, float, float, Optional[np.ndarray]]:
             try:
                 thread_con = con.cursor()
-                data_dict = thread_con.execute(
-                    f'SELECT "{col}", "{self.target}" FROM current_df'
-                ).fetchnumpy()
-
-                col_arr_raw = data_dict[col]
-                target_arr_raw = data_dict[self.target]
-
-                # Unmask DuckDB MaskedArrays
-                if isinstance(col_arr_raw, np.ma.MaskedArray):
-                    col_arr = col_arr_raw.filled(np.nan if np.issubdtype(col_arr_raw.dtype, np.number) else None)
-                else:
-                    col_arr = col_arr_raw
-
-                if isinstance(target_arr_raw, np.ma.MaskedArray):
-                    target_arr = target_arr_raw.filled(0)
-                else:
-                    target_arr = target_arr_raw
-
                 dtype = self._resolve_optb_dtype(columns_types[col])
-                
-                iv_val = 0.0
-                max_rr = 0.0
 
                 if self.binning_method == "naive":
-                    total_events = np.sum(target_arr)
-                    total_non_events = len(target_arr) - total_events
-                    transformed_bins = np.empty(len(col_arr), dtype=object)
-                    
-                    # Helper function to compute both metrics per bin
-                    def _process_naive_bin_stats(mask, current_iv, current_max_rr):
-                        bin_events = np.sum(target_arr[mask])
-                        bin_total = np.sum(mask)
-                        bin_non_events = bin_total - bin_events
-                        
-                        if bin_total > 0:
-                            # Update max response rate (enforcing hard constraints)
-                            if bin_total >= self.min_sample_size and bin_events >= self.min_events:
-                                rr = bin_events / bin_total
-                                if rr > current_max_rr:
-                                    current_max_rr = rr
-                                    
-                            # Update IV chunk
-                            if bin_events > 0 or bin_non_events > 0:
-                                pct_events = max((bin_events / total_events) if total_events > 0 else 0, 1e-6)
-                                pct_non_events = max((bin_non_events / total_non_events) if total_non_events > 0 else 0, 1e-6)
-                                current_iv += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
-                                
-                        return current_iv, current_max_rr
-
                     if dtype == "numerical":
-                        col_arr_float = col_arr.astype(float, copy=False)
-                        valid_mask = ~np.isnan(col_arr_float)
-                        if not np.any(valid_mask):
-                            raise ValueError("Column contains only NaNs")
-                            
-                        q = np.linspace(0, 100, self.naive_bins + 1)
-                        edges = np.unique(np.percentile(col_arr_float[valid_mask], q))
+                        # Compute quantiles natively in DuckDB SQL
+                        q_step = 1.0 / float(self.naive_bins)
+                        q_list = [round(i * q_step, 6) for i in range(self.naive_bins + 1)]
+                        q_str = ", ".join(str(q) for q in q_list)
                         
-                        if len(edges) < 2:
+                        quantiles = thread_con.execute(
+                            f'SELECT QUANTILE_CONT("{col}", [{q_str}]) FROM current_df WHERE "{col}" IS NOT NULL'
+                        ).fetchone()[0]
+
+                        if quantiles is None or len(quantiles) == 0:
                             edges = np.array([-np.inf, np.inf])
                         else:
-                            edges[0], edges[-1] = -np.inf, np.inf
-                            
-                        bin_indices = np.digitize(col_arr_float, edges[1:-1], right=False)
+                            edges = np.unique(np.array(quantiles, dtype=float))
+                            if len(edges) < 2:
+                                edges = np.array([-np.inf, np.inf])
+                            else:
+                                edges[0] = -np.inf
+                                edges[-1] = np.inf
 
+                        case_clauses = []
                         for i in range(len(edges) - 1):
                             lower, upper = edges[i], edges[i+1]
                             lower_str = "-inf" if np.isinf(lower) and lower < 0 else str(lower)
                             upper_str = "inf" if np.isinf(upper) and upper > 0 else str(upper)
-                            
-                            mask = (bin_indices == i) & valid_mask
-                            transformed_bins[mask] = f"[{lower_str}, {upper_str})"
-                            iv_val, max_rr = _process_naive_bin_stats(mask, iv_val, max_rr)
+                            label = f"[{lower_str}, {upper_str})"
 
-                        # Handle Missing for numerical
-                        missing_mask = ~valid_mask
-                        if np.any(missing_mask):
-                            transformed_bins[missing_mask] = "Missing"
-                            iv_val, max_rr = _process_naive_bin_stats(missing_mask, iv_val, max_rr)
+                            if np.isinf(lower) and lower < 0:
+                                case_clauses.append(f'WHEN "{col}" < {upper} THEN \'{label}\'')
+                            elif np.isinf(upper) and upper > 0:
+                                case_clauses.append(f'WHEN "{col}" >= {lower} THEN \'{label}\'')
+                            else:
+                                case_clauses.append(f'WHEN "{col}" >= {lower} AND "{col}" < {upper} THEN \'{label}\'')
 
+                        case_expr = f"""
+                        CASE 
+                            WHEN "{col}" IS NULL THEN 'Missing'
+                            {' '.join(case_clauses)}
+                            ELSE 'Missing'
+                        END
+                        """
                     else:
-                        # Handle categorical arrays
-                        missing_mask = np.array([
-                            x is None 
-                            or (isinstance(x, float) and np.isnan(x)) 
-                            or (isinstance(x, str) and x.strip() in ("", "None", "nan", "NaN", "<NA>", "null", "NULL"))
-                            for x in col_arr
-                        ])
-                        valid_mask = ~missing_mask
+                        case_expr = f"""
+                        CASE 
+                            WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
+                            ELSE '[' || CAST("{col}" AS VARCHAR) || ']'
+                        END
+                        """
 
-                        if np.any(valid_mask):
-                            valid_vals = col_arr[valid_mask].astype(str)
-                            unique_vals = np.unique(valid_vals)
-                            
-                            for val in unique_vals:
-                                mask = valid_mask & (col_arr.astype(str) == val)
-                                transformed_bins[mask] = f"['{val}']"
-                                iv_val, max_rr = _process_naive_bin_stats(mask, iv_val, max_rr)
+                    # Aggregate binned metrics in DuckDB
+                    stats_df = thread_con.execute(
+                        f"""
+                        WITH binned AS (
+                            SELECT 
+                                {case_expr} AS bin_label,
+                                CAST("{self.target}" AS DOUBLE) AS target
+                            FROM current_df
+                        )
+                        SELECT 
+                            bin_label,
+                            COUNT(*) AS cnt,
+                            SUM(target) AS evt
+                        FROM binned
+                        GROUP BY bin_label
+                        """
+                    ).fetchall()
 
-                        if np.any(missing_mask):
-                            transformed_bins[missing_mask] = "Missing"
-                            iv_val, max_rr = _process_naive_bin_stats(missing_mask, iv_val, max_rr)
+                    total_events = sum(r[2] or 0.0 for r in stats_df)
+                    total_non_events = sum((r[1] - (r[2] or 0.0)) for r in stats_df)
 
-                    transformed_bins = np.asarray(transformed_bins, dtype=str)
+                    iv_val = 0.0
+                    max_rr = 0.0
+
+                    for label, cnt, evt in stats_df:
+                        evt = evt or 0.0
+                        cnt = cnt or 0
+                        non_evt = cnt - evt
+
+                        if cnt >= self.min_sample_size and evt >= self.min_events:
+                            rr = evt / cnt
+                            if rr > max_rr:
+                                max_rr = rr
+
+                        if total_events > 0 and total_non_events > 0:
+                            pct_events = max(evt / total_events, 1e-6)
+                            pct_non_events = max(non_evt / total_non_events, 1e-6)
+                            iv_val += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
+
+                    # Transform bins array in DuckDB
+                    transformed_bins = thread_con.execute(
+                        f"""
+                        SELECT {case_expr} AS bin_label FROM current_df
+                        """
+                    ).fetchnumpy()["bin_label"].astype(str)
 
                 else:
                     # Optimal binning fallback
+                    data_dict = thread_con.execute(
+                        f'SELECT "{col}", "{self.target}" FROM current_df'
+                    ).fetchnumpy()
+
+                    col_arr_raw = data_dict[col]
+                    target_arr_raw = data_dict[self.target]
+
+                    col_arr = col_arr_raw.filled(np.nan if np.issubdtype(col_arr_raw.dtype, np.number) else None) if isinstance(col_arr_raw, np.ma.MaskedArray) else col_arr_raw
+                    target_arr = target_arr_raw.filled(0) if isinstance(target_arr_raw, np.ma.MaskedArray) else target_arr_raw
+
                     optb = OptimalBinning(name=col, dtype=dtype)
                     optb.fit(col_arr, target_arr)
-                    
+
                     bin_table = optb.binning_table.build()
-                    iv_val = bin_table["IV"].values[-1]
+                    iv_val = float(bin_table["IV"].values[-1])
                     transformed_bins = np.asarray(optb.transform(col_arr, metric="bins"), dtype=str)
-                    
-                    # Extract max response rate enforcing hard constraints
+
                     valid_bins = bin_table[
                         (bin_table["Count"] >= self.min_sample_size) & 
                         (bin_table["Event"] >= self.min_events)
                     ]
-                    if not valid_bins.empty:
-                        max_rr = valid_bins["Event rate"].max()
+                    max_rr = float(valid_bins["Event rate"].max()) if not valid_bins.empty else 0.0
 
                 thread_con.close()
                 return col, float(iv_val), float(max_rr), transformed_bins
+
             except Exception as e:
                 logger.debug(f"Computation failed for {col}: {e}")
                 return col, 0.0, 0.0, None
@@ -468,32 +398,17 @@ class StrategicSegmentBuilder:
             if bins is not None:
                 precomputed_bins[col] = bins
 
-        # Dynamic sorting based on user selection
         if self.selection_metric == "response_rate":
             ranking.sort(key=lambda x: x["max_rr"], reverse=True)
         else:
             ranking.sort(key=lambda x: x["iv"], reverse=True)
-            
+
         return ranking, precomputed_bins
 
     @staticmethod
     def _bin_sort_key(label: str) -> Tuple[int, float, str]:
         """
         Numeric-aware sort key for a bin label.
-
-        Bin labels produced by naive binning look like "[10.0, 20.0)" or
-        "[-inf, 5.0)". Sorting these as plain strings (lexicographic order)
-        is WRONG for adjacency purposes -- e.g. "[100.0, 200.0)" would sort
-        BEFORE "[20.0, 30.0)" because '1' < '2' as characters, even though
-        100 > 20 numerically. This key parses the lower bound and sorts on
-        that numerically instead, falling back to lexicographic order for
-        non-range (categorical) labels so the two kinds never get compared
-        against each other.
-
-        Returns:
-            (type_flag, numeric_value, string_value) -- type_flag=0 for
-            parsed numeric-range labels, 1 for everything else (categorical
-            strings sort among themselves via string_value).
         """
         m = re.match(r"^[\[\(]\s*(-?inf|-?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*,", label)
         if m:
@@ -516,45 +431,8 @@ class StrategicSegmentBuilder:
         seen_rules: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """
-        For each qualifying bin result, attempts to merge it with adjacent
-        neighbour bin(s) on every variable in the combo, producing expanded
-        candidates that capture more events while still clearing min_lift
-        and min_events.
-
-        Vectorized implementation: instead of issuing one SQL round-trip per
-        candidate merge (which does not scale -- a full table scan of
-        `binned_df` per candidate), this pulls ONE grouped aggregate per
-        variable in the combo (grouped by that variable plus every other
-        variable already fixed in the combo), then performs all neighbour /
-        multi-hop window arithmetic via cumulative sums in-memory. This is
-        the same "windowed aggregate" idea as a SQL window function
-        (`SUM() OVER (... ROWS BETWEEN ...)`), just computed with numpy
-        prefix sums after a single bulk fetch -- correctness-equivalent, but
-        O(1) per window lookup instead of O(1 query) per window.
-
-        The expansion is per-variable: for a combo (A, B), for each
-        qualifying (bin_A, bin_B) result, we try widening bin_A's window
-        left/right, and separately widening bin_B's window left/right,
-        keeping the other variable's bin fixed. `max_expansion_hops`
-        controls how many neighbouring bins may be folded in per direction
-        (1 == old behaviour: single left/right neighbour only).
-
-        Args:
-            con:          DuckDB connection.
-            combo:        Tuple of feature names for this combination.
-            base_rate:    Global event rate (used to compute lift).
-            base_results: Already-qualifying results from the base GROUP BY pass.
-            seen_rules:   Optional shared dedup set. When the caller is iterating
-                over multiple combos in a single batch (e.g. `_agg_combinations`
-                processing all 1-way, 2-way, or 3-way combos together), it should
-                pass the SAME set across every call so expanded candidates are
-                deduplicated across combos, not just within one combo's own
-                expansion pass. If omitted, a fresh set is created (dedup is then
-                local to this single call only).
-
-        Returns:
-            List of additional expanded rule dicts (same schema as _agg_combinations
-            output). May be empty if no expansion improves results.
+        Attempts to merge adjacent neighbour bin(s) on every variable in combo.
+        Uses native Python groupby processing (no Pandas).
         """
         if not base_results:
             return []
@@ -572,8 +450,6 @@ class StrategicSegmentBuilder:
         for col in combo:
             other_cols = [c for c in combo if c != col]
 
-            # ---- One bulk grouped query for this variable (replaces what
-            # used to be N single-row point queries in the old loop). ----
             group_cols = other_cols + [col]
             select_cols = ", ".join(f'CAST("{c}" AS VARCHAR) AS "{c}"' for c in group_cols)
             group_by_cols = ", ".join(f'"{c}"' for c in group_cols)
@@ -594,7 +470,6 @@ class StrategicSegmentBuilder:
             if not rows:
                 continue
 
-            # Native Python processing (No Pandas)
             columns = other_cols + [col, "cnt", "evt"]
             
             processed = []
@@ -609,10 +484,7 @@ class StrategicSegmentBuilder:
                 continue
 
             if other_cols:
-                # Sort by other_cols, then by the numeric sort key
                 processed.sort(key=lambda x: tuple(x[c] for c in other_cols) + (x["_sort_key"],))
-                
-                # Group by other_cols
                 group_iter = []
                 for k, g in groupby(processed, key=lambda x: tuple(x[c] for c in other_cols)):
                     group_iter.append((k, list(g)))
@@ -631,7 +503,6 @@ class StrategicSegmentBuilder:
                 if n < 2:
                     continue
 
-                # Extract as native lists/numpy arrays
                 bins = [x[col] for x in g_list]
                 cnt = np.array([x["cnt"] for x in g_list], dtype=float)
                 evt = np.array([x["evt"] for x in g_list], dtype=float)
@@ -645,7 +516,7 @@ class StrategicSegmentBuilder:
                     )
                     base_result = base_lookup.get(rule_at_idx)
                     if base_result is None:
-                        continue  # not a qualifying base bin -- nothing to expand from
+                        continue
 
                     base_events = base_result["events"]
 
@@ -689,23 +560,16 @@ class StrategicSegmentBuilder:
                                 "lift": float(exp_lift),
                                 "events": float(exp_events),
                                 "combo_vars": combo,
-                                "base_events": base_events,  # for Δ calculation
+                                "base_events": base_events,
                             }
                         )
-
-        if not expanded:
-            logger.debug(f"↩️ No expansion candidates found for combo {combo}")
 
         return expanded
 
     @staticmethod
     def _candidate_windows(idx: int, n: int, max_hops: int):
         """
-        Yields (lo, hi) inclusive index windows around `idx` for widening
-        the merge left and right independently, up to `max_hops` bins in
-        each direction (capped at the array bounds). Mirrors the original
-        single-neighbour expansion when max_hops=1, and generalizes to
-        multi-bin merges for max_hops > 1.
+        Yields (lo, hi) inclusive index windows around `idx`.
         """
         for hops in range(1, max_hops + 1):
             lo, hi = idx - hops, idx
@@ -726,14 +590,6 @@ class StrategicSegmentBuilder:
     ) -> List[Dict[str, Any]]:
         """
         Batches SQL GROUP BY queries for a list of feature combinations.
-
-        Args:
-            con: DuckDB connection.
-            combo_list: List of tuples, each tuple is a combination of features.
-            base_rate: Global event rate (used to compute lift).
-
-        Returns:
-            List of rule dictionaries with keys: rule, count, events, rate, lift, combo_vars.
         """
         if not combo_list:
             return []
@@ -762,15 +618,12 @@ class StrategicSegmentBuilder:
         valid_results = []
         chunk_size = 100
 
-        # We need per-combo base results for the expansion step, so collect them
-        # before merging into valid_results.
         per_combo_base: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {
             combo: [] for combo in combo_list
         }
 
         for i in range(0, len(queries), chunk_size):
             chunk = queries[i:i + chunk_size]
-            # combos_chunk = combo_for_query[i:i + chunk_size]
             union_query = " UNION ALL ".join(chunk)
 
             res = con.execute(union_query).fetchall()
@@ -779,7 +632,6 @@ class StrategicSegmentBuilder:
                 lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
                 combo_key = tuple(combo_vars_str.split(","))
 
-                # if lift >= self.min_lift and events >= self.min_events:
                 if events >= self.min_events:
                     entry = {
                         "rule": rule,
@@ -793,23 +645,14 @@ class StrategicSegmentBuilder:
                     if combo_key in per_combo_base:
                         per_combo_base[combo_key].append(entry)
 
-        # --- Adjacent bin expansion ---
-        # For each combo that produced at least one qualifying result, try to
-        # find expanded candidates that capture more events while keeping lift.
         all_expanded: List[Dict[str, Any]] = []
-        expansion_stats: Dict[str, Dict[str, Any]] = {}  # combo_str -> stats
-
-        # Shared dedup set across ALL combos processed in this _agg_combinations
-        # invocation (e.g. every 1-way, or every 2-way combo in this batch), so
-        # an expanded candidate produced while expanding one combo can't be
-        # re-added as a "new" candidate while expanding a different combo.
+        expansion_stats: Dict[str, Dict[str, Any]] = {}
         shared_seen_rules: set = set()
 
         for combo in combo_list:
             base = per_combo_base.get(combo, [])
             if not base:
                 continue
-            # Only perform adjacent bin expansion if we are using naive binning
             if getattr(self, "binning_method", "naive") == "naive":
                 expanded = self._expand_adjacent_bins(
                     con, combo, base_rate, base, seen_rules=shared_seen_rules
@@ -829,17 +672,14 @@ class StrategicSegmentBuilder:
                         "best_events": best["events"],
                     }
 
-        # ---- Nice expansion logging ----
         mode = getattr(self, "expand_log_mode", "summary")
         if expansion_stats and mode != "none":
-            # Table header
             logger.info("🔀 Adjacent-bin expansion summary")
             logger.info(
                 f"   {'Combo':<42} {'#exp':>5}  {'Best Δevents':>12}  {'Best lift':>9}"
             )
             logger.info("   " + "-" * 72)
 
-            # Sort by best event gain descending
             for combo_key, st in sorted(
                 expansion_stats.items(), key=lambda x: x[1]["best_delta"], reverse=True
             ):
@@ -851,7 +691,6 @@ class StrategicSegmentBuilder:
             total_exp = sum(s["n_exp"] for s in expansion_stats.values())
             logger.info(f"   → Total expanded candidates generated: {total_exp}")
 
-            # Full mode: also show the top 3 concrete rules
             if mode == "full":
                 top = sorted(all_expanded, key=lambda x: x["events"], reverse=True)[:3]
                 logger.info("   Top expanded rules:")
@@ -866,13 +705,7 @@ class StrategicSegmentBuilder:
 
     def parse_rule_to_sql(self, rule_str: str) -> str:
         """
-        Translates OptBinning / naive / expanded rule strings into a production SQL WHERE clause.
-
-        Handles:
-        - Normal numerical ranges:  col=[10.0, 20.0)
-        - Expanded adjacent bins:  col=[[10.0, 20.0), [20.0, 30.0)]
-        - Categorical:             col=['A', 'B']  or  col=['success']
-        - Missing / Special
+        Translates rule strings into production SQL WHERE clause.
         """
         parts = [p.strip() for p in rule_str.split("&")]
         sql_conditions: List[str] = []
@@ -884,18 +717,12 @@ class StrategicSegmentBuilder:
             col, interval = [x.strip() for x in part.split("=", 1)]
             bracket_match = _BRACKET_REGEX.search(interval)
 
-            # ------------------------------------------------------------------
-            # 1. Detect expanded numerical form produced by _expand_adjacent_bins
-            #    Example: [[2.0, 3.0), [3.0, inf)]
-            # ------------------------------------------------------------------
+            # 1. Multi-range / merged adjacent ranges like [[10, 20), [20, 30)]
             if interval.startswith("[[") or (interval.startswith("[") and ")," in interval and interval.count("[") >= 2):
-                # Extract all individual ranges
-                # Remove outer [ ] first
                 inner = interval.strip()
                 if inner.startswith("[") and inner.endswith("]"):
                     inner = inner[1:-1]
 
-                # Split on "), " while keeping the closing )
                 raw_tokens = re.split(r"\),\s*", inner)
                 ranges = []
                 for tok in raw_tokens:
@@ -904,17 +731,15 @@ class StrategicSegmentBuilder:
                         continue
                     if not tok.endswith(")"):
                         tok = tok + ")"
-                    # Now tok is something like "[2.0, 3.0)" or "[3.0, inf)"
                     if tok[0] in ("[", "(") and tok[-1] in ("]", ")"):
                         left_char = tok[0]
                         right_char = tok[-1]
                         content = tok[1:-1]
-                        lo, hi = [x.strip() for x in content.split(",", 1)]
-                        ranges.append((left_char, lo, hi, right_char))
+                        if "," in content:
+                            lo, hi = [x.strip() for x in content.split(",", 1)]
+                            ranges.append((left_char, lo, hi, right_char))
 
                 if ranges:
-                    # Take outermost bounds
-                    # Sort by lower bound so we get the true min/max even if expansion order was wrong
                     def _sort_key(r):
                         val = r[1]
                         if val.lower() == "-inf":
@@ -933,16 +758,14 @@ class StrategicSegmentBuilder:
                         op = ">=" if overall_lower_char == "[" else ">"
                         range_conds.append(f"{col} {op} {overall_lower}")
                     if overall_upper.lower() != "inf":
-                        op = "<" if overall_upper_char == ")" else "<="
+                        op = "<=" if overall_upper_char == "]" else "<"
                         range_conds.append(f"{col} {op} {overall_upper}")
 
                     if range_conds:
                         sql_conditions.append(" AND ".join(range_conds))
                     continue
 
-            # ------------------------------------------------------------------
-            # 2. Categorical detection
-            # ------------------------------------------------------------------
+            # 2. Explicit Categoricals
             is_categorical = False
             if bracket_match:
                 content = bracket_match.group(1)
@@ -974,71 +797,60 @@ class StrategicSegmentBuilder:
                     sql_conditions.append(f"{col} IN ({formatted_items})")
                 continue
 
-            # ------------------------------------------------------------------
-            # 3. Missing / Special
-            # ------------------------------------------------------------------
+            # 3. Special or Missing values
             if interval in ["Special", "Missing"]:
                 sql_conditions.append(f"{col} IS NULL")
                 continue
 
-            # ------------------------------------------------------------------
-            # 4. Normal continuous range  e.g. [10.0, 20.0)  or  (-inf, 5.0]
-            # ------------------------------------------------------------------
+            # 4. Standard Intervals [lo, hi) or Single Bracket Values [val]
             if interval.startswith(("[", "(")):
-                left_char, right_char = interval[0], interval[-1]
-                lower_str, upper_str = [x.strip() for x in interval[1:-1].split(",", 1)]
+                inner = interval[1:-1].strip()
 
-                range_conds = []
-                if lower_str.lower() != "-inf":
-                    op = ">=" if left_char == "[" else ">"
-                    range_conds.append(f"{col} {op} {lower_str}")
-                if upper_str.lower() != "inf":
-                    op = "<=" if right_char == "]" else "<"
-                    range_conds.append(f"{col} {op} {upper_str}")
+                if "," in inner:
+                    left_char, right_char = interval[0], interval[-1]
+                    lower_str, upper_str = [x.strip() for x in inner.split(",", 1)]
 
-                if range_conds:
-                    sql_conditions.append(" AND ".join(range_conds))
+                    range_conds = []
+                    if lower_str.lower() != "-inf":
+                        op = ">=" if left_char == "[" else ">"
+                        range_conds.append(f"{col} {op} {lower_str}")
+                    if upper_str.lower() != "inf":
+                        op = "<=" if right_char == "]" else "<"
+                        range_conds.append(f"{col} {op} {upper_str}")
 
-        return " AND ".join(f"({cond})" if "AND" in cond else cond for cond in sql_conditions)
+                    if range_conds:
+                        sql_conditions.append(" AND ".join(range_conds))
+                else:
+                    # Single value inside brackets, e.g. [123] or [Value]
+                    clean_val = inner.strip("'\"")
+                    if clean_val.replace(".", "", 1).replace("-", "", 1).isdigit():
+                        sql_conditions.append(f"{col} = {clean_val}")
+                    else:
+                        sql_conditions.append(f"{col} = '{clean_val}'")
+
+        return " AND ".join(f"({cond})" for cond in sql_conditions)
 
     def extract_segments(self, data: Any) -> List[Dict[str, Any]]:
         """
         Sequentially extracts high‑lift rules on the residual dataset.
-
-        After extraction, the stored counts reflect the final hierarchical segmentation
-        on the original dataset, ensuring consistency with `evaluate_final_coverage()`.
-
-        Args:
-            data: Input data (will be loaded into DuckDB).
-
-        Returns:
-            List of segment dictionaries with keys: segment_id, rule_string, sql_filter,
-            count, rate, lift, meta_applied_sample_size, meta_applied_min_lift.
         """
         logger.info("🚀 Starting hierarchical segment extraction...")
 
-# Connect to the persisted database on disk instead of :memory:
         con = duckdb.connect(self.db_path)
 
         total_cores = os.cpu_count() or 1
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
-        
-        # Force a conservative memory limit so it spills to disk safely
-        # E.g., cap at 4GB regardless of total system memory
         target_memory_gb = 4 
 
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
-        
-        # CRITICAL: Tell DuckDB to use our specific temp folder for spilling
         con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
-        
         con.execute("SET preserve_insertion_order = false;")
+        
         logger.info(
             f"⚙️ DuckDB Configured for Disk Spilling: Threads={target_threads}/{total_cores}, "
             f"MemoryLimit={target_memory_gb}GB, TempDir={self.db_temp_dir}"
         )
-        
         logger.info(f"📊 Sort priority: {self.sort_priority}")
         logger.info(f"📦 Binning method: {self.binning_method} (naive_bins={self.naive_bins})")
         
@@ -1057,7 +869,6 @@ class StrategicSegmentBuilder:
         ]
         self.feature_usage_counts = {col: 0 for col in eligible_cols}
 
-        # Build parameter grid experiments
         if self.param_grid:
             sizes = self.param_grid.get("min_sample_size", [self.min_sample_size])
             lifts = self.param_grid.get("min_lift", [self.min_lift])
@@ -1065,13 +876,10 @@ class StrategicSegmentBuilder:
                 {"min_sample_size": s, "min_lift": l}
                 for s, l in product(sizes, lifts)
             ]
-            logger.info(
-                f"📊 Dynamic Grid Search Enabled: {len(experiments)} configurations."
-            )
+            logger.info(f"📊 Dynamic Grid Search Enabled: {len(experiments)} configurations.")
         else:
             experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
 
-        # Cache original base_rate and absolute constraints
         original_base_rate = con.execute(
             f'SELECT AVG(CAST("{self.target}" AS DOUBLE)) FROM current_df'
         ).fetchone()[0] or 0.0
@@ -1105,7 +913,6 @@ class StrategicSegmentBuilder:
                 con, eligible_cols, columns_types
             )
 
-            # --- Diagnostic snapshot ---
             if self.selection_metric == "response_rate":
                 current_score_map = {row["variable"]: row["max_rr"] for row in iv_ranking}
             else:
@@ -1153,7 +960,6 @@ class StrategicSegmentBuilder:
                 logger.warning("⚠️ All eligible features exhausted. Aborting.")
                 break
 
-            # Build binned table (ensure target array is standard ndarray)
             raw_target_arr = con.execute(
                 f'SELECT "{self.target}" FROM current_df'
             ).fetchnumpy()[self.target]
@@ -1176,18 +982,9 @@ class StrategicSegmentBuilder:
             con.execute("DROP TABLE IF EXISTS binned_df")
             con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
 
-            # --- Grid search over parameter configurations ---
-            grid_candidates: List[Dict[str, Any]] = []
-
-            # -------------------------------------------------------------------------
-            # THE FIX: Hoist rule generation outside the grid loop to prevent duplicate 
-            # SQL execution and redundant _expand_adjacent_bins calls.
-            # -------------------------------------------------------------------------
-            # 1. Determine global floor constraints across all experiments
             global_min_sample = min(exp["min_sample_size"] for exp in experiments)
             global_min_lift = min(exp["min_lift"] for exp in experiments)
             
-            # Temporarily set instance variables for the SQL generation pass
             self.min_sample_size = global_min_sample
             self.min_lift = global_min_lift
             
@@ -1223,17 +1020,14 @@ class StrategicSegmentBuilder:
                     if res_3:
                         all_candidate_rules.extend(res_3)
 
-            # 2. Grid search over parameter configurations (In-Memory Filtering)
             grid_candidates: List[Dict[str, Any]] = []
             for config in experiments:
-                # Filter the globally generated rules against this config's strict thresholds
                 valid_for_config = [
                     r for r in all_candidate_rules
                     if r["count"] >= config["min_sample_size"] and r["lift"] >= config["min_lift"]
                 ]
                 
                 if valid_for_config:
-                    # Sort by priority and take the top match for this grid config
                     valid_for_config.sort(key=lambda x: self._get_sort_key(x), reverse=True)
                     top_match = valid_for_config[0].copy()
                     top_match["grid_min_sample_size"] = config["min_sample_size"]
@@ -1244,28 +1038,17 @@ class StrategicSegmentBuilder:
                 logger.info("⏹️ No candidates cleared the grid. Stopping.")
                 break
 
-            # 3. Rank the final candidates out of the grid
-            grid_candidates.sort(
-                key=lambda x: self._get_sort_key(x), reverse=True
-            )
-            # ... Resume raw validation (selected_candidate loop) ...
-
-            # Rank candidates by (lift, count, rate)
-            grid_candidates.sort(
-                key=lambda x: self._get_sort_key(x), reverse=True
-            )
+            grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
 
             selected_candidate = None
             for candidate in grid_candidates:
                 rule_str = candidate["rule"]
                 sql_filter = self.parse_rule_to_sql(rule_str)
-                # Validate on raw current_df (residual)
                 actual = con.execute(
                     f'SELECT COUNT(*) AS cnt, SUM(CAST("{self.target}" AS DOUBLE)) AS evt '
                     f'FROM current_df WHERE ({sql_filter})'
                 ).fetchone()
                 actual_cnt, actual_evt = actual[0], actual[1] or 0
-                # Calculate actual lift for this candidate
                 actual_rate = (actual_evt / actual_cnt * 100.0) if actual_cnt > 0 else 0.0
                 actual_lift = (actual_rate / (original_base_rate * 100.0)) if original_base_rate > 0 else 0.0
 
@@ -1293,7 +1076,6 @@ class StrategicSegmentBuilder:
             best_raw_sql = selected_candidate["sql_filter"]
             winning_combo = selected_candidate["combo_vars"]
 
-            # Compute metrics from the residual counts
             actual_rate = (
                 selected_candidate["actual_events"] / selected_candidate["actual_count"]
             ) * 100.0
@@ -1310,7 +1092,6 @@ class StrategicSegmentBuilder:
                     f"{self.feature_usage_counts[var]}"
                 )
 
-            # Store the raw rule and raw SQL (no exclusions)
             self.segments.append(
                 {
                     "segment_id": i,
@@ -1338,18 +1119,14 @@ class StrategicSegmentBuilder:
                 f"  Rule: {best_rule}\n"
                 f"  SQL: {best_raw_sql}"
             )
-            # ------------------------------------------------------------------
-            # Clear comparison of top expanded candidates vs the final champion
-            # ------------------------------------------------------------------
-            # Collect the top expanded candidates that were available in this iteration
+
             expanded_in_this_iter = [
                 r for r in all_candidate_rules
-                if "base_events" in r          # only expanded rules carry this key
+                if "base_events" in r
             ]
             if expanded_in_this_iter:
-                # Sort them the same way the engine ranked everything
                 expanded_in_this_iter.sort(key=lambda x: self._get_sort_key(x), reverse=True)
-                top_exp = expanded_in_this_iter[:5]   # show top 5
+                top_exp = expanded_in_this_iter[:5]
         
                 logger.info("📊 Top adjacent-merge candidates vs final champion")
                 logger.info(
@@ -1357,7 +1134,6 @@ class StrategicSegmentBuilder:
                 )
                 logger.info("   " + "-" * 90)
         
-                # First line = the actual winner
                 logger.info(
                     f"   {'★':<5} {'CHAMPION':<10} "
                     f"{actual_lift:>6.2f}x {actual_rate:>6.1f}% "
@@ -1367,7 +1143,6 @@ class StrategicSegmentBuilder:
                 )
         
                 for idx, e in enumerate(top_exp, 1):
-                    # Decide why it lost (or would have won)
                     champ_key = self._get_sort_key({
                         "lift": actual_lift,
                         "rate": actual_rate,
@@ -1379,7 +1154,6 @@ class StrategicSegmentBuilder:
                     if cand_key > champ_key:
                         reason = "would have beaten champion (but failed raw validation)"
                     else:
-                        # Walk the sort priority tuple to find the first deciding dimension
                         _dim_order = {
                             "lift_count_rate":   ["lift", "count", "rate"],
                             "count_lift_rate":   ["count", "lift", "rate"],
@@ -1410,7 +1184,7 @@ class StrategicSegmentBuilder:
                             "count": e["count"],
                             "events": e["events"],
                         }
-                        reason = "ranked lower by sort_priority"  # fallback
+                        reason = "ranked lower by sort_priority"
                         for dim in priority_order:
                             if cand_vals[dim] < champ_vals[dim]:
                                 label = {
@@ -1424,7 +1198,6 @@ class StrategicSegmentBuilder:
                                 )
                                 break
                             elif cand_vals[dim] > champ_vals[dim]:
-                                # candidate beats champ on this dim — next dim decided it
                                 break
             
                         logger.info(
@@ -1442,8 +1215,6 @@ class StrategicSegmentBuilder:
                 "count": int(selected_candidate["actual_count"]),
             }
 
-            # Remove rows matching the raw rule from the residual
-            # NULL‑safe: keep rows where the rule evaluates to NULL
             con.execute(
                 f"""
                 CREATE TABLE temp_residual AS
@@ -1454,7 +1225,6 @@ class StrategicSegmentBuilder:
             con.execute("DROP TABLE current_df")
             con.execute("ALTER TABLE temp_residual RENAME TO current_df")
 
-        # Restore original config
         self.min_sample_size = abs_min_sample_size
         self.min_events = abs_min_events
         self.min_lift = abs_min_lift 
@@ -1465,25 +1235,15 @@ class StrategicSegmentBuilder:
     def evaluate_final_coverage(self, original_data: Any) -> List[Dict[str, Any]]:
         """
         Evaluates the hierarchical segmentation on the original dataset.
-
-        The rules are applied in the order they were extracted (first rule gets
-        highest priority). This yields the true hierarchical segmentation.
-
-        Args:
-            original_data: The original (unfiltered) dataset.
-
-        Returns:
-            List of dictionaries with segment KPIs: segment, total_count,
-            target_events, response_rate, base_response_rate, capture_rate, lift.
         """
         if not self.segments:
             return []
 
         logger.info("📊 Evaluating final hierarchical coverage on original data...")
         con = duckdb.connect(":memory:")
-        con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM original_data")
+        con.register("input_data_view", original_data)
+        con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view")
 
-        # Build CASE statement with raw SQL filters in order
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
             for seg in self.segments
@@ -1540,9 +1300,6 @@ class StrategicSegmentBuilder:
     def explain_feature_journey(self, feature_name: str) -> None:
         """
         Prints a detailed audit trail of a specific feature across all iterations.
-
-        Args:
-            feature_name: Name of the feature to trace.
         """
         if not self.diagnostics_:
             print("⚠️ No diagnostic records found. Run extract_segments() first.")
@@ -1562,7 +1319,6 @@ class StrategicSegmentBuilder:
                 continue
 
             print(f"\n[Iteration {iter_num}]")
-            # Default fallback to 'iv' for backward compatibility on older states
             metric_val = state.get('metric_score', state.get('iv', 0.0))
             metric_name = state.get('metric_type', 'iv').upper()
             
@@ -1584,22 +1340,12 @@ class StrategicSegmentBuilder:
         self, original_data: Any, features: List[str]
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Generates a feature health report on the original dataset for an explicitly provided
-        list of features using native DuckDB SQL naive binning (NTILE quantiles for numeric
-        features and direct grouping for categoricals). Robustly handles string targets.
-
-        Args:
-            original_data: The original (unfiltered) dataset.
-            features: List of feature column names to evaluate.
-
-        Returns:
-            Dictionary mapping each specified feature to its bin health details.
+        Generates a feature health report on the original dataset using DuckDB native SQL.
         """
         if not features:
             logger.warning("⚠️ No features provided for health report generation.")
             return {}
 
-        # Deduplicate features while preserving order
         unique_features = list(dict.fromkeys(features))
 
         logger.info(
@@ -1608,12 +1354,12 @@ class StrategicSegmentBuilder:
         )
 
         con = duckdb.connect(":memory:")
-        con.execute("CREATE TABLE input_df AS SELECT * FROM original_data")
+        con.register("input_data_view", original_data)
+        con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
 
         cols_info = con.execute("DESCRIBE input_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}
 
-        # Safe target conversion expression for DuckDB SQL (handles numeric, string 'Yes'/'No', 'True'/'False')
         target_expr = f"""
         (CASE 
             WHEN TRY_CAST("{self.target}" AS DOUBLE) IS NOT NULL THEN TRY_CAST("{self.target}" AS DOUBLE)
@@ -1647,7 +1393,6 @@ class StrategicSegmentBuilder:
             )
 
             if is_numeric:
-                # DuckDB SQL Quantile binning via NTILE()
                 query = f"""
                 WITH ranked AS (
                     SELECT
@@ -1689,7 +1434,6 @@ class StrategicSegmentBuilder:
                 ORDER BY sort_key
                 """
             else:
-                # Direct SQL grouping for categorical values
                 query = f"""
                 SELECT
                     CASE
@@ -1736,4 +1480,3 @@ class StrategicSegmentBuilder:
     
         health_report_df = pd.DataFrame(rows)
         return health_report_df
-    

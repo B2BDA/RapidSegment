@@ -72,6 +72,7 @@ class StrategicSegmentBuilder:
         sort_priority: str = "lift_rate_count",  # or "count_lift_rate", "lift_rate_count", etc.
         binning_method: str = "optimal",  
         naive_bins: int = 5 ,
+        max_expansion_hops: int = 1,
         selection_metric: str = "iv",
         expand_log_mode: str = "summary",  # "none" | "summary" | "full"
     ) -> None:
@@ -116,6 +117,12 @@ class StrategicSegmentBuilder:
                     -  'naive' for simple quantile/category heuristics.
             naive_bins: Number of quantile bins used when binning_method is 'naive'.
             selection_metric: Metric used to rank features for top_n_vars selection. Support "iv" or "response_rate".
+            max_expansion_hops: For binning_method="naive" adjacent-bin merging, how many
+                    neighbouring bins may be folded into a merge window, per direction
+                    (left/right), around a qualifying base bin. 1 (default) reproduces the
+                    original single-neighbour-only merge behaviour. Values > 1 allow wider,
+                    multi-bin contiguous merges to be considered (more event capture
+                    potential, more candidates evaluated).
             expand_log_mode: Controls verbosity of adjacent-bin expansion logging.
                     - "summary" (default): neat table summary per iteration
                     - "full": table + top expanded candidates at INFO level
@@ -144,6 +151,7 @@ class StrategicSegmentBuilder:
         self.diagnostics_: List[Dict[str, Any]] = []
         self.binning_method = binning_method  
         self.naive_bins = naive_bins     
+        self.max_expansion_hops = max(1, int(max_expansion_hops))
         self.selection_metric = selection_metric
         self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "full") else "summary"      
 
@@ -435,6 +443,37 @@ class StrategicSegmentBuilder:
             
         return ranking, precomputed_bins
 
+    @staticmethod
+    def _bin_sort_key(label: str) -> Tuple[int, float, str]:
+        """
+        Numeric-aware sort key for a bin label.
+
+        Bin labels produced by naive binning look like "[10.0, 20.0)" or
+        "[-inf, 5.0)". Sorting these as plain strings (lexicographic order)
+        is WRONG for adjacency purposes -- e.g. "[100.0, 200.0)" would sort
+        BEFORE "[20.0, 30.0)" because '1' < '2' as characters, even though
+        100 > 20 numerically. This key parses the lower bound and sorts on
+        that numerically instead, falling back to lexicographic order for
+        non-range (categorical) labels so the two kinds never get compared
+        against each other.
+
+        Returns:
+            (type_flag, numeric_value, string_value) -- type_flag=0 for
+            parsed numeric-range labels, 1 for everything else (categorical
+            strings sort among themselves via string_value).
+        """
+        m = re.match(r"^[\[\(]\s*(-?inf|-?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*,", label)
+        if m:
+            raw = m.group(1).lower()
+            if raw == "-inf":
+                val = float("-inf")
+            elif raw == "inf":
+                val = float("inf")
+            else:
+                val = float(raw)
+            return (0, val, "")
+        return (1, 0.0, label)
+
     def _expand_adjacent_bins(
         self,
         con: duckdb.DuckDBPyConnection,
@@ -444,16 +483,28 @@ class StrategicSegmentBuilder:
         seen_rules: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """
-        For each qualifying bin result, attempts to merge it with its adjacent
-        neighbour bin on every variable in the combo, producing expanded candidates
-        that capture more events while still clearing min_lift and min_events.
+        For each qualifying bin result, attempts to merge it with adjacent
+        neighbour bin(s) on every variable in the combo, producing expanded
+        candidates that capture more events while still clearing min_lift
+        and min_events.
 
-        The expansion is per-variable: for a combo (A, B), for each qualifying
-        (bin_A, bin_B) result, we try expanding bin_A to include its neighbour,
-        and separately try expanding bin_B to include its neighbour, keeping the
-        other variable's bin fixed. Expanded candidates that improve event capture
-        over the base result while maintaining lift are added as additional
-        candidates.
+        Vectorized implementation: instead of issuing one SQL round-trip per
+        candidate merge (which does not scale -- a full table scan of
+        `binned_df` per candidate), this pulls ONE grouped aggregate per
+        variable in the combo (grouped by that variable plus every other
+        variable already fixed in the combo), then performs all neighbour /
+        multi-hop window arithmetic via cumulative sums in-memory. This is
+        the same "windowed aggregate" idea as a SQL window function
+        (`SUM() OVER (... ROWS BETWEEN ...)`), just computed with numpy
+        prefix sums after a single bulk fetch -- correctness-equivalent, but
+        O(1) per window lookup instead of O(1 query) per window.
+
+        The expansion is per-variable: for a combo (A, B), for each
+        qualifying (bin_A, bin_B) result, we try widening bin_A's window
+        left/right, and separately widening bin_B's window left/right,
+        keeping the other variable's bin fixed. `max_expansion_hops`
+        controls how many neighbouring bins may be folded in per direction
+        (1 == old behaviour: single left/right neighbour only).
 
         Args:
             con:          DuckDB connection.
@@ -475,132 +526,128 @@ class StrategicSegmentBuilder:
         if not base_results:
             return []
 
-        # Build a lookup: variable -> sorted list of unique bin labels in binned_df.
-        # We only do this once per combo and only for variables that appear in combo.
-        bin_labels: Dict[str, List[str]] = {}
-        for col in combo:
-            rows = con.execute(
-                f'SELECT DISTINCT CAST("{col}" AS VARCHAR) AS b '
-                f'FROM binned_df ORDER BY b'
-            ).fetchall()
-            bin_labels[col] = [r[0] for r in rows]
-
-        expanded: List[Dict[str, Any]] = []
         if seen_rules is None:
             seen_rules = set()
-
-        # Index base results by their rule string to avoid exact duplicates
         for r in base_results:
             seen_rules.add(r["rule"])
 
-        for result in base_results:
-            # Parse the current bin assignment per variable from the rule string.
-            # Rule format: "colA=<bin> & colB=<bin> & ..."
-            current_bins: Dict[str, str] = {}
-            for part in result["rule"].split(" & "):
-                if "=" not in part:
+        base_lookup: Dict[str, Dict[str, Any]] = {r["rule"]: r for r in base_results}
+        max_hops = max(1, int(getattr(self, "max_expansion_hops", 1)))
+
+        expanded: List[Dict[str, Any]] = []
+
+        for col in combo:
+            other_cols = [c for c in combo if c != col]
+
+            # ---- One bulk grouped query for this variable (replaces what
+            # used to be N single-row point queries in the old loop). ----
+            group_cols = other_cols + [col]
+            select_cols = ", ".join(f'CAST("{c}" AS VARCHAR) AS "{c}"' for c in group_cols)
+            group_by_cols = ", ".join(f'"{c}"' for c in group_cols)
+            try:
+                rows = con.execute(
+                    f"""
+                    SELECT {select_cols},
+                           COUNT("{self.target}")::BIGINT AS cnt,
+                           SUM(CAST("{self.target}" AS DOUBLE)) AS evt
+                    FROM binned_df
+                    GROUP BY {group_by_cols}
+                    """
+                ).fetchall()
+            except Exception:
+                logger.debug(f"↩️ Expansion aggregate query failed for variable '{col}' in combo {combo}")
+                continue
+
+            if not rows:
+                continue
+
+            gdf = pd.DataFrame(rows, columns=other_cols + [col, "cnt", "evt"])
+            # Drop Missing bins from the mergeable sequence -- adjacency
+            # merging into/out of "Missing" is not meaningful (mirrors the
+            # original behaviour, which explicitly skipped Missing bins).
+            gdf = gdf[gdf[col] != "Missing"]
+            if gdf.empty:
+                continue
+
+            gdf["_sort_key"] = gdf[col].map(self._bin_sort_key)
+
+            if other_cols:
+                gdf = gdf.sort_values(other_cols + ["_sort_key"])
+                group_iter = gdf.groupby(other_cols, sort=False)
+            else:
+                gdf = gdf.sort_values("_sort_key")
+                group_iter = [((), gdf)]
+
+            for group_key, g in group_iter:
+                if other_cols:
+                    key_tuple = group_key if isinstance(group_key, tuple) else (group_key,)
+                    other_val = dict(zip(other_cols, key_tuple))
+                else:
+                    other_val = {}
+
+                g = g.reset_index(drop=True)
+                n = len(g)
+                if n < 2:
                     continue
-                col, bin_val = part.split("=", 1)
-                current_bins[col.strip()] = bin_val.strip()
 
-            # For each variable in the combo, try expanding to include the
-            # adjacent neighbour bin (both directions: left and right).
-            for col in combo:
-                if col not in current_bins or col not in bin_labels:
-                    continue
+                bins = g[col].tolist()
+                cnt = g["cnt"].to_numpy(dtype=float)
+                evt = g["evt"].to_numpy(dtype=float)
+                cum_cnt = np.concatenate(([0.0], np.cumsum(cnt)))
+                cum_evt = np.concatenate(([0.0], np.cumsum(evt)))
 
-                labels = bin_labels[col]
-                current_bin = current_bins[col]
+                for idx in range(n):
+                    rule_at_idx = " & ".join(
+                        f"{c}={other_val[c]}" if c != col else f"{c}={bins[idx]}"
+                        for c in combo
+                    )
+                    base_result = base_lookup.get(rule_at_idx)
+                    if base_result is None:
+                        continue  # not a qualifying base bin -- nothing to expand from
 
-                if current_bin not in labels:
-                    continue
+                    base_events = base_result["events"]
 
-                idx = labels.index(current_bin)
-                neighbours = []
-                if idx > 0:
-                    neighbours.append(labels[idx - 1])   # left neighbour
-                if idx < len(labels) - 1:
-                    neighbours.append(labels[idx + 1])   # right neighbour
+                    for lo, hi in self._candidate_windows(idx, n, max_hops):
+                        exp_count = cum_cnt[hi + 1] - cum_cnt[lo]
+                        exp_events = cum_evt[hi + 1] - cum_evt[lo]
+                        if exp_count <= 0:
+                            continue
 
-                for neighbour_bin in neighbours:
-                    # Build the expanded bin set for this variable:
-                    # the original bin + the neighbour bin.
-                    if current_bin == "Missing" or neighbour_bin == "Missing":
-                        continue
-                    expanded_bins_for_col = [current_bin, neighbour_bin]
+                        exp_rate = (exp_events / exp_count) * 100.0
+                        exp_lift = exp_rate / (base_rate * 100.0) if base_rate > 0 else 0.0
 
-                    # Construct the WHERE clause for the expanded query.
-                    # For the expanding variable: bin IN (current, neighbour).
-                    # For all other variables: bin = their fixed value.
-                    where_parts = []
-                    rule_parts = []
-                    for c in combo:
-                        if c == col:
-                            in_list = ", ".join(
-                                f"'{b}'" for b in expanded_bins_for_col
-                            )
-                            where_parts.append(
-                                f'CAST("{c}" AS VARCHAR) IN ({in_list})'
-                            )
-                            # Rule label: show both bins joined
-                            rule_parts.append(
-                                f"{c}=[{', '.join(sorted(expanded_bins_for_col))}]"
-                            )
-                        else:
-                            fixed_bin = current_bins[c]
-                            where_parts.append(
-                                f'CAST("{c}" AS VARCHAR) = \'{fixed_bin}\''
-                            )
-                            rule_parts.append(f"{c}={fixed_bin}")
+                        if not (
+                            exp_lift >= self.min_lift
+                            and exp_events >= self.min_events
+                            and exp_count >= self.min_sample_size
+                            and exp_events > base_events
+                        ):
+                            continue
 
-                    rule_str = " & ".join(rule_parts)
+                        window_labels_sorted = sorted(bins[lo:hi + 1], key=self._bin_sort_key)
+                        merged_label = f"[{', '.join(window_labels_sorted)}]"
 
-                    # Skip if we've already produced this rule
-                    if rule_str in seen_rules:
-                        continue
-                    seen_rules.add(rule_str)
+                        rule_parts = []
+                        for c in combo:
+                            if c == col:
+                                rule_parts.append(f"{c}={merged_label}")
+                            else:
+                                rule_parts.append(f"{c}={other_val[c]}")
+                        rule_str = " & ".join(rule_parts)
 
-                    where_clause = " AND ".join(where_parts)
-                    try:
-                        row = con.execute(
-                            f"""
-                            SELECT
-                                COUNT("{self.target}")::BIGINT AS cnt,
-                                SUM(CAST("{self.target}" AS DOUBLE)) AS evt
-                            FROM binned_df
-                            WHERE {where_clause}
-                            """
-                        ).fetchone()
-                    except Exception:
-                        continue
+                        if rule_str in seen_rules:
+                            continue
+                        seen_rules.add(rule_str)
 
-                    if row is None:
-                        continue
-
-                    exp_count, exp_events = row[0] or 0, row[1] or 0.0
-                    if exp_count == 0:
-                        continue
-
-                    exp_rate = (exp_events / exp_count) * 100.0
-                    exp_lift = exp_rate / (base_rate * 100.0) if base_rate > 0 else 0.0
-
-                    # Only keep if it still clears hard constraints AND captures
-                    # more events than the base result it was derived from.
-                    if (
-                        exp_lift >= self.min_lift
-                        and exp_events >= self.min_events
-                        and exp_count >= self.min_sample_size
-                        and exp_events > result["events"]
-                    ):
                         expanded.append(
                             {
                                 "rule": rule_str,
-                                "count": exp_count,
-                                "rate": exp_rate,
-                                "lift": exp_lift,
-                                "events": exp_events,
+                                "count": int(exp_count),
+                                "rate": float(exp_rate),
+                                "lift": float(exp_lift),
+                                "events": float(exp_events),
                                 "combo_vars": combo,
-                                "base_events": result["events"],  # for Δ calculation
+                                "base_events": base_events,  # for Δ calculation
                             }
                         )
 
@@ -608,6 +655,26 @@ class StrategicSegmentBuilder:
             logger.debug(f"↩️ No expansion candidates found for combo {combo}")
 
         return expanded
+
+    @staticmethod
+    def _candidate_windows(idx: int, n: int, max_hops: int):
+        """
+        Yields (lo, hi) inclusive index windows around `idx` for widening
+        the merge left and right independently, up to `max_hops` bins in
+        each direction (capped at the array bounds). Mirrors the original
+        single-neighbour expansion when max_hops=1, and generalizes to
+        multi-bin merges for max_hops > 1.
+        """
+        for hops in range(1, max_hops + 1):
+            lo, hi = idx - hops, idx
+            if lo < 0:
+                break
+            yield (lo, hi)
+        for hops in range(1, max_hops + 1):
+            lo, hi = idx, idx + hops
+            if hi >= n:
+                break
+            yield (lo, hi)
 
     def _agg_combinations(
         self,
@@ -1068,28 +1135,6 @@ class StrategicSegmentBuilder:
 
             # --- Grid search over parameter configurations ---
             grid_candidates: List[Dict[str, Any]] = []
-            # Build binned table (ensure target array is standard ndarray)
-            raw_target_arr = con.execute(
-                f'SELECT "{self.target}" FROM current_df'
-            ).fetchnumpy()[self.target]
-
-            if isinstance(raw_target_arr, np.ma.MaskedArray):
-                clean_target_arr = raw_target_arr.filled(0)
-            else:
-                clean_target_arr = raw_target_arr
-
-            binned_data = {self.target: clean_target_arr}
-            valid_vars = []
-            for v in top_vars:
-                if v in precomputed_bins and len(np.unique(precomputed_bins[v])) > 1:
-                    binned_data[v] = precomputed_bins[v]
-                    valid_vars.append(v)
-            if not valid_vars:
-                logger.warning("⚠️ No valid binned variables found. Stopping.")
-                break
-
-            con.execute("DROP TABLE IF EXISTS binned_df")
-            con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
 
             # -------------------------------------------------------------------------
             # THE FIX: Hoist rule generation outside the grid loop to prevent duplicate 

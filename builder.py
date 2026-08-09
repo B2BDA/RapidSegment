@@ -16,7 +16,6 @@ from itertools import combinations, product, groupby
 from typing import Any, Dict, List, Optional, Tuple, Union
 import duckdb
 import numpy as np
-import psutil
 from joblib import Parallel, delayed
 from optbinning import OptimalBinning
 import pandas as pd
@@ -36,7 +35,6 @@ logger = logging.getLogger("StrategicEngine")
 # Pre-compiled regex for fast parsing inside loops
 _BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags=re.DOTALL)
 
-@staticmethod
 def setup_disk_backed_db(base_dir: str = "experiments") -> tuple[str, str]:
     """
     Creates an experiment directory and generates a unique DuckDB file path.
@@ -761,11 +759,6 @@ class StrategicSegmentBuilder:
             """
             queries.append(query)
 
-        # Map each query back to its combo so we can run expansion per combo.
-        combo_for_query = []
-        for combo in combo_list:
-            combo_for_query.append(combo)
-
         valid_results = []
         chunk_size = 100
 
@@ -1049,7 +1042,8 @@ class StrategicSegmentBuilder:
         logger.info(f"📊 Sort priority: {self.sort_priority}")
         logger.info(f"📦 Binning method: {self.binning_method} (naive_bins={self.naive_bins})")
         
-        con.execute("CREATE OR REPLACE TABLE current_df AS SELECT * FROM data")
+        con.register("input_data_view", data)
+        con.execute("CREATE OR REPLACE TABLE current_df AS SELECT * FROM input_data_view")
 
         cols_info = con.execute("DESCRIBE current_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}

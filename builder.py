@@ -1693,3 +1693,4 @@ class StrategicSegmentBuilder:
     
         health_report_df = pd.DataFrame(rows)
         return health_report_df
+    

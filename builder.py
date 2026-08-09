@@ -441,6 +441,7 @@ class StrategicSegmentBuilder:
         combo: Tuple[str, ...],
         base_rate: float,
         base_results: List[Dict[str, Any]],
+        seen_rules: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """
         For each qualifying bin result, attempts to merge it with its adjacent
@@ -459,6 +460,13 @@ class StrategicSegmentBuilder:
             combo:        Tuple of feature names for this combination.
             base_rate:    Global event rate (used to compute lift).
             base_results: Already-qualifying results from the base GROUP BY pass.
+            seen_rules:   Optional shared dedup set. When the caller is iterating
+                over multiple combos in a single batch (e.g. `_agg_combinations`
+                processing all 1-way, 2-way, or 3-way combos together), it should
+                pass the SAME set across every call so expanded candidates are
+                deduplicated across combos, not just within one combo's own
+                expansion pass. If omitted, a fresh set is created (dedup is then
+                local to this single call only).
 
         Returns:
             List of additional expanded rule dicts (same schema as _agg_combinations
@@ -478,7 +486,8 @@ class StrategicSegmentBuilder:
             bin_labels[col] = [r[0] for r in rows]
 
         expanded: List[Dict[str, Any]] = []
-        seen_rules: set = set()
+        if seen_rules is None:
+            seen_rules = set()
 
         # Index base results by their rule string to avoid exact duplicates
         for r in base_results:
@@ -686,13 +695,21 @@ class StrategicSegmentBuilder:
         all_expanded: List[Dict[str, Any]] = []
         expansion_stats: Dict[str, Dict[str, Any]] = {}  # combo_str -> stats
 
+        # Shared dedup set across ALL combos processed in this _agg_combinations
+        # invocation (e.g. every 1-way, or every 2-way combo in this batch), so
+        # an expanded candidate produced while expanding one combo can't be
+        # re-added as a "new" candidate while expanding a different combo.
+        shared_seen_rules: set = set()
+
         for combo in combo_list:
             base = per_combo_base.get(combo, [])
             if not base:
                 continue
             # Only perform adjacent bin expansion if we are using naive binning
             if getattr(self, "binning_method", "naive") == "naive":
-                expanded = self._expand_adjacent_bins(con, combo, base_rate, base)
+                expanded = self._expand_adjacent_bins(
+                    con, combo, base_rate, base, seen_rules=shared_seen_rules
+                )
                 if expanded:
                     valid_results.extend(expanded)
                     all_expanded.extend(expanded)

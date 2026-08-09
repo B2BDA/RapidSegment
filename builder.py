@@ -20,6 +20,7 @@ from joblib import Parallel, delayed
 from optbinning import OptimalBinning
 import pandas as pd
 import uuid
+import psutil
 
 # -----------------------------------------------------------------------------
 # Module-level configuration
@@ -840,7 +841,8 @@ class StrategicSegmentBuilder:
 
         total_cores = os.cpu_count() or 1
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
-        target_memory_gb = 4 
+        total_mem_gb = psutil.virtual_memory().total / (1024**3)
+        target_memory_gb = max(1, int(total_mem_gb * 0.8)) 
 
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")

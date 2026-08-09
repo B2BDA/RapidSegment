@@ -20,12 +20,12 @@ import psutil
 from joblib import Parallel, delayed
 from optbinning import OptimalBinning
 import pandas as pd
+import uuid
 
 # -----------------------------------------------------------------------------
 # Module-level configuration
 # -----------------------------------------------------------------------------
-now = datetime.now()
-timestamp = now.strftime("%Y_%m_%d_%H_%M_%S")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,6 +35,29 @@ logger = logging.getLogger("StrategicEngine")
 
 # Pre-compiled regex for fast parsing inside loops
 _BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags=re.DOTALL)
+
+@staticmethod
+def setup_disk_backed_db(base_dir: str = "experiments") -> tuple[str, str]:
+    """
+    Creates an experiment directory and generates a unique DuckDB file path.
+    Returns the database path and the temp directory path.
+    """
+    # 1. Create the main experiments directory
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # 2. Generate unique identifiers (Date + UUID)
+    date_str = datetime.now().strftime("%Y%m%d")
+    unique_id = uuid.uuid4().hex[:8]  # Short UUID is usually sufficient and cleaner
+    
+    # 3. Define the main database file path
+    db_filename = f"segmentation_{date_str}_{unique_id}.duckdb"
+    db_path = os.path.join(base_dir, db_filename)
+    
+    # 4. Create a dedicated temp directory for DuckDB to spill to
+    temp_dir = os.path.join(base_dir, f"tmp_{date_str}_{unique_id}")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    return db_path, temp_dir    
 
 
 class StrategicSegmentBuilder:
@@ -74,7 +97,9 @@ class StrategicSegmentBuilder:
         naive_bins: int = 5 ,
         max_expansion_hops: int = 1,
         selection_metric: str = "iv",
-        expand_log_mode: str = "summary",  # "none" | "summary" | "full"
+        expand_log_mode: str = "summary",  # "none" | "summary" | "full",
+        db_path: Optional[str] = None,
+        db_temp_dir: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -153,7 +178,17 @@ class StrategicSegmentBuilder:
         self.naive_bins = naive_bins     
         self.max_expansion_hops = max(1, int(max_expansion_hops))
         self.selection_metric = selection_metric
-        self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "full") else "summary"      
+        self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "full") else "summary"   
+        # Set up disk-backed DuckDB automatically if not provided
+        if db_path is None or db_temp_dir is None:
+            self.db_path, self.db_temp_dir = setup_disk_backed_db("experiments")
+            logger.info(f"📂 Created disk-backed DB at: {self.db_path}")
+        else:
+            self.db_path = db_path
+            self.db_temp_dir = db_temp_dir
+
+  
+
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -989,20 +1024,26 @@ class StrategicSegmentBuilder:
         """
         logger.info("🚀 Starting hierarchical segment extraction...")
 
-        # Use in-memory for constrained environments
-        con = duckdb.connect(":memory:")
+# Connect to the persisted database on disk instead of :memory:
+        con = duckdb.connect(self.db_path)
 
         total_cores = os.cpu_count() or 1
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
-        total_memory_bytes = psutil.virtual_memory().total
-        target_memory_gb = max(1, int((total_memory_bytes * 0.6) / (1024 ** 3)))
+        
+        # Force a conservative memory limit so it spills to disk safely
+        # E.g., cap at 4GB regardless of total system memory
+        target_memory_gb = 4 
 
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
+        
+        # CRITICAL: Tell DuckDB to use our specific temp folder for spilling
+        con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
+        
         con.execute("SET preserve_insertion_order = false;")
         logger.info(
-            f"⚙️ DuckDB Configured: Threads={target_threads}/{total_cores}, "
-            f"MemoryLimit={target_memory_gb}GB"
+            f"⚙️ DuckDB Configured for Disk Spilling: Threads={target_threads}/{total_cores}, "
+            f"MemoryLimit={target_memory_gb}GB, TempDir={self.db_temp_dir}"
         )
         
         logger.info(f"📊 Sort priority: {self.sort_priority}")

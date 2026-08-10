@@ -95,7 +95,7 @@ class StrategicSegmentBuilder:
         sort_priority: str = "lift_rate_count",  # or "count_lift_rate", "lift_rate_count", etc.
         binning_method: str = "optimal",  
         naive_bins: int = 5 ,
-        max_expansion_hops: int = 1,
+        max_expansion_hops: int = 0,
         selection_metric: str = "iv",
         expand_log_mode: str = "summary",  # "none" | "summary" | "full",
         db_path: Optional[str] = None,
@@ -444,7 +444,7 @@ class StrategicSegmentBuilder:
             seen_rules.add(r["rule"])
 
         base_lookup: Dict[str, Dict[str, Any]] = {r["rule"]: r for r in base_results}
-        max_hops = max(1, int(getattr(self, "max_expansion_hops", 1)))
+        max_hops = max(0, int(getattr(self, "max_expansion_hops", 0)))
 
         expanded: List[Dict[str, Any]] = []
 
@@ -571,15 +571,25 @@ class StrategicSegmentBuilder:
     def _candidate_windows(idx: int, n: int, max_hops: int):
         """
         Yields (lo, hi) inclusive index windows around `idx`.
+    
+        Windows that would span the variable's entire domain (all n bins) are excluded:
+        such a merge removes the variable's filtering power entirely (matches every row),
+        producing a degenerate, non-informative candidate. Left unguarded, expansions on
+        different variables can each independently collapse to this "no constraint" state
+        and surface as distinct rule strings with identical count/events/lift downstream.
         """
         for hops in range(1, max_hops + 1):
             lo, hi = idx - hops, idx
             if lo < 0:
                 break
+            if hi - lo + 1 >= n:
+                break
             yield (lo, hi)
         for hops in range(1, max_hops + 1):
             lo, hi = idx, idx + hops
             if hi >= n:
+                break
+            if hi - lo + 1 >= n:
                 break
             yield (lo, hi)
 
@@ -698,7 +708,7 @@ class StrategicSegmentBuilder:
                 for i, e in enumerate(top, 1):
                     delta = e["events"] - e.get("base_events", e["events"])
                     logger.info(
-                        f"     {i}. {e['rule'][:90]}"
+                        f"     {i}. {e['rule']}"
                         f"  | events {e['events']:.0f} (Δ{delta:+.0f}) | lift {e['lift']:.2f}x"
                     )
 
@@ -1153,7 +1163,7 @@ class StrategicSegmentBuilder:
 
             expanded_in_this_iter = [
                 r for r in all_candidate_rules
-                if "base_events" in r
+                if "base_events" in r and r["rule"] != best_rule
             ]
             if expanded_in_this_iter:
                 expanded_in_this_iter.sort(key=lambda x: self._get_sort_key(x), reverse=True)
@@ -1231,12 +1241,12 @@ class StrategicSegmentBuilder:
                             elif cand_vals[dim] > champ_vals[dim]:
                                 break
             
-                        logger.info(
-                            f"   {idx:<5} {'expanded':<10} "
-                            f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
-                            f"{e['count']:>8} {e['events']:>8.0f}  "
-                            f"{e['rule'][:55]}  → {reason}"
-                        )
+                    logger.info(
+                        f"   {idx:<5} {'expanded':<10} "
+                        f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
+                        f"{e['count']:>8} {e['events']:>8.0f}  "
+                        f"{e['rule']}  → {reason}"
+                    )
 
             self.diagnostics_[-1]["winning_segment"] = {
                 "rule": best_rule,

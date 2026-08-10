@@ -725,32 +725,31 @@ class StrategicSegmentBuilder:
 
         def _quote_sql_string(val: Any) -> str:
             txt = str(val)
-            return "'" + txt.replace("'","''") + "'"
+            # escape single quotes for SQL and wrap in single quotes
+            return "'" + txt.replace("'", "''") + "'"
+        
         def _is_categorical_col(col_name: str) -> bool:
             return col_name in self._categorical_cols
-
+        
         for part in parts:
             if "=" not in part:
                 continue
-
+        
             col, interval = [x.strip() for x in part.split("=", 1)]
             bracket_match = _BRACKET_REGEX.search(interval)
-            col_is_categorical = _is_categorical_cols(col)
+            col_is_categorical = _is_categorical_col(col)
+        
             # 1. Multi-range / merged adjacent NUMERIC ranges like [[10, 20), [20, 30)]
-            # Real numeric range tokens always end in ')' or ']', so adjacent tokens are
-            # joined by "),"/"]," + "[". Categorical merges (see 1b) join bracketed single
-            # values like "[female], [male]" -- joined by "],", never "),". Require the
-            # numeric-specific separator so we don't misfire on merged categoricals.
             is_numeric_multirange = (
-                not col_is_categorical
+                (not col_is_categorical)
                 and interval.startswith("[[")
-                and re.search(r"\),\s*\[",interval) is not None
+                and re.search(r"\),\s*\[", interval) is not None
             )
             if is_numeric_multirange:
                 inner = interval.strip()
                 if inner.startswith("[") and inner.endswith("]"):
                     inner = inner[1:-1]
-
+        
                 raw_tokens = re.split(r"\),\s*", inner)
                 ranges = []
                 for tok in raw_tokens:
@@ -766,21 +765,21 @@ class StrategicSegmentBuilder:
                         if "," in content:
                             lo, hi = [x.strip() for x in content.split(",", 1)]
                             ranges.append((left_char, lo, hi, right_char))
-
+        
                 if ranges:
                     def _sort_key(r):
                         val = r[1]
-                        if val.lower() == "-inf":
+                        if isinstance(val, str) and val.lower() == "-inf":
                             return float("-inf")
                         try:
                             return float(val)
                         except Exception:
                             return 0.0
-
+        
                     ranges_sorted = sorted(ranges, key=_sort_key)
                     overall_lower_char, overall_lower = ranges_sorted[0][0], ranges_sorted[0][1]
                     overall_upper_char, overall_upper = ranges_sorted[-1][3], ranges_sorted[-1][2]
-
+        
                     range_conds = []
                     if overall_lower.lower() != "-inf":
                         op = ">=" if overall_lower_char == "[" else ">"
@@ -788,23 +787,22 @@ class StrategicSegmentBuilder:
                     if overall_upper.lower() != "inf":
                         op = "<=" if overall_upper_char == "]" else "<"
                         range_conds.append(f"{col} {op} {overall_upper}")
-
+        
                     if range_conds:
                         sql_conditions.append(" AND ".join(range_conds))
                     continue
-
-            # 1b. Merged categorical lists like [[male], [female]] or [[male], [female], [other]],
-            # produced when _expand_adjacent_bins merges adjacent single-bracket categorical bins.
+        
+            # 1b. Merged categorical lists like [[male], [female]]
             if interval.startswith("[[") and bracket_match:
                 cat_tokens = re.findall(r"\[([^\[\]]+)\]", interval)
                 if cat_tokens:
-                    cleaned_items = [t.strip().strip("'\"") for t in cat_tokens]
+                    cleaned_items = [t.strip().strip("'\"") for t in cat_tokens if t.strip()]
                     formatted_items = ", ".join(_quote_sql_string(item) for item in cleaned_items if item)
                     if formatted_items:
                         sql_conditions.append(f"{col} IN ({formatted_items})")
                     continue
-
-            # 2. Explicit Categoricals
+        
+            # 2. Explicit Categoricals (single bracket / multiple tokens)
             def _is_numeric_token(tok: str) -> bool:
                 tok = tok.strip().strip("'\"")
                 if tok.lower() in ("-inf", "inf", "+inf"):
@@ -812,57 +810,38 @@ class StrategicSegmentBuilder:
                 try:
                     float(tok)
                     return True
-                except ValueError:
+                except Exception:
                     return False
-
+        
             is_categorical = False
             if bracket_match:
                 content = bracket_match.group(1)
-                tokens = [t for t in content.split(",") if t.strip()]
+                tokens = [t for t in re.split(r",\s*", content) if t.strip()]
                 if any(k in interval for k in ("'", '"', "Array", "Categorical")) or not interval.startswith(("[", "(")):
                     is_categorical = True
                 elif len(tokens) > 2:
                     is_categorical = True
                 elif not all(_is_numeric_token(t) for t in tokens):
                     is_categorical = True
-
+        
             if is_categorical and bracket_match:
-                import ast
-                try:
-                    raw_items = ast.literal_eval(bracket_match.group(0))
-                except Exception:
-                    raw_content = bracket_match.group(1)
-                    if "," not in raw_content:
-                        raw_content = re.sub(r"'\s+'", "','", raw_content)
-                        raw_content = re.sub(r'"\s+"', '","', raw_content)
-                        raw_content = re.sub(r"\s+", ",", raw_content)
-                    raw_items = [
-                        i.strip().strip("'").strip('"')
-                        for i in raw_content.split(",")
-                        if i.strip()
-                    ]
-
-                formatted_items = ", ".join(
-                    [
-                        _quote_sql_string(item)
-                        if (col_is_categorical or isinstance(item,str))
-                        else str(item)
-                        for item in raw_items
-                    ]
-                )
+                # parse tokens more robustly than literal_eval
+                raw_content = bracket_match.group(1)
+                raw_items = [i.strip().strip("'\"") for i in re.split(r",\s*", raw_content) if i.strip()]
+                formatted_items = ", ".join(_quote_sql_string(item) for item in raw_items)
                 if formatted_items:
                     sql_conditions.append(f"{col} IN ({formatted_items})")
                 continue
-
+        
             # 3. Special or Missing values
             if interval in ["Special", "Missing"]:
                 sql_conditions.append(f"{col} IS NULL")
                 continue
-
+        
             # 4. Standard Intervals [lo, hi) or Single Bracket Values [val]
             if interval.startswith(("[", "(")):
                 inner = interval[1:-1].strip()
-
+        
                 if "," in inner:
                     if col_is_categorical:
                         raw_items = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
@@ -872,7 +851,7 @@ class StrategicSegmentBuilder:
                         continue
                     left_char, right_char = interval[0], interval[-1]
                     lower_str, upper_str = [x.strip() for x in inner.split(",", 1)]
-
+        
                     range_conds = []
                     if lower_str.lower() != "-inf":
                         op = ">=" if left_char == "[" else ">"
@@ -880,19 +859,26 @@ class StrategicSegmentBuilder:
                     if upper_str.lower() != "inf":
                         op = "<=" if right_char == "]" else "<"
                         range_conds.append(f"{col} {op} {upper_str}")
-
+        
                     if range_conds:
                         sql_conditions.append(" AND ".join(range_conds))
                 else:
                     # Single value inside brackets, e.g. [123] or [Value]
-                    clean_val = inner.strip("'\"")
+                    clean_val = inner.strip().strip("'\"")
+                    # numeric detection
+                    try:
+                        float(clean_val)
+                        is_num = True
+                    except Exception:
+                        is_num = False
+        
                     if col_is_categorical:
                         sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
-                    elif clean_val.replace(".", "", 1).replace("-", "", 1).isdigit():
+                    elif is_num:
                         sql_conditions.append(f"{col} = {clean_val}")
                     else:
                         sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
-
+        
         return " AND ".join(f"({cond})" for cond in sql_conditions)
 
     def extract_segments(self, data: Any) -> List[Dict[str, Any]]:

@@ -591,9 +591,12 @@ class StrategicSegmentBuilder:
         results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
         )
-
         ranking: List[FeatureScore] = []
         precomputed_bins: Dict[str, np.ndarray] = {}
+        # Per-bin selection-metric scores cached for the dtype-agnostic merge
+        # axis: _metric_ranked_bins ranks bins by this value (ascending) instead
+        # of always using bin response rate.
+        precomputed_bin_scores: Dict[str, np.ndarray] = {}
         for col, score, max_rr, bins in results:
             ranking.append(FeatureScore(variable=col, iv=float(score), max_rr=float(max_rr)))
             if bins is not None:
@@ -606,8 +609,78 @@ class StrategicSegmentBuilder:
         else:
             ranking.sort(key=lambda x: x.iv, reverse=True)
 
-        return [r.to_dict() for r in ranking], precomputed_bins
+        # Recompute per-bin axis scores from the same bin label expression
+        # used by the original per-column stats pass (numeric or categorical,
+        # including rare-category pooling) in one SQL pass per column
+        # (cheap, sequential, main connection).
+        for col, bins in precomputed_bins.items():
+            dtype = columns_types.get(col, "VARCHAR")
+            label_expr = (
+                self._bin_label_expr(col, dtype)
+                if self._is_numeric_duckdb_type(dtype)
+                else (
+                    self._other_bin_case_expr(col, dtype)
+                    or self._bin_label_expr(col, dtype)
+                )
+            )
+            try:
+                rows = con.execute(
+                    f"""
+                    SELECT {label_expr} AS bin_label,
+                           COUNT(*)::BIGINT AS cnt,
+                           SUM(CAST("{self.target}" AS DOUBLE)) AS evt
+                    FROM current_df
+                    GROUP BY 1
+                    """
+                ).fetchall()
+            except Exception:
+                rows = None
+            if rows:
+                per_bin = self._per_bin_metric_scores(rows)
+                score_map = {row[0]: per_bin.get(row[0], 0.0) for row in rows}
+                precomputed_bin_scores[col] = np.array(
+                    [score_map.get(b, 0.0) for b in bins.astype(str)], dtype=float
+                )
+            else:
+                precomputed_bin_scores[col] = np.zeros(len(bins), dtype=float)
+        return ([r.to_dict() for r in ranking], precomputed_bins, precomputed_bin_scores)
 
+    def _per_bin_metric_scores(self, stats_rows) -> Dict[str, float]:
+        """
+        Per-bin scores of the configured selection_metric, given
+        (label, cnt, evt) aggregates. This is the axis used by
+        _metric_ranked_bins to rank categorical bins for adjacent-merge
+        adjacency (replacing the fixed bin response rate).
+        """
+        total_events = max(sum((r[2] or 0.0) for r in stats_rows), 1e-12)
+        total_non_events = max(
+            sum(((r[1] or 0) - (r[2] or 0.0)) for r in stats_rows), 1e-12
+        )
+        scores: Dict[str, float] = {}
+        if callable(self.selection_metric):
+            for label, cnt, evt in stats_rows:
+                scores[str(label)] = float(
+                    self.selection_metric([(str(label), cnt or 0, evt or 0.0)])
+                )
+        else:
+            for label, cnt, evt in stats_rows:
+                cnt, evt = cnt or 0, evt or 0.0
+                non_evt = cnt - evt
+                if self.selection_metric == "response_rate":
+                    scores[str(label)] = (
+                        (evt / cnt) if cnt >= self.min_sample_size else 0.0
+                    )
+                else:  # iv: per-bin contribution component of the column IV
+                    if total_events > 0 and total_non_events > 0:
+                        pct_events = max(evt / total_events, 1e-6)
+                        pct_non_events = max(non_evt / total_non_events, 1e-6)
+                        scores[str(label)] = (
+                            (pct_non_events - pct_events)
+                            * np.log(pct_non_events / pct_events)
+                        )
+                    else:
+                        scores[str(label)] = 0.0
+        return scores
     # -------------------------------------------------------------------------
     # Adjacent-bin merging (dtype-agnostic via metric-rank adjacency)
     # -------------------------------------------------------------------------
@@ -695,9 +768,28 @@ class StrategicSegmentBuilder:
             if n < 2:
                 continue
             bins = [x[col] for x in g_list]
-            # Metric values per bin: numeric bins use mid-range as score proxy is
-            # NOT used; instead each bin's response rate is the ranking metric so
-            # rank adjacency is meaningful for both dtype classes.
+            # Axis scores for the merge rank order: numeric bins keep their
+            # natural ordinal order via _bin_sort_key; categorical bins are
+            # ranked by the CONFIGURED selection_metric (per-bin scores
+            # cached in self._precomputed_bin_scores) instead of the fixed
+            # bin response rate, so the merge axis honors iv / response_rate /
+            # any user-supplied callable metric.
+            _sk = self._bin_sort_key
+            _is_num = lambda lbl: _sk(lbl)[0] == 0
+            axis_scores = []
+            bin_scores_map = getattr(self, "_precomputed_bin_scores", None) or {}
+            col_scores = bin_scores_map.get(col)
+            for idx, x in enumerate(g_list):
+                lbl = x[col]
+                if _is_num(lbl):
+                    axis_scores.append(float("inf"))  # ordinal path
+                elif col_scores is not None and idx < len(col_scores):
+                    # Map this bin label back to its precomputed per-bin score.
+                    axis_scores.append(float(col_scores[idx]))
+                else:
+                    axis_scores.append(
+                        (x["evt"] / x["cnt"]) if x["cnt"] > 0 else 0.0
+                    )
             rates = [
                 (x["evt"] / x["cnt"]) if x["cnt"] > 0 else 0.0 for x in g_list
             ]
@@ -713,6 +805,7 @@ class StrategicSegmentBuilder:
                     "cnt": np.array([x["cnt"] for x in g_list], dtype=float),
                     "evt": np.array([x["evt"] for x in g_list], dtype=float),
                     "rates": rates,
+                    "axis_scores": np.array(axis_scores, dtype=float),
                 }
             )
         return out
@@ -763,10 +856,14 @@ class StrategicSegmentBuilder:
                 rates = g["rates"]
                 other_val = g["other_val"]
 
-                # Rank bins by ascending response rate so categorical adjacency
-                # follows the same ranking metric used for variable selection;
-                # numeric bins remain naturally ordered.
-                rank_order = sorted(range(len(bins)), key=lambda i: rates[i])
+                # Rank bins for merge adjacency: categorical bins by ascending
+                # configured selection_metric score (axis_scores); numeric bins
+                # keep their natural ordinal order via _bin_sort_key.
+                _sk = self._bin_sort_key
+                rank_order = sorted(
+                    range(len(bins)),
+                    key=lambda i: (_sk(bins[i])[0], g["axis_scores"][i]),
+                )
 
                 # Reorder cumulative sums by rank so windows walk rank-adjacent bins.
                 sorted_bins = [bins[i] for i in rank_order]
@@ -1350,9 +1447,11 @@ class StrategicSegmentBuilder:
                 f"Base Rate: {current_base_rate*100:.2f}%"
             )
 
-            iv_ranking_dicts, precomputed_bins = self.compute_iv_ranking_and_bin(
-                con, eligible_cols, columns_types
+            iv_ranking_dicts, precomputed_bins, precomputed_bin_scores = (
+                self.compute_iv_ranking_and_bin(con, eligible_cols, columns_types)
             )
+            # Per-bin axis scores for the dtype-agnostic merge rank order.
+            self._precomputed_bin_scores = precomputed_bin_scores
             iv_ranking = [FeatureScore.from_dict(r) for r in iv_ranking_dicts]
 
             if self.selection_metric == "response_rate":

@@ -767,25 +767,12 @@ class StrategicSegmentBuilder:
                     continue
 
             # 2. Explicit Categoricals
-            def _is_numeric_token(tok: str) -> bool:
-                tok = tok.strip().strip("'\"")
-                if tok.lower() in ("-inf", "inf", "+inf"):
-                    return True
-                try:
-                    float(tok)
-                    return True
-                except ValueError:
-                    return False
-
             is_categorical = False
             if bracket_match:
                 content = bracket_match.group(1)
-                tokens = [t for t in content.split(",") if t.strip()]
                 if any(k in interval for k in ("'", '"', "Array", "Categorical")) or not interval.startswith(("[", "(")):
                     is_categorical = True
-                elif len(tokens) > 2:
-                    is_categorical = True
-                elif not all(_is_numeric_token(t) for t in tokens):
+                elif len(content.split(",")) > 2:
                     is_categorical = True
 
             if is_categorical and bracket_match:

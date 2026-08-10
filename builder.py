@@ -725,7 +725,7 @@ class StrategicSegmentBuilder:
 
         def _quote_sql_string(val: Any) -> str:
             txt = str(val)
-            return "'" + txt.replace(:'","''") + "'"
+            return "'" + txt.replace("'","''") + "'"
         def _is_categorical_col(col_name: str) -> bool:
             return col_name in self._categorical_cols
 
@@ -735,7 +735,7 @@ class StrategicSegmentBuilder:
 
             col, interval = [x.strip() for x in part.split("=", 1)]
             bracket_match = _BRACKET_REGEX.search(interval)
-            col_is_categorical = _is_categorical_cols
+            col_is_categorical = _is_categorical_cols(col)
             # 1. Multi-range / merged adjacent NUMERIC ranges like [[10, 20), [20, 30)]
             # Real numeric range tokens always end in ')' or ']', so adjacent tokens are
             # joined by "),"/"]," + "[". Categorical merges (see 1b) join bracketed single
@@ -799,7 +799,7 @@ class StrategicSegmentBuilder:
                 cat_tokens = re.findall(r"\[([^\[\]]+)\]", interval)
                 if cat_tokens:
                     cleaned_items = [t.strip().strip("'\"") for t in cat_tokens]
-                    formatted_items = ", ".join(_quote_sql_string(item) for item in cleaned_item if item)
+                    formatted_items = ", ".join(_quote_sql_string(item) for item in cleaned_items if item)
                     if formatted_items:
                         sql_conditions.append(f"{col} IN ({formatted_items})")
                     continue
@@ -866,7 +866,7 @@ class StrategicSegmentBuilder:
                 if "," in inner:
                     if col_is_categorical:
                         raw_items = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
-                        formatted_items = ", ".join(_quote_sql_strinf(item) for item in raw_items)
+                        formatted_items = ", ".join(_quote_sql_string(item) for item in raw_items)
                         if formatted_items:
                             sql_conditions.append(f"{col} IN ({formatted_items})")
                         continue
@@ -1211,7 +1211,7 @@ class StrategicSegmentBuilder:
                     f"{actual_lift:>6.2f}x {actual_rate:>6.1f}% "
                     f"{selected_candidate['actual_count']:>8} "
                     f"{selected_candidate['actual_events']:>8.0f}  "
-                    f"{best_rule[:60]}"
+                    f"{best_rule}"
                 )
         
                 for idx, e in enumerate(top_exp, 1):

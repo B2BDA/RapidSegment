@@ -718,8 +718,13 @@ class StrategicSegmentBuilder:
             col, interval = [x.strip() for x in part.split("=", 1)]
             bracket_match = _BRACKET_REGEX.search(interval)
 
-            # 1. Multi-range / merged adjacent ranges like [[10, 20), [20, 30)]
-            if interval.startswith("[[") or (interval.startswith("[") and ")," in interval and interval.count("[") >= 2):
+            # 1. Multi-range / merged adjacent NUMERIC ranges like [[10, 20), [20, 30)]
+            # Real numeric range tokens always end in ')' or ']', so adjacent tokens are
+            # joined by "),"/"]," + "[". Categorical merges (see 1b) join bracketed single
+            # values like "[female], [male]" -- joined by "],", never "),". Require the
+            # numeric-specific separator so we don't misfire on merged categoricals.
+            is_numeric_multirange = interval.startswith("[[") and re.search(r"\),\s*\[", interval) is not None
+            if is_numeric_multirange:
                 inner = interval.strip()
                 if inner.startswith("[") and inner.endswith("]"):
                     inner = inner[1:-1]
@@ -766,13 +771,37 @@ class StrategicSegmentBuilder:
                         sql_conditions.append(" AND ".join(range_conds))
                     continue
 
+            # 1b. Merged categorical lists like [[male], [female]] or [[male], [female], [other]],
+            # produced when _expand_adjacent_bins merges adjacent single-bracket categorical bins.
+            if interval.startswith("[[") and bracket_match:
+                cat_tokens = re.findall(r"\[([^\[\]]+)\]", interval)
+                if cat_tokens:
+                    cleaned_items = [t.strip().strip("'\"") for t in cat_tokens]
+                    formatted_items = ", ".join(f"'{item}'" for item in cleaned_items if item)
+                    if formatted_items:
+                        sql_conditions.append(f"{col} IN ({formatted_items})")
+                    continue
+
             # 2. Explicit Categoricals
+            def _is_numeric_token(tok: str) -> bool:
+                tok = tok.strip().strip("'\"")
+                if tok.lower() in ("-inf", "inf", "+inf"):
+                    return True
+                try:
+                    float(tok)
+                    return True
+                except ValueError:
+                    return False
+
             is_categorical = False
             if bracket_match:
                 content = bracket_match.group(1)
+                tokens = [t for t in content.split(",") if t.strip()]
                 if any(k in interval for k in ("'", '"', "Array", "Categorical")) or not interval.startswith(("[", "(")):
                     is_categorical = True
-                elif len(content.split(",")) > 2:
+                elif len(tokens) > 2:
+                    is_categorical = True
+                elif not all(_is_numeric_token(t) for t in tokens):
                     is_categorical = True
 
             if is_categorical and bracket_match:

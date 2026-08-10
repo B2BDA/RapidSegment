@@ -122,7 +122,7 @@ class StrategicSegmentBuilder:
             binning_method: Which binning engine to use ('optimal' or 'naive').
             naive_bins: Number of quantile bins used when binning_method is 'naive'.
             selection_metric: Metric used to rank features for top_n_vars selection ("iv" or "response_rate").
-            max_expansion_hops: Adjacent-bin merging hop distance limit.
+            max_expansion_hops: Adjacent-bin merging hop distance limit. (0 disables expansion)
             expand_log_mode: Controls verbosity of adjacent-bin expansion logging ("none", "summary", "full").
         """
         self.target = target
@@ -147,9 +147,11 @@ class StrategicSegmentBuilder:
         self.diagnostics_: List[Dict[str, Any]] = []
         self.binning_method = binning_method  
         self.naive_bins = naive_bins     
-        self.max_expansion_hops = max(1, int(max_expansion_hops))
+        self.max_expansion_hops = max(0, int(max_expansion_hops))
         self.selection_metric = selection_metric
         self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "full") else "summary"   
+        self._columns_types: Dict[str,str] = {}
+        self._categorical_cols: set[str] = set()
         
         # Set up disk-backed DuckDB automatically if not provided
         if db_path is None or db_temp_dir is None:
@@ -721,19 +723,29 @@ class StrategicSegmentBuilder:
         parts = [p.strip() for p in rule_str.split("&")]
         sql_conditions: List[str] = []
 
+        def _quote_sql_string(val: Any) -> str:
+            txt = str(val)
+            return "'" + txt.replace(:'","''") + "'"
+        def _is_categorical_col(col_name: str) -> bool:
+            return col_name in self._categorical_cols
+
         for part in parts:
             if "=" not in part:
                 continue
 
             col, interval = [x.strip() for x in part.split("=", 1)]
             bracket_match = _BRACKET_REGEX.search(interval)
-
+            col_is_categorical = _is_categorical_cols
             # 1. Multi-range / merged adjacent NUMERIC ranges like [[10, 20), [20, 30)]
             # Real numeric range tokens always end in ')' or ']', so adjacent tokens are
             # joined by "),"/"]," + "[". Categorical merges (see 1b) join bracketed single
             # values like "[female], [male]" -- joined by "],", never "),". Require the
             # numeric-specific separator so we don't misfire on merged categoricals.
-            is_numeric_multirange = interval.startswith("[[") and re.search(r"\),\s*\[", interval) is not None
+            is_numeric_multirange = (
+                not col_is_categorical
+                and interval.startswith("[[")
+                and re.search(r"\),\s*\[",interval) is not None
+            )
             if is_numeric_multirange:
                 inner = interval.strip()
                 if inner.startswith("[") and inner.endswith("]"):
@@ -787,7 +799,7 @@ class StrategicSegmentBuilder:
                 cat_tokens = re.findall(r"\[([^\[\]]+)\]", interval)
                 if cat_tokens:
                     cleaned_items = [t.strip().strip("'\"") for t in cat_tokens]
-                    formatted_items = ", ".join(f"'{item}'" for item in cleaned_items if item)
+                    formatted_items = ", ".join(_quote_sql_string(item) for item in cleaned_item if item)
                     if formatted_items:
                         sql_conditions.append(f"{col} IN ({formatted_items})")
                     continue
@@ -831,7 +843,12 @@ class StrategicSegmentBuilder:
                     ]
 
                 formatted_items = ", ".join(
-                    [f"'{item}'" if isinstance(item, str) else str(item) for item in raw_items]
+                    [
+                        _quote_sql_string(item)
+                        if (col_is_categorical or isinstance(item,str))
+                        else str(item)
+                        for item in raw_items
+                    ]
                 )
                 if formatted_items:
                     sql_conditions.append(f"{col} IN ({formatted_items})")
@@ -847,6 +864,12 @@ class StrategicSegmentBuilder:
                 inner = interval[1:-1].strip()
 
                 if "," in inner:
+                    if col_is_categorical:
+                        raw_items = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
+                        formatted_items = ", ".join(_quote_sql_strinf(item) for item in raw_items)
+                        if formatted_items:
+                            sql_conditions.append(f"{col} IN ({formatted_items})")
+                        continue
                     left_char, right_char = interval[0], interval[-1]
                     lower_str, upper_str = [x.strip() for x in inner.split(",", 1)]
 
@@ -863,10 +886,12 @@ class StrategicSegmentBuilder:
                 else:
                     # Single value inside brackets, e.g. [123] or [Value]
                     clean_val = inner.strip("'\"")
-                    if clean_val.replace(".", "", 1).replace("-", "", 1).isdigit():
+                    if col_is_categorical:
+                        sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
+                    elif clean_val.replace(".", "", 1).replace("-", "", 1).isdigit():
                         sql_conditions.append(f"{col} = {clean_val}")
                     else:
-                        sql_conditions.append(f"{col} = '{clean_val}'")
+                        sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
 
         return " AND ".join(f"({cond})" for cond in sql_conditions)
 
@@ -900,6 +925,12 @@ class StrategicSegmentBuilder:
 
         cols_info = con.execute("DESCRIBE current_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}
+        self._columns_types = columns_types
+        self._categorical_cols = {
+            col_name
+            for col_name, dtype in columns_types.items()
+            if self._resolve_optb_dtype(dtype) == "categorical"
+        }
         all_cols = list(columns_types.keys())
 
         if self.enable_diversity:

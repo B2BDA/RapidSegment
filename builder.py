@@ -740,9 +740,9 @@ class StrategicSegmentBuilder:
         
             # 1. Multi-range / merged adjacent NUMERIC ranges like [[10, 20), [20, 30)]
             # Real numeric range tokens always end in ')' or ']', so adjacent tokens are
-            # joined by "),"/"]," + +"[". Categorical merges (see 1b) join bracketed single
-            # values like "[femlae],[male'} -- jouned by "[,", never "),". Rquired the
-            # numeric-specific seperator so we don't misfire on merged categoricals
+            # joined by "),"/"]," + "[". Categorical merges (see 1b) join bracketed single
+            # values like "[female],[male]" -- joined by "],", never "),". Require the
+            # numeric-specific separator so we don't misfire on merged categoricals
             is_numeric_multirange = (
                 not col_is_categorical
                 and interval.startswith("[[")
@@ -795,7 +795,7 @@ class StrategicSegmentBuilder:
                         sql_conditions.append(" AND ".join(range_conds))
                     continue
         
-            # 1b. Merged categorical lists like [[male], [female]] or [[male],[female], [otjers]],
+            # 1b. Merged categorical lists like [[male], [female]] or [[male],[female], [others]],
             # produced when _expand_adjacent_bins merges adjacent single-bracket categorical bins.
             if interval.startswith("[[") and bracket_match:
                 cat_tokens = re.findall(r"\[([^\[\]]+)\]", interval)
@@ -839,7 +839,7 @@ class StrategicSegmentBuilder:
                         raw_content = re.sub(r'"\s+"', '","', raw_content)
                         raw_content = re.sub(r"\s+", ",", raw_content)
                     raw_items = [
-                        i.strip().strip("'")/strip('"')
+                        i.strip().strip("'").strip('"')
                         for i in raw_content.split(",")
                         if i.strip()
                     ]
@@ -886,7 +886,7 @@ class StrategicSegmentBuilder:
                         sql_conditions.append(" AND ".join(range_conds))
                 else:
                     # Single value inside brackets, e.g. [123] or [Value]
-                    clean_val = inner.strip().strip("'\"")
+                    clean_val = inner.strip("'\"")
         
                     if col_is_categorical:
                         sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")

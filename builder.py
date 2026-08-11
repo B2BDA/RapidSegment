@@ -383,7 +383,26 @@ class StrategicSegmentBuilder:
 
                     bin_table = optb.binning_table.build()
                     iv_val = float(bin_table["IV"].values[-1])
-                    transformed_bins = np.asarray(optb.transform(col_arr, metric="bins"), dtype=str)
+
+                    # Bug 2 fix: under pandas>=3.0, metric="bins" stringifies
+                    # ArrowStringArray slices into a verbose repr for multi-category
+                    # bins. Rebuild clean labels from the binning table and map via
+                    # metric="indices" instead.
+                    if dtype == "categorical":
+                        raw_cells = bin_table["Bin"].tolist()
+                        clean_labels = {
+                            i: self._sanitize_bin_label(cell)
+                            for i, cell in enumerate(raw_cells)
+                            if str(cell) not in ("Special", "Missing", "")
+                        }
+                        idx = optb.transform(col_arr, metric="indices")
+                        transformed_bins = np.array(
+                            [clean_labels.get(i, "Missing") for i in idx], dtype=str
+                        )
+                    else:
+                        transformed_bins = np.asarray(
+                            optb.transform(col_arr, metric="bins"), dtype=str
+                        )
 
                     valid_bins = bin_table[
                         (bin_table["Count"] >= self.min_sample_size) & 
@@ -603,6 +622,19 @@ class StrategicSegmentBuilder:
             if hi - lo + 1 >= n:
                 break
             yield (lo, hi)
+    @staticmethod
+    def _sanitize_bin_label(label: Any) -> str:
+        """
+        Defends against an OptBinning + pandas>=3.0 interaction where a categorical
+        bin's label comes back as a raw array-like (e.g. pandas ArrowStringArray)
+        instead of a joined string. Rebuilds the "[cat1, cat2]" format explicitly.
+        """
+        if isinstance(label, str):
+            return label
+        try:
+            return "[" + ", ".join(str(i) for i in list(label)) + "]"
+        except TypeError:
+            return str(label)
 
     def _agg_combinations(
         self,
@@ -749,6 +781,14 @@ class StrategicSegmentBuilder:
             txt = str(val)
             # escape single quotes for SQL and wrap in single quotes
             return "'" + txt.replace("'", "''") + "'"
+
+        def _strip_wrapping_quotes(s: str) -> str:
+            # Only strip a matching outer quote pair; never strip interior/unbalanced quotes
+            # (Bug 4: str.strip("'\"") mangles values like Say "hi")
+            s = s.strip()
+            if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+                return s[1:-1]
+            return s
         
         def _is_categorical_col(col_name: str) -> bool:
             return col_name in self._categorical_cols
@@ -820,10 +860,23 @@ class StrategicSegmentBuilder:
         
             # 1b. Merged categorical lists like [[male], [female]] or [[male],[female], [others]],
             # produced when _expand_adjacent_bins merges adjacent single-bracket categorical bins.
+            # Guard: a single-category value that itself contains brackets (e.g. category "[VIP]"
+            # becomes the label "[[VIP]]") must NOT be treated as a multi-value merge
+            # (Bug 3 partial mitigation — full fix needs escaped rule grammar).
             if interval.startswith("[[") and bracket_match:
                 cat_tokens = re.findall(r"\[([^\[\]]+)\]", interval)
+                # If the outer form is exactly one nested pair with no sibling tokens
+                # (e.g. "[[VIP]]"), treat as a single literal category value instead.
+                is_single_nested = (
+                    len(cat_tokens) == 1
+                    and re.fullmatch(r"\[\[[^\[\]]+\]\]", interval.strip()) is not None
+                )
+                if is_single_nested:
+                    cleaned = _strip_wrapping_quotes(cat_tokens[0])
+                    sql_conditions.append(f"{col} = {_quote_sql_string(cleaned)}")
+                    continue
                 if cat_tokens:
-                    cleaned_items = [t.strip().strip("'\"") for t in cat_tokens]
+                    cleaned_items = [_strip_wrapping_quotes(t) for t in cat_tokens]
                     formatted_items = ", ".join(_quote_sql_string(item) for item in cleaned_items if item)
                     if formatted_items:
                         sql_conditions.append(f"{col} IN ({formatted_items})")
@@ -854,7 +907,7 @@ class StrategicSegmentBuilder:
             if is_categorical and bracket_match:
                 try:
                     raw_items = ast.literal_eval(bracket_match.group(0))
-                    if not isinstance(raw_items, (list,tuple)):
+                    if not isinstance(raw_items, (list, tuple)):
                         raw_items = [raw_items]
                 except Exception:
                     raw_content = bracket_match.group(1)
@@ -863,11 +916,11 @@ class StrategicSegmentBuilder:
                         raw_content = re.sub(r'"\s+"', '","', raw_content)
                         raw_content = re.sub(r"\s+", ",", raw_content)
                     raw_items = [
-                        i.strip().strip("'").strip('"')
+                        _strip_wrapping_quotes(i)
                         for i in raw_content.split(",")
                         if i.strip()
                     ]
-                    formatted_items = ", ".join(
+                formatted_items = ", ".join(
                     [
                         _quote_sql_string(item)
                         if (col_is_categorical or isinstance(item, str))
@@ -890,7 +943,7 @@ class StrategicSegmentBuilder:
         
                 if "," in inner:
                     if col_is_categorical:
-                        raw_items = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
+                        raw_items = [_strip_wrapping_quotes(x) for x in inner.split(",") if x.strip()]
                         formatted_items = ", ".join(_quote_sql_string(item) for item in raw_items)
                         if formatted_items:
                             sql_conditions.append(f"{col} IN ({formatted_items})")
@@ -910,7 +963,7 @@ class StrategicSegmentBuilder:
                         sql_conditions.append(" AND ".join(range_conds))
                 else:
                     # Single value inside brackets, e.g. [123] or [Value]
-                    clean_val = inner.strip("'\"")
+                    clean_val = _strip_wrapping_quotes(inner)
         
                     if col_is_categorical:
                         sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
@@ -956,7 +1009,20 @@ class StrategicSegmentBuilder:
         logger.info(f"📦 Binning method: {self.binning_method} (naive_bins={self.naive_bins})")
         
         con.register("input_data_view", data)
-        con.execute("CREATE OR REPLACE TABLE current_df AS SELECT * FROM input_data_view")
+        # Bug 6: cast target to DOUBLE up front so bool-dtype targets work with AVG,
+        # and fail early with a clear message if the target column is missing.
+        cols_info_probe = con.execute("DESCRIBE input_data_view").fetchall()
+        probe_cols = {row[0] for row in cols_info_probe}
+        if self.target not in probe_cols:
+            raise ValueError(
+                f"Target column '{self.target}' not found in input data. "
+                f"Available columns: {sorted(probe_cols)}"
+            )
+        con.execute(
+            f'CREATE OR REPLACE TABLE current_df AS '
+            f'SELECT * REPLACE (CAST("{self.target}" AS DOUBLE) AS "{self.target}") '
+            f'FROM input_data_view'
+        )
 
         cols_info = con.execute("DESCRIBE current_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}
@@ -977,8 +1043,8 @@ class StrategicSegmentBuilder:
         self.feature_usage_counts = {col: 0 for col in eligible_cols}
 
         if self.param_grid:
-            sizes = self.param_grid.get("min_sample_size", [self.min_sample_size])
-            lifts = self.param_grid.get("min_lift", [self.min_lift])
+            sizes = self.param_grid.get("min_sample_size", [self.min_sample_size]) or [self.min_sample_size]
+            lifts = self.param_grid.get("min_lift", [self.min_lift]) or [self.min_lift]
             experiments = [
                 {"min_sample_size": s, "min_lift": l}
                 for s, l in product(sizes, lifts)
@@ -995,11 +1061,17 @@ class StrategicSegmentBuilder:
 
         for i in range(1, self.max_segments + 1):
             res = con.execute(
-                f'SELECT AVG("{self.target}"), COUNT(*) FROM current_df'
+                f'SELECT AVG(CAST("{self.target}" AS DOUBLE)), COUNT(*) FROM current_df'
             ).fetchone()
             current_base_rate, current_volume = res[0] or 0.0, res[1] or 0
 
-            min_floor_volume = min(exp["min_sample_size"] for exp in experiments)
+            # Bug 5 defensive: empty param_grid lists already fall back above, but
+            # guard min() against an empty experiments list just in case.
+            min_floor_volume = (
+                min(exp["min_sample_size"] for exp in experiments)
+                if experiments
+                else self.min_sample_size
+            )
 
             if current_base_rate == 0 or current_volume < min_floor_volume:
                 logger.info(
@@ -1086,8 +1158,16 @@ class StrategicSegmentBuilder:
             con.execute("DROP TABLE IF EXISTS binned_df")
             con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
 
-            global_min_sample = min(exp["min_sample_size"] for exp in experiments)
-            global_min_lift = min(exp["min_lift"] for exp in experiments)
+            global_min_sample = (
+                min(exp["min_sample_size"] for exp in experiments)
+                if experiments
+                else self.min_sample_size
+            )
+            global_min_lift = (
+                min(exp["min_lift"] for exp in experiments)
+                if experiments
+                else self.min_lift
+            )
             
             self.min_sample_size = global_min_sample
             self.min_lift = global_min_lift

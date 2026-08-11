@@ -11,6 +11,7 @@ Python Version: 3.9+
 import logging
 import os
 import re
+import ast
 from datetime import datetime
 from itertools import combinations, product, groupby
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -143,6 +144,12 @@ class StrategicSegmentBuilder:
         self.feature_groups = feature_groups or {}
         self.ignore_features = ignore_features or []
         self.feature_usage_counts: Dict[str, int] = {}
+        # Reverse map for O(1) group lookups; rebuilt by _validate_feature_groups
+        self._feature_to_group: Dict[str, int] = {
+            var: group
+            for group, vars_list in self.feature_groups.items()
+            for var in vars_list
+        }
         self.sort_priority = sort_priority
         self.diagnostics_: List[Dict[str, Any]] = []
         self.binning_method = binning_method  
@@ -188,17 +195,19 @@ class StrategicSegmentBuilder:
                         "was not found in the provided DataFrame/Table."
                     )
                 validated_count += 1
-
+        # Rebuild reverse map after validation passes
+        self._feature_to_group = {
+            var: group
+            for group, vars_list in self.feature_groups.items()
+            for var in vars_list
+        }
         logger.info(f"✅ Feature group validation passed. ({validated_count} features mapped)")
 
     def get_group(self, var: str) -> str:
         """
         Returns the assigned business category for a feature, or the feature name itself.
         """
-        for group, vars_list in self.feature_groups.items():
-            if var in vars_list:
-                return group
-        return var
+        return self._feature_to_group.get(var,var)
 
     def is_diverse(self, combo: Tuple[str, ...]) -> bool:
         """
@@ -257,8 +266,8 @@ class StrategicSegmentBuilder:
         logger.info(f"🔍 Computing IV and bins for {len(eligible_cols)} features...")
 
         def _worker(col: str) -> Tuple[str, float, float, Optional[np.ndarray]]:
+            thread_con = con.cursor()
             try:
-                thread_con = con.cursor()
                 dtype = self._resolve_optb_dtype(columns_types[col])
 
                 if self.binning_method == "naive":
@@ -388,6 +397,8 @@ class StrategicSegmentBuilder:
             except Exception as e:
                 logger.debug(f"Computation failed for {col}: {e}")
                 return col, 0.0, 0.0, None
+            finally:
+                thread_con.close()
 
         results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
@@ -626,6 +637,24 @@ class StrategicSegmentBuilder:
                     AND SUM(CAST("{self.target}" AS DOUBLE)) >= {self.min_events}
             """
             queries.append(query)
+            
+        def _process_rows(rows):
+            for rule, count, events, combo_var_str in rows:
+                rate = (event / count) * 100.0 if count > 0 else 0
+                lft = rate/ (base_rate * 100.0) if base_rate > 0 else 0
+                combo_key = tuple(combo_vars_str.split(","))
+                if events >= self.min_events:
+                    entry = {
+                        "rule": rule,
+                        "count": count,
+                        "rate": rate,
+                        "lift": lift,
+                        "events": events,
+                        "combo_vars": combo_key,
+                       }
+                       valid_results.append(entry)
+                       if combo_let in per_combo_base:
+                           per_combo_base[combo_key].append(entry)
 
         valid_results = []
         chunk_size = 100
@@ -636,26 +665,21 @@ class StrategicSegmentBuilder:
 
         for i in range(0, len(queries), chunk_size):
             chunk = queries[i:i + chunk_size]
+            chunk_combo = combo_list[i:i + chunk_size]
             union_query = " UNION ALL ".join(chunk)
-
-            res = con.execute(union_query).fetchall()
-            for row_idx, (rule, count, events, combo_vars_str) in enumerate(res):
-                rate = (events / count) * 100.0 if count > 0 else 0
-                lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
-                combo_key = tuple(combo_vars_str.split(","))
-
-                if events >= self.min_events:
-                    entry = {
-                        "rule": rule,
-                        "count": count,
-                        "rate": rate,
-                        "lift": lift,
-                        "events": events,
-                        "combo_vars": combo_key,
-                    }
-                    valid_results.append(entry)
-                    if combo_key in per_combo_base:
-                        per_combo_base[combo_key].append(entry)
+            try:
+                res = con.execute(union_query).fetchall()
+                _process_rows(res)
+            except Exception as batch_arr:
+                logger.debug(
+                f"Batch query failed ({len(chunk)} combo), retrying individually: {batch_err}"
+                )
+                for single_query, single_combo in zip(chunk, chunk_combos):
+                    try:
+                        res = con.execute(single_query).fetchall()
+                        _process_rows(res)
+                    except Exception as e:
+                        logger.debug(f"Single combo query failed for {single_combo}: {e}")
 
         all_expanded: List[Dict[str, Any]] = []
         expansion_stats: Dict[str, Dict[str, Any]] = {}
@@ -829,9 +853,10 @@ class StrategicSegmentBuilder:
                     is_categorical = True
         
             if is_categorical and bracket_match:
-                import ast
                 try:
                     raw_items = ast.literal_eval(bracket_match.group(0))
+                    if not isinstance(raw_items, (list,tuple)):
+                        raw_items = [raw_items]
                 except Exception:
                     raw_content = bracket_match.group(1)
                     if "," not in raw_content:
@@ -902,6 +927,15 @@ class StrategicSegmentBuilder:
         Sequentially extracts high‑lift rules on the residual dataset.
         """
         logger.info("🚀 Starting hierarchical segment extraction...")
+        # Reset all accumulated state so repeated calls produce independent results
+        self.segments = []
+        self.diagnostics_ = []
+        self.feature_usage_counts = {}
+        
+        # Snapshot threshold before any grid search mutation inside the loop
+        abs_min_sample_size = self.min_sample_size
+        abs_min_events = self.min_events
+        abs_min_lift = self.min_lift
 
         con = duckdb.connect(self.db_path)
 
@@ -957,9 +991,6 @@ class StrategicSegmentBuilder:
         original_base_rate = con.execute(
             f'SELECT AVG(CAST("{self.target}" AS DOUBLE)) FROM current_df'
         ).fetchone()[0] or 0.0
-        abs_min_sample_size = self.min_sample_size
-        abs_min_events = self.min_events
-        abs_min_lift = self.min_lift
 
         logger.info(f"🔒 Locking Original Base Rate: {original_base_rate*100:.2f}%")
 
@@ -1302,7 +1333,10 @@ class StrategicSegmentBuilder:
         self.min_sample_size = abs_min_sample_size
         self.min_events = abs_min_events
         self.min_lift = abs_min_lift 
-        con.close()
+        try:
+            con.close()
+        except Exception:
+            pass
         logger.info("🏁 Extraction complete.")
         return self.segments
 
@@ -1412,7 +1446,7 @@ class StrategicSegmentBuilder:
 
     def generate_feature_health_report(
         self, original_data: Any, features: List[str]
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> pd.DataFrame:
         """
         Generates a feature health report on the original dataset using DuckDB native SQL.
         """

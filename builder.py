@@ -651,9 +651,9 @@ class StrategicSegmentBuilder:
                         "events": events,
                         "combo_vars": combo_key,
                        }
-                       valid_results.append(entry)
-                       if combo_key in per_combo_base:
-                           per_combo_base[combo_key].append(entry)
+                   valid_results.append(entry)
+                   if combo_key in per_combo_base:
+                       per_combo_base[combo_key].append(entry)
 
         valid_results = []
         chunk_size = 100

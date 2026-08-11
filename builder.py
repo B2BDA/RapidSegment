@@ -145,7 +145,7 @@ class StrategicSegmentBuilder:
         self.ignore_features = ignore_features or []
         self.feature_usage_counts: Dict[str, int] = {}
         # Reverse map for O(1) group lookups; rebuilt by _validate_feature_groups
-        self._feature_to_group: Dict[str, int] = {
+        self._feature_to_group: Dict[str, str] = {
             var: group
             for group, vars_list in self.feature_groups.items()
             for var in vars_list
@@ -391,7 +391,6 @@ class StrategicSegmentBuilder:
                     ]
                     max_rr = float(valid_bins["Event rate"].max()) if not valid_bins.empty else 0.0
 
-                thread_con.close()
                 return col, float(iv_val), float(max_rr), transformed_bins
 
             except Exception as e:
@@ -639,9 +638,9 @@ class StrategicSegmentBuilder:
             queries.append(query)
             
         def _process_rows(rows):
-            for rule, count, events, combo_var_str in rows:
-                rate = (event / count) * 100.0 if count > 0 else 0
-                lft = rate/ (base_rate * 100.0) if base_rate > 0 else 0
+            for rule, count, events, combo_vars_str in rows:
+                rate = (events / count) * 100.0 if count > 0 else 0
+                lift = rate/ (base_rate * 100.0) if base_rate > 0 else 0
                 combo_key = tuple(combo_vars_str.split(","))
                 if events >= self.min_events:
                     entry = {
@@ -653,7 +652,7 @@ class StrategicSegmentBuilder:
                         "combo_vars": combo_key,
                        }
                        valid_results.append(entry)
-                       if combo_let in per_combo_base:
+                       if combo_key in per_combo_base:
                            per_combo_base[combo_key].append(entry)
 
         valid_results = []
@@ -665,14 +664,14 @@ class StrategicSegmentBuilder:
 
         for i in range(0, len(queries), chunk_size):
             chunk = queries[i:i + chunk_size]
-            chunk_combo = combo_list[i:i + chunk_size]
+            chunk_combos = combo_list[i:i + chunk_size]
             union_query = " UNION ALL ".join(chunk)
             try:
                 res = con.execute(union_query).fetchall()
                 _process_rows(res)
-            except Exception as batch_arr:
+            except Exception as batch_err:
                 logger.debug(
-                f"Batch query failed ({len(chunk)} combo), retrying individually: {batch_err}"
+                f"Batch query failed ({len(chunk)} combos), retrying individually: {batch_err}"
                 )
                 for single_query, single_combo in zip(chunk, chunk_combos):
                     try:

@@ -220,7 +220,11 @@ class StrategicSegmentBuilder:
 
     def _get_sort_key(self, rule: Dict[str, Any]) -> Tuple[float, ...]:
         """
-        Utility function to shortlist rules based on users choice on which metric to prioritize.
+        Create a sortable tuple for a candidate rule based on the configured priority.
+
+        The returned tuple keeps the ordering deterministic across the many ranking
+        strategies supported by the builder. Each branch mirrors a different user-facing
+        priority such as lift-first, count-first, or event-first selection.
         """
         priority = self.sort_priority
         if priority == "lift_count_rate":
@@ -338,6 +342,9 @@ class StrategicSegmentBuilder:
                         """
                     ).fetchall()
 
+                    # Information Value is a weighted log-ratio between event and non-event
+                    # distributions across the bins. These totals give the denominator for that
+                    # calculation and allow us to compare each binned segment against the global base.
                     total_events = sum(r[2] or 0.0 for r in stats_df)
                     total_non_events = sum((r[1] - (r[2] or 0.0)) for r in stats_df)
 
@@ -378,27 +385,47 @@ class StrategicSegmentBuilder:
                     col_arr = col_arr_raw.filled(np.nan if np.issubdtype(col_arr_raw.dtype, np.number) else None) if isinstance(col_arr_raw, np.ma.MaskedArray) else col_arr_raw
                     target_arr = target_arr_raw.filled(0) if isinstance(target_arr_raw, np.ma.MaskedArray) else target_arr_raw
 
+                    # Fit an Optimal Binning model to the current feature/target pair so we can
+                    # create monotonic, high-signal bins without relying on a fixed quantile grid.
                     optb = OptimalBinning(name=col, dtype=dtype)
                     optb.fit(col_arr, target_arr)
 
                     bin_table = optb.binning_table.build()
                     iv_val = float(bin_table["IV"].values[-1])
 
-                    # Bug 2 fix: under pandas>=3.0, metric="bins" stringifies
-                    # ArrowStringArray slices into a verbose repr for multi-category
-                    # bins. Rebuild clean labels from the binning table and map via
-                    # metric="indices" instead.
+                    # Under newer pandas versions, metric="bins" can stringify categorical
+                    # bin labels in a verbose way. Rebuild clean labels from the binning
+                    # table and map via metric="indices" instead.
                     if dtype == "categorical":
                         raw_cells = bin_table["Bin"].tolist()
+                        # Build a complete index->label map (do not drop Special/Missing)
                         clean_labels = {
                             i: self._sanitize_bin_label(cell)
                             for i, cell in enumerate(raw_cells)
-                            if str(cell) not in ("Special", "Missing", "")
                         }
+                        # indices may be masked/array-like; coerce safely to ints
                         idx = optb.transform(col_arr, metric="indices")
+                        try:
+                            idx_arr = np.asarray(idx)
+                        except Exception:
+                            idx_arr = np.array(list(idx))
+
+                        idx_int = []
+                        for v in idx_arr:
+                            try:
+                                # handle masked or nan-like values
+                                if hasattr(v, 'item'):
+                                    v_val = v.item()
+                                else:
+                                    v_val = v
+                                idx_int.append(int(v_val))
+                            except Exception:
+                                idx_int.append(-1)
+
                         transformed_bins = np.array(
-                            [clean_labels.get(i, "Missing") for i in idx], dtype=str
+                            [clean_labels.get(i, "Missing") for i in idx_int], dtype=str
                         )
+                        logger.debug(f"{col}: optimal categorical bins unique={np.unique(transformed_bins).tolist()[:20]}")
                     else:
                         transformed_bins = np.asarray(
                             optb.transform(col_arr, metric="bins"), dtype=str
@@ -534,6 +561,9 @@ class StrategicSegmentBuilder:
                 if n < 2:
                     continue
 
+                # Grouped rows are already sorted by the current feature's bin order. We can
+                # evaluate sliding windows over the cumulative counts/events to generate merged
+                # candidates without re-running a query for every possible interval.
                 bins = [x[col] for x in g_list]
                 cnt = np.array([x["cnt"] for x in g_list], dtype=float)
                 evt = np.array([x["evt"] for x in g_list], dtype=float)
@@ -643,11 +673,18 @@ class StrategicSegmentBuilder:
         base_rate: float,
     ) -> List[Dict[str, Any]]:
         """
-        Batches SQL GROUP BY queries for a list of feature combinations.
+        Aggregate candidate rules for one or more feature combinations.
+
+        The method builds a SQL GROUP BY query for each combination, executes them in
+        chunks, and turns the raw aggregate rows into rule dictionaries that later feed
+        the ranking and validation stages. For the naive path, the resulting base rules
+        can also be expanded into adjacent-bin merges.
         """
         if not combo_list:
             return []
 
+        # Build one GROUP BY query per combination. Chunking keeps the DuckDB work bounded
+        # while still letting us evaluate hundreds of candidate rules efficiently.
         queries = []
         for combo in combo_list:
             cols_str = ", ".join([f'"{c}"' for c in combo])
@@ -670,6 +707,8 @@ class StrategicSegmentBuilder:
             queries.append(query)
             
         def _process_rows(rows):
+            # Convert the SQL aggregate rows into the internal rule dictionary format used
+            # by the rest of the extraction pipeline.
             for rule, count, events, combo_vars_str in rows:
                 rate = (events / count) * 100.0 if count > 0 else 0
                 lift = rate/ (base_rate * 100.0) if base_rate > 0 else 0
@@ -772,7 +811,11 @@ class StrategicSegmentBuilder:
 
     def parse_rule_to_sql(self, rule_str: str) -> str:
         """
-        Translates rule strings into production SQL WHERE clause.
+        Translate a human-readable rule string into a SQL WHERE predicate.
+
+        Rules are stored in a compact bracketed form (for example, ``income=[10000, 20000)``)
+        and must be converted back into SQL that can be evaluated against the residual table.
+        This method handles numeric ranges, categorical sets, and missing-value tokens.
         """
         parts = [p.strip() for p in rule_str.split("&")]
         sql_conditions: List[str] = []
@@ -793,6 +836,8 @@ class StrategicSegmentBuilder:
         def _is_categorical_col(col_name: str) -> bool:
             return col_name in self._categorical_cols
         
+        # Each rule is composed of one or more ``column=interval`` parts joined by ``&``.
+        # We convert each part independently and later combine them with logical AND.
         for part in parts:
             if "=" not in part:
                 continue
@@ -1009,7 +1054,7 @@ class StrategicSegmentBuilder:
         logger.info(f"📦 Binning method: {self.binning_method} (naive_bins={self.naive_bins})")
         
         con.register("input_data_view", data)
-        # Bug 6: cast target to DOUBLE up front so bool-dtype targets work with AVG,
+        # Cast the target to DOUBLE up front so boolean targets work with AVG,
         # and fail early with a clear message if the target column is missing.
         cols_info_probe = con.execute("DESCRIBE input_data_view").fetchall()
         probe_cols = {row[0] for row in cols_info_probe}
@@ -1065,8 +1110,8 @@ class StrategicSegmentBuilder:
             ).fetchone()
             current_base_rate, current_volume = res[0] or 0.0, res[1] or 0
 
-            # Bug 5 defensive: empty param_grid lists already fall back above, but
-            # guard min() against an empty experiments list just in case.
+            # Guard the minimum-volume check against an empty experiments list in case
+            # a custom grid is passed with no valid values.
             min_floor_volume = (
                 min(exp["min_sample_size"] for exp in experiments)
                 if experiments
@@ -1156,7 +1201,14 @@ class StrategicSegmentBuilder:
                 break
 
             con.execute("DROP TABLE IF EXISTS binned_df")
-            con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
+            # Materialize binned_data via a pandas DataFrame and register it with DuckDB
+            try:
+                binned_df_pd = pd.DataFrame(binned_data)
+                con.register("binned_data_df", binned_df_pd)
+                con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data_df")
+            except Exception:
+                # Fallback to previous direct table creation if DataFrame registration fails
+                con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
 
             global_min_sample = (
                 min(exp["min_sample_size"] for exp in experiments)
@@ -1169,6 +1221,8 @@ class StrategicSegmentBuilder:
                 else self.min_lift
             )
             
+            # Apply the current grid-search thresholds for this iteration so the candidate
+            # pool is filtered consistently. The original values are restored after the loop.
             self.min_sample_size = global_min_sample
             self.min_lift = global_min_lift
             
@@ -1204,6 +1258,8 @@ class StrategicSegmentBuilder:
                     if res_3:
                         all_candidate_rules.extend(res_3)
 
+            # Build a shortlist of candidates for each grid configuration and keep the top
+            # rule from each configuration for later raw validation against the real table.
             grid_candidates: List[Dict[str, Any]] = []
             for config in experiments:
                 valid_for_config = [
@@ -1224,6 +1280,9 @@ class StrategicSegmentBuilder:
 
             grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
 
+            # Re-run the strongest candidates against the real residual table using SQL.
+            # This step enforces the hard constraints on actual data counts/events rather than
+            # only the binned approximation used during candidate generation.
             selected_candidate = None
             for candidate in grid_candidates:
                 rule_str = candidate["rule"]

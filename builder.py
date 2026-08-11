@@ -4,7 +4,7 @@ Strategic Segmentation Engine
 Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning,
 and vectorized DuckDB scorecard deciling.
 
-Author: Bishwarup Biswas + Gemini + DeepSeek + ChatGPT
+Author: Bishwarup Biswas
 Python Version: 3.9+
 """
 

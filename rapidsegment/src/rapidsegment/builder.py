@@ -4,27 +4,29 @@ Strategic Segmentation Engine
 Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning,
 and vectorized DuckDB scorecard deciling.
 
-Author: Bishwarup Biswas + Gemini + DeepSeek + ChatGPT
+Author: Bishwarup Biswas
 Python Version: 3.9+
 """
 
 import logging
 import os
 import re
+import ast
 from datetime import datetime
-from itertools import combinations, product
+from itertools import combinations, product, groupby
 from typing import Any, Dict, List, Optional, Tuple, Union
 import duckdb
 import numpy as np
-import psutil
 from joblib import Parallel, delayed
 from optbinning import OptimalBinning
+import pandas as pd
+import uuid
+import psutil
 
 # -----------------------------------------------------------------------------
 # Module-level configuration
 # -----------------------------------------------------------------------------
-now = datetime.now()
-timestamp = now.strftime("%Y_%m_%d_%H_%M_%S")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +36,29 @@ logger = logging.getLogger("StrategicEngine")
 
 # Pre-compiled regex for fast parsing inside loops
 _BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags=re.DOTALL)
+
+
+def setup_disk_backed_db(base_dir: str = "experiments") -> tuple[str, str]:
+    """
+    Creates an experiment directory and generates a unique DuckDB file path.
+    Returns the database path and the temp directory path.
+    """
+    # 1. Create the main experiments directory
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # 2. Generate unique identifiers (Date + UUID)
+    date_str = datetime.now().strftime("%Y%m%d")
+    unique_id = uuid.uuid4().hex[:8]  # Short UUID is usually sufficient and cleaner
+    
+    # 3. Define the main database file path
+    db_filename = f"segmentation_{date_str}_{unique_id}.duckdb"
+    db_path = os.path.join(base_dir, db_filename)
+    
+    # 4. Create a dedicated temp directory for DuckDB to spill to
+    temp_dir = os.path.join(base_dir, f"tmp_{date_str}_{unique_id}")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    return db_path, temp_dir    
 
 
 class StrategicSegmentBuilder:
@@ -68,7 +93,14 @@ class StrategicSegmentBuilder:
         enable_3way: bool = True,
         feature_groups: Optional[Dict[str, List[str]]] = None,
         ignore_features: Optional[List[str]] = None,
-        sort_priority: str = "lift_rate_count"  # or "count_lift_rate", "lift_rate_count", etc.
+        sort_priority: str = "lift_rate_count",  # or "count_lift_rate", "lift_rate_count", etc.
+        binning_method: str = "optimal",  
+        naive_bins: int = 5 ,
+        max_expansion_hops: int = 0,
+        selection_metric: str = "iv",
+        expand_log_mode: str = "summary",  # "none" | "summary" | "champion" | "full",
+        db_path: Optional[str] = None,
+        db_temp_dir: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -76,9 +108,7 @@ class StrategicSegmentBuilder:
             n_jobs: Number of parallel jobs for IV computation. -1 uses all but one core.
             min_sample_size: Absolute minimum row count for a valid rule. Used as a fallback when param_grid is None.
             min_lift: Absolute minimum lift threshold (hard constraint).
-                Enforced on all final segments, calculated relative to the locked original base response rate. 
-                Not relaxed during param_grid exploration.: Minimum lift threshold. Used as a fallback when param_grid is None.
-            min_events: Minimum number of positive events for a valid rule. Used as a fallback when param_grid is None.
+            min_events: Minimum number of positive events for a valid rule.
             top_n_vars: Number of highest‑IV features passed into the Apriori engine.
             max_segments: Maximum number of segments to extract.
             max_feature_reuse: Max times a feature can appear across segments.
@@ -89,17 +119,20 @@ class StrategicSegmentBuilder:
             enable_3way: Allow 3‑dimensional intersection rules.
             feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
             ignore_features: Explicit list of columns to drop prior to IV calculation.
-            sort_priority: Ranking criteria for selecting champion segments. 
-                Can be a predefined shortcut string:
-                    - 'lift_rate_count': Lift → Response Rate → Sample Size
-                    - 'count_lift_rate': Sample Size → Lift → Response Rate
-                    - 'rate_lift_count': Response Rate → Lift → Sample Size
-                    - 'rate_count_lift': Response Rate → Sample Size → Lift
-                    - 'lift_count_rate': Lift → Sample Size → Response Rate
-                    - 'count_rate_lift': Sample Size → Response Rate → Lift
+            sort_priority: Ranking criteria for selecting champion segments.
+            binning_method: Which binning engine to use ('optimal' or 'naive').
+            naive_bins: Number of quantile bins used when binning_method is 'naive'.
+            selection_metric: Metric used to rank features for top_n_vars selection ("iv" or "response_rate").
+            max_expansion_hops: Adjacent-bin merging hop distance limit (0 disables expansion).
+            expand_log_mode: Controls verbosity of adjacent-bin expansion logging ("none", "summary", "champion", "full").
+                - "none": No expansion logging.
+                - "summary": Show summary statistics of adjacent-bin expansions.
+                - "champion": Display champion segment with contenders in a formatted table.
+                - "full": Display summary plus detailed top expanded rules.
         """
         self.target = target
-        self.n_jobs = n_jobs if n_jobs != -1 else max(1, os.cpu_count() - 1)
+        cpu_count = os.cpu_count() or 1
+        self.n_jobs = n_jobs if n_jobs != -1 else max(1, cpu_count - 1)
         self.min_sample_size = min_sample_size
         self.min_lift = min_lift
         self.min_events = min_events
@@ -115,20 +148,33 @@ class StrategicSegmentBuilder:
         self.feature_groups = feature_groups or {}
         self.ignore_features = ignore_features or []
         self.feature_usage_counts: Dict[str, int] = {}
+        # Reverse map for O(1) group lookups; rebuilt by _validate_feature_groups
+        self._feature_to_group: Dict[str, str] = {
+            var: group
+            for group, vars_list in self.feature_groups.items()
+            for var in vars_list
+        }
         self.sort_priority = sort_priority
-        # Diagnostic repository (feature journey tracking)
         self.diagnostics_: List[Dict[str, Any]] = []
+        self.binning_method = binning_method  
+        self.naive_bins = naive_bins     
+        self.max_expansion_hops = max(0, int(max_expansion_hops))
+        self.selection_metric = selection_metric
+        self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "champion", "full") else "summary"   
+        self._columns_types: Dict[str,str] = {}
+        self._categorical_cols: set[str] = set()
+        # Set up disk-backed DuckDB automatically if not provided
+        if db_path is None or db_temp_dir is None:
+            self.db_path, self.db_temp_dir = setup_disk_backed_db("experiments")
+            logger.info(f"📂 Created disk-backed DB at: {self.db_path}")
+        else:
+            self.db_path = db_path
+            self.db_temp_dir = db_temp_dir
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
         """
         Determines the correct OptBinning data type flag from a DuckDB type string.
-
-        Args:
-            duckdb_type: DuckDB column type as string.
-
-        Returns:
-            'categorical' or 'numerical'.
         """
         dtype_upper = duckdb_type.upper()
         if any(t in dtype_upper for t in ["VARCHAR", "CHAR", "STRING", "TEXT", "UUID"]):
@@ -138,12 +184,6 @@ class StrategicSegmentBuilder:
     def _validate_feature_groups(self, columns: List[str]) -> None:
         """
         Validates that all declared feature group variables exist in the target dataset.
-
-        Args:
-            columns: List of all column names from the table.
-
-        Raises:
-            ValueError: If any feature in a group is not found.
         """
         if not self.feature_groups:
             return
@@ -159,33 +199,23 @@ class StrategicSegmentBuilder:
                         "was not found in the provided DataFrame/Table."
                     )
                 validated_count += 1
-
+        # Rebuild reverse map after validation passes
+        self._feature_to_group = {
+            var: group
+            for group, vars_list in self.feature_groups.items()
+            for var in vars_list
+        }
         logger.info(f"✅ Feature group validation passed. ({validated_count} features mapped)")
 
     def get_group(self, var: str) -> str:
         """
         Returns the assigned business category for a feature, or the feature name itself.
-
-        Args:
-            var: Feature name.
-
-        Returns:
-            Group name or the feature name.
         """
-        for group, vars_list in self.feature_groups.items():
-            if var in vars_list:
-                return group
-        return var
+        return self._feature_to_group.get(var,var)
 
     def is_diverse(self, combo: Tuple[str, ...]) -> bool:
         """
         Ensures a tuple of features spans strictly distinct analytical groups.
-
-        Args:
-            combo: Tuple of feature names.
-
-        Returns:
-            True if all features belong to different groups (or diversity is disabled).
         """
         if not self.enable_diversity:
             return True
@@ -194,13 +224,11 @@ class StrategicSegmentBuilder:
 
     def _get_sort_key(self, rule: Dict[str, Any]) -> Tuple[float, ...]:
         """
-        Utility function to shorlist rules based on users choice on which metric to prioritize.
+        Create a sortable tuple for a candidate rule based on the configured priority.
 
-        Args:
-            rule: Dictionary of Rules that was captured and passed hard constraints.
-
-        Returns:
-            Returns a tuple for sorting rules based on self.sort_priority.
+        The returned tuple keeps the ordering deterministic across the many ranking
+        strategies supported by the builder. Each branch mirrors a different user-facing
+        priority such as lift-first, count-first, or event-first selection.
         """
         priority = self.sort_priority
         if priority == "lift_count_rate":
@@ -215,9 +243,24 @@ class StrategicSegmentBuilder:
             return (rule["count"], rule["rate"], rule["lift"])
         elif priority == "rate_count_lift":
             return (rule["rate"], rule["count"], rule["lift"])
+        elif priority == "events_lift_rate":
+            return (rule["events"], rule["lift"], rule["rate"])
+        elif priority == "events_rate_lift":
+            return (rule["events"], rule["rate"], rule["lift"])
+        elif priority == "lift_events_rate":
+            return (rule["lift"], rule["events"], rule["rate"])
+        elif priority == "rate_events_lift":
+            return (rule["rate"], rule["events"], rule["lift"])
+        elif priority == "events_count_rate":
+            return (rule["events"], rule["count"], rule["rate"])
+        elif priority == "events_rate_count":
+            return (rule["events"], rule["rate"], rule["count"])
+        elif priority == "count_events_rate":
+            return (rule["count"], rule["events"], rule["rate"])
+        elif priority == "rate_events_count":
+            return (rule["rate"], rule["events"], rule["count"])
         else:
-            # Fallback: lift, count, rate
-            return (rule["lift"], rule["count"], rule["rate"])
+            return (rule["lift"], rule["rate"], rule["count"])
 
     def compute_iv_ranking_and_bin(
         self,
@@ -226,40 +269,185 @@ class StrategicSegmentBuilder:
         columns_types: Dict[str, str],
     ) -> Tuple[List[Dict[str, Union[str, float]]], Dict[str, np.ndarray]]:
         """
-        Computes Information Value (IV) and pre‑computed bins in a single parallel pass.
-
-        Args:
-            con: DuckDB connection.
-            eligible_cols: List of feature columns to evaluate.
-            columns_types: Mapping of column name to its DuckDB type.
-
-        Returns:
-            - Ranking: List of dicts with 'variable' and 'iv' (IV * 100).
-            - Precomputed bins: Dict mapping feature name to transformed bin array.
+        Computes Information Value (IV) and pre-computed bins using SQL-native DuckDB execution.
         """
         logger.info(f"🔍 Computing IV and bins for {len(eligible_cols)} features...")
 
-        def _worker(col: str) -> Tuple[str, float, Optional[np.ndarray]]:
+        def _worker(col: str) -> Tuple[str, float, float, Optional[np.ndarray]]:
+            thread_con = con.cursor()
             try:
-                thread_con = con.cursor()
-                data_dict = thread_con.execute(
-                    f'SELECT "{col}", "{self.target}" FROM current_df'
-                ).fetchnumpy()
-                col_arr = data_dict[col]
-                target_arr = data_dict[self.target]
                 dtype = self._resolve_optb_dtype(columns_types[col])
 
-                optb = OptimalBinning(name=col, dtype=dtype)
-                optb.fit(col_arr, target_arr)
+                if self.binning_method == "naive":
+                    if dtype == "numerical":
+                        # Compute quantiles natively in DuckDB SQL
+                        q_step = 1.0 / float(self.naive_bins)
+                        q_list = [round(i * q_step, 6) for i in range(self.naive_bins + 1)]
+                        q_str = ", ".join(str(q) for q in q_list)
+                        
+                        quantiles = thread_con.execute(
+                            f'SELECT QUANTILE_CONT("{col}", [{q_str}]) FROM current_df WHERE "{col}" IS NOT NULL'
+                        ).fetchone()[0]
 
-                iv_val = optb.binning_table.build()["IV"].values[-1]
-                transformed_bins = optb.transform(col_arr, metric="bins").astype(str)
+                        if quantiles is None or len(quantiles) == 0:
+                            edges = np.array([-np.inf, np.inf])
+                        else:
+                            edges = np.unique(np.array(quantiles, dtype=float))
+                            if len(edges) < 2:
+                                edges = np.array([-np.inf, np.inf])
+                            else:
+                                edges[0] = -np.inf
+                                edges[-1] = np.inf
 
-                thread_con.close()
-                return col, float(iv_val) * 100, transformed_bins
+                        case_clauses = []
+                        for i in range(len(edges) - 1):
+                            lower, upper = edges[i], edges[i+1]
+                            lower_str = "-inf" if np.isinf(lower) and lower < 0 else str(lower)
+                            upper_str = "inf" if np.isinf(upper) and upper > 0 else str(upper)
+                            label = f"[{lower_str}, {upper_str})"
+
+                            if np.isinf(lower) and lower < 0:
+                                case_clauses.append(f'WHEN "{col}" < {upper} THEN \'{label}\'')
+                            elif np.isinf(upper) and upper > 0:
+                                case_clauses.append(f'WHEN "{col}" >= {lower} THEN \'{label}\'')
+                            else:
+                                case_clauses.append(f'WHEN "{col}" >= {lower} AND "{col}" < {upper} THEN \'{label}\'')
+
+                        case_expr = f"""
+                        CASE 
+                            WHEN "{col}" IS NULL THEN 'Missing'
+                            {' '.join(case_clauses)}
+                            ELSE 'Missing'
+                        END
+                        """
+                    else:
+                        case_expr = f"""
+                        CASE 
+                            WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
+                            ELSE '[' || CAST("{col}" AS VARCHAR) || ']'
+                        END
+                        """
+
+                    # Aggregate binned metrics in DuckDB
+                    stats_df = thread_con.execute(
+                        f"""
+                        WITH binned AS (
+                            SELECT 
+                                {case_expr} AS bin_label,
+                                CAST("{self.target}" AS DOUBLE) AS target
+                            FROM current_df
+                        )
+                        SELECT 
+                            bin_label,
+                            COUNT(*) AS cnt,
+                            SUM(target) AS evt
+                        FROM binned
+                        GROUP BY bin_label
+                        """
+                    ).fetchall()
+
+                    # Information Value is a weighted log-ratio between event and non-event
+                    # distributions across the bins. These totals give the denominator for that
+                    # calculation and allow us to compare each binned segment against the global base.
+                    total_events = sum(r[2] or 0.0 for r in stats_df)
+                    total_non_events = sum((r[1] - (r[2] or 0.0)) for r in stats_df)
+
+                    iv_val = 0.0
+                    max_rr = 0.0
+
+                    for label, cnt, evt in stats_df:
+                        evt = evt or 0.0
+                        cnt = cnt or 0
+                        non_evt = cnt - evt
+
+                        if cnt >= self.min_sample_size and evt >= self.min_events:
+                            rr = evt / cnt
+                            if rr > max_rr:
+                                max_rr = rr
+
+                        if total_events > 0 and total_non_events > 0:
+                            pct_events = max(evt / total_events, 1e-6)
+                            pct_non_events = max(non_evt / total_non_events, 1e-6)
+                            iv_val += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
+
+                    # Transform bins array in DuckDB
+                    transformed_bins = thread_con.execute(
+                        f"""
+                        SELECT {case_expr} AS bin_label FROM current_df
+                        """
+                    ).fetchnumpy()["bin_label"].astype(str)
+
+                else:
+                    # Optimal binning fallback
+                    data_dict = thread_con.execute(
+                        f'SELECT "{col}", "{self.target}" FROM current_df'
+                    ).fetchnumpy()
+
+                    col_arr_raw = data_dict[col]
+                    target_arr_raw = data_dict[self.target]
+
+                    col_arr = col_arr_raw.filled(np.nan if np.issubdtype(col_arr_raw.dtype, np.number) else None) if isinstance(col_arr_raw, np.ma.MaskedArray) else col_arr_raw
+                    target_arr = target_arr_raw.filled(0) if isinstance(target_arr_raw, np.ma.MaskedArray) else target_arr_raw
+
+                    # Fit an Optimal Binning model to the current feature/target pair so we can
+                    # create monotonic, high-signal bins without relying on a fixed quantile grid.
+                    optb = OptimalBinning(name=col, dtype=dtype)
+                    optb.fit(col_arr, target_arr)
+
+                    bin_table = optb.binning_table.build()
+                    iv_val = float(bin_table["IV"].values[-1])
+
+                    # Under newer pandas versions, metric="bins" can stringify categorical
+                    # bin labels in a verbose way. Rebuild clean labels from the binning
+                    # table and map via metric="indices" instead.
+                    if dtype == "categorical":
+                        raw_cells = bin_table["Bin"].tolist()
+                        # Build a complete index->label map (do not drop Special/Missing)
+                        clean_labels = {
+                            i: self._sanitize_bin_label(cell)
+                            for i, cell in enumerate(raw_cells)
+                        }
+                        # indices may be masked/array-like; coerce safely to ints
+                        idx = optb.transform(col_arr, metric="indices")
+                        try:
+                            idx_arr = np.asarray(idx)
+                        except Exception:
+                            idx_arr = np.array(list(idx))
+
+                        idx_int = []
+                        for v in idx_arr:
+                            try:
+                                # handle masked or nan-like values
+                                if hasattr(v, 'item'):
+                                    v_val = v.item()
+                                else:
+                                    v_val = v
+                                idx_int.append(int(v_val))
+                            except Exception:
+                                idx_int.append(-1)
+
+                        transformed_bins = np.array(
+                            [clean_labels.get(i, "Missing") for i in idx_int], dtype=str
+                        )
+                        logger.debug(f"{col}: optimal categorical bins unique={np.unique(transformed_bins).tolist()[:20]}")
+                    else:
+                        transformed_bins = np.asarray(
+                            optb.transform(col_arr, metric="bins"), dtype=str
+                        )
+
+                    valid_bins = bin_table[
+                        (bin_table["Count"] >= self.min_sample_size) & 
+                        (bin_table["Event"] >= self.min_events)
+                    ]
+                    max_rr = float(valid_bins["Event rate"].max()) if not valid_bins.empty else 0.0
+
+                return col, float(iv_val), float(max_rr), transformed_bins
+
             except Exception as e:
-                logger.debug(f"IV computation failed for {col}: {e}")
-                return col, 0.0, None
+                logger.debug(f"Computation failed for {col}: {e}")
+                return col, 0.0, 0.0, None
+            finally:
+                thread_con.close()
 
         results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
@@ -267,13 +455,220 @@ class StrategicSegmentBuilder:
 
         ranking = []
         precomputed_bins = {}
-        for col, iv, bins in results:
-            ranking.append({"variable": col, "iv": iv})
+        for col, iv, rr, bins in results:
+            ranking.append({"variable": col, "iv": iv, "max_rr": rr})
             if bins is not None:
                 precomputed_bins[col] = bins
 
-        ranking.sort(key=lambda x: x["iv"], reverse=True)
+        if self.selection_metric == "response_rate":
+            ranking.sort(key=lambda x: x["max_rr"], reverse=True)
+        else:
+            ranking.sort(key=lambda x: x["iv"], reverse=True)
+
         return ranking, precomputed_bins
+
+    @staticmethod
+    def _bin_sort_key(label: str) -> Tuple[int, float, str]:
+        """
+        Numeric-aware sort key for a bin label.
+        """
+        m = re.match(r"^[\[\(]\s*(-?inf|-?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*,", label)
+        if m:
+            raw = m.group(1).lower()
+            if raw == "-inf":
+                val = float("-inf")
+            elif raw == "inf":
+                val = float("inf")
+            else:
+                val = float(raw)
+            return (0, val, "")
+        return (1, 0.0, label)
+
+    def _expand_adjacent_bins(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        combo: Tuple[str, ...],
+        base_rate: float,
+        base_results: List[Dict[str, Any]],
+        seen_rules: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Attempts to merge adjacent neighbour bin(s) on every variable in combo.
+        Uses native Python groupby processing (no Pandas).
+        """
+        if not base_results:
+            return []
+
+        if seen_rules is None:
+            seen_rules = set()
+        for r in base_results:
+            seen_rules.add(r["rule"])
+
+        base_lookup: Dict[str, Dict[str, Any]] = {r["rule"]: r for r in base_results}
+        max_hops = max(0, int(getattr(self, "max_expansion_hops", 0)))
+
+        expanded: List[Dict[str, Any]] = []
+
+        for col in combo:
+            other_cols = [c for c in combo if c != col]
+
+            group_cols = other_cols + [col]
+            select_cols = ", ".join(f'CAST("{c}" AS VARCHAR) AS "{c}"' for c in group_cols)
+            group_by_cols = ", ".join(f'"{c}"' for c in group_cols)
+            try:
+                rows = con.execute(
+                    f"""
+                    SELECT {select_cols},
+                           COUNT("{self.target}")::BIGINT AS cnt,
+                           SUM(CAST("{self.target}" AS DOUBLE)) AS evt
+                    FROM binned_df
+                    GROUP BY {group_by_cols}
+                    """
+                ).fetchall()
+            except Exception:
+                logger.debug(f"↩️ Expansion aggregate query failed for variable '{col}' in combo {combo}")
+                continue
+
+            if not rows:
+                continue
+
+            columns = other_cols + [col, "cnt", "evt"]
+            
+            processed = []
+            for r in rows:
+                row_dict = dict(zip(columns, r))
+                if row_dict[col] == "Missing":
+                    continue
+                row_dict["_sort_key"] = self._bin_sort_key(row_dict[col])
+                processed.append(row_dict)
+
+            if not processed:
+                continue
+
+            if other_cols:
+                processed.sort(key=lambda x: tuple(x[c] for c in other_cols) + (x["_sort_key"],))
+                group_iter = []
+                for k, g in groupby(processed, key=lambda x: tuple(x[c] for c in other_cols)):
+                    group_iter.append((k, list(g)))
+            else:
+                processed.sort(key=lambda x: x["_sort_key"])
+                group_iter = [((), processed)]
+
+            for group_key, g_list in group_iter:
+                if other_cols:
+                    key_tuple = group_key if isinstance(group_key, tuple) else (group_key,)
+                    other_val = dict(zip(other_cols, key_tuple))
+                else:
+                    other_val = {}
+
+                n = len(g_list)
+                if n < 2:
+                    continue
+
+                # Grouped rows are already sorted by the current feature's bin order. We can
+                # evaluate sliding windows over the cumulative counts/events to generate merged
+                # candidates without re-running a query for every possible interval.
+                bins = [x[col] for x in g_list]
+                cnt = np.array([x["cnt"] for x in g_list], dtype=float)
+                evt = np.array([x["evt"] for x in g_list], dtype=float)
+                cum_cnt = np.concatenate(([0.0], np.cumsum(cnt)))
+                cum_evt = np.concatenate(([0.0], np.cumsum(evt)))
+
+                for idx in range(n):
+                    rule_at_idx = " & ".join(
+                        f"{c}={other_val[c]}" if c != col else f"{c}={bins[idx]}"
+                        for c in combo
+                    )
+                    base_result = base_lookup.get(rule_at_idx)
+                    if base_result is None:
+                        continue
+
+                    base_events = base_result["events"]
+
+                    for lo, hi in self._candidate_windows(idx, n, max_hops):
+                        exp_count = cum_cnt[hi + 1] - cum_cnt[lo]
+                        exp_events = cum_evt[hi + 1] - cum_evt[lo]
+                        if exp_count <= 0:
+                            continue
+
+                        exp_rate = (exp_events / exp_count) * 100.0
+                        exp_lift = exp_rate / (base_rate * 100.0) if base_rate > 0 else 0.0
+
+                        if not (
+                            exp_lift >= self.min_lift
+                            and exp_events >= self.min_events
+                            and exp_count >= self.min_sample_size
+                            and exp_events > base_events
+                        ):
+                            continue
+
+                        window_labels_sorted = sorted(bins[lo:hi + 1], key=self._bin_sort_key)
+                        merged_label = f"[{', '.join(window_labels_sorted)}]"
+
+                        rule_parts = []
+                        for c in combo:
+                            if c == col:
+                                rule_parts.append(f"{c}={merged_label}")
+                            else:
+                                rule_parts.append(f"{c}={other_val[c]}")
+                        rule_str = " & ".join(rule_parts)
+
+                        if rule_str in seen_rules:
+                            continue
+                        seen_rules.add(rule_str)
+
+                        expanded.append(
+                            {
+                                "rule": rule_str,
+                                "count": int(exp_count),
+                                "rate": float(exp_rate),
+                                "lift": float(exp_lift),
+                                "events": float(exp_events),
+                                "combo_vars": combo,
+                                "base_events": base_events,
+                            }
+                        )
+
+        return expanded
+
+    @staticmethod
+    def _candidate_windows(idx: int, n: int, max_hops: int):
+        """
+        Yields (lo, hi) inclusive index windows around `idx`.
+    
+        Windows that would span the variable's entire domain (all n bins) are excluded:
+        such a merge removes the variable's filtering power entirely (matches every row),
+        producing a degenerate, non-informative candidate. Left unguarded, expansions on
+        different variables can each independently collapse to this "no constraint" state
+        and surface as distinct rule strings with identical count/events/lift downstream.
+        """
+        for hops in range(1, max_hops + 1):
+            lo, hi = idx - hops, idx
+            if lo < 0:
+                break
+            if hi - lo + 1 >= n:
+                break
+            yield (lo, hi)
+        for hops in range(1, max_hops + 1):
+            lo, hi = idx, idx + hops
+            if hi >= n:
+                break
+            if hi - lo + 1 >= n:
+                break
+            yield (lo, hi)
+    @staticmethod
+    def _sanitize_bin_label(label: Any) -> str:
+        """
+        Defends against an OptBinning + pandas>=3.0 interaction where a categorical
+        bin's label comes back as a raw array-like (e.g. pandas ArrowStringArray)
+        instead of a joined string. Rebuilds the "[cat1, cat2]" format explicitly.
+        """
+        if isinstance(label, str):
+            return label
+        try:
+            return "[" + ", ".join(str(i) for i in list(label)) + "]"
+        except TypeError:
+            return str(label)
 
     def _agg_combinations(
         self,
@@ -282,19 +677,18 @@ class StrategicSegmentBuilder:
         base_rate: float,
     ) -> List[Dict[str, Any]]:
         """
-        Batches SQL GROUP BY queries for a list of feature combinations.
+        Aggregate candidate rules for one or more feature combinations.
 
-        Args:
-            con: DuckDB connection.
-            combo_list: List of tuples, each tuple is a combination of features.
-            base_rate: Global event rate (used to compute lift).
-
-        Returns:
-            List of rule dictionaries with keys: rule, count, events, rate, lift, combo_vars.
+        The method builds a SQL GROUP BY query for each combination, executes them in
+        chunks, and turns the raw aggregate rows into rule dictionaries that later feed
+        the ranking and validation stages. For the naive path, the resulting base rules
+        can also be expanded into adjacent-bin merges.
         """
         if not combo_list:
             return []
 
+        # Build one GROUP BY query per combination. Chunking keeps the DuckDB work bounded
+        # while still letting us evaluate hundreds of candidate rules efficiently.
         queries = []
         for combo in combo_list:
             cols_str = ", ".join([f'"{c}"' for c in combo])
@@ -315,153 +709,378 @@ class StrategicSegmentBuilder:
                     AND SUM(CAST("{self.target}" AS DOUBLE)) >= {self.min_events}
             """
             queries.append(query)
+            
+        def _process_rows(rows):
+            # Convert the SQL aggregate rows into the internal rule dictionary format used
+            # by the rest of the extraction pipeline.
+            for rule, count, events, combo_vars_str in rows:
+                rate = (events / count) * 100.0 if count > 0 else 0
+                lift = rate/ (base_rate * 100.0) if base_rate > 0 else 0
+                combo_key = tuple(combo_vars_str.split(","))
+                if events >= self.min_events:
+                    entry = {
+                        "rule": rule,
+                        "count": count,
+                        "rate": rate,
+                        "lift": lift,
+                        "events": events,
+                        "combo_vars": combo_key,
+                       }
+                valid_results.append(entry)
+                if combo_key in per_combo_base:
+                    per_combo_base[combo_key].append(entry)
 
         valid_results = []
         chunk_size = 100
 
+        per_combo_base: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {
+            combo: [] for combo in combo_list
+        }
+
         for i in range(0, len(queries), chunk_size):
             chunk = queries[i:i + chunk_size]
+            chunk_combos = combo_list[i:i + chunk_size]
             union_query = " UNION ALL ".join(chunk)
+            try:
+                res = con.execute(union_query).fetchall()
+                _process_rows(res)
+            except Exception as batch_err:
+                logger.debug(
+                f"Batch query failed ({len(chunk)} combos), retrying individually: {batch_err}"
+                )
+                for single_query, single_combo in zip(chunk, chunk_combos):
+                    try:
+                        res = con.execute(single_query).fetchall()
+                        _process_rows(res)
+                    except Exception as e:
+                        logger.debug(f"Single combo query failed for {single_combo}: {e}")
 
-            res = con.execute(union_query).fetchall()
-            for rule, count, events, combo_vars_str in res:
-                rate = (events / count) * 100.0 if count > 0 else 0
-                lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
+        all_expanded: List[Dict[str, Any]] = []
+        expansion_stats: Dict[str, Dict[str, Any]] = {}
+        shared_seen_rules: set = set()
 
-                if lift >= self.min_lift and events >= self.min_events:
-                    valid_results.append(
-                        {
-                            "rule": rule,
-                            "count": count,
-                            "rate": rate,
-                            "lift": lift,
-                            "events": events,
-                            "combo_vars": tuple(combo_vars_str.split(",")),
-                        }
+        for combo in combo_list:
+            base = per_combo_base.get(combo, [])
+            if not base:
+                continue
+            if getattr(self, "binning_method", "naive") == "naive":
+                expanded = self._expand_adjacent_bins(
+                    con, combo, base_rate, base, seen_rules=shared_seen_rules
+                )
+                if expanded:
+                    valid_results.extend(expanded)
+                    all_expanded.extend(expanded)
+
+                    combo_key = " & ".join(combo)
+                    best = max(expanded, key=lambda x: x["events"])
+                    delta = best["events"] - best.get("base_events", best["events"])
+                    expansion_stats[combo_key] = {
+                        "n_exp": len(expanded),
+                        "best_delta": delta,
+                        "best_lift": best["lift"],
+                        "best_rule": best["rule"],
+                        "best_events": best["events"],
+                    }
+
+        mode = getattr(self, "expand_log_mode", "summary")
+        if expansion_stats and mode in ("summary", "full"):
+            logger.info("🔀 Adjacent-bin expansion summary")
+            logger.info(
+                f"   {'Combo':<42} {'#exp':>5}  {'Best Δevents':>12}  {'Best lift':>9}"
+            )
+            logger.info("   " + "-" * 72)
+
+            for combo_key, st in sorted(
+                expansion_stats.items(), key=lambda x: x[1]["best_delta"], reverse=True
+            ):
+                logger.info(
+                    f"   {combo_key:<42} {st['n_exp']:>5}  "
+                    f"{st['best_delta']:>+12.0f}  {st['best_lift']:>8.2f}x"
+                )
+
+            total_exp = sum(s["n_exp"] for s in expansion_stats.values())
+            logger.info(f"   → Total expanded candidates generated: {total_exp}")
+
+            if mode == "full":
+                top = sorted(all_expanded, key=lambda x: x["events"], reverse=True)[:3]
+                logger.info("   Top expanded rules:")
+                for i, e in enumerate(top, 1):
+                    delta = e["events"] - e.get("base_events", e["events"])
+                    logger.info(
+                        f"     {i}. {e['rule']}"
+                        f"  | events {e['events']:.0f} (Δ{delta:+.0f}) | lift {e['lift']:.2f}x"
                     )
 
         return valid_results
 
     def parse_rule_to_sql(self, rule_str: str) -> str:
         """
-        Translates OptBinning string syntax into a production SQL WHERE clause.
+        Translate a human-readable rule string into a SQL WHERE predicate.
 
-        Args:
-            rule_str: Rule string like "col1='A' & col2=[1,2,3]".
-
-        Returns:
-            SQL condition string (e.g., `col1 IN ('A') AND col2 IN (1,2,3)`).
+        Rules are stored in a compact bracketed form (for example, ``income=[10000, 20000)``)
+        and must be converted back into SQL that can be evaluated against the residual table.
+        This method handles numeric ranges, categorical sets, and missing-value tokens.
         """
         parts = [p.strip() for p in rule_str.split("&")]
         sql_conditions: List[str] = []
 
+        def _quote_sql_string(val: Any) -> str:
+            txt = str(val)
+            # escape single quotes for SQL and wrap in single quotes
+            return "'" + txt.replace("'", "''") + "'"
+
+        def _strip_wrapping_quotes(s: str) -> str:
+            # Only strip a matching outer quote pair; never strip interior/unbalanced quotes
+            # (Bug 4: str.strip("'\"") mangles values like Say "hi")
+            s = s.strip()
+            if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+                return s[1:-1]
+            return s
+        
+        def _is_categorical_col(col_name: str) -> bool:
+            return col_name in self._categorical_cols
+        
+        # Each rule is composed of one or more ``column=interval`` parts joined by ``&``.
+        # We convert each part independently and later combine them with logical AND.
         for part in parts:
             if "=" not in part:
                 continue
-
+        
             col, interval = [x.strip() for x in part.split("=", 1)]
             bracket_match = _BRACKET_REGEX.search(interval)
-
+            col_is_categorical = _is_categorical_col(col)
+        
+            # 1. Multi-range / merged adjacent NUMERIC ranges like [[10, 20), [20, 30)]
+            # Real numeric range tokens always end in ')' or ']', so adjacent tokens are
+            # joined by "),"/"]," + "[". Categorical merges (see 1b) join bracketed single
+            # values like "[female],[male]" -- joined by "],", never "),". Require the
+            # numeric-specific separator so we don't misfire on merged categoricals
+            is_numeric_multirange = (
+                not col_is_categorical
+                and interval.startswith("[[")
+                and re.search(r"\),\s*\[", interval) is not None
+            )
+            if is_numeric_multirange:
+                inner = interval.strip()
+                if inner.startswith("[") and inner.endswith("]"):
+                    inner = inner[1:-1]
+        
+                raw_tokens = re.split(r"\),\s*", inner)
+                ranges = []
+                for tok in raw_tokens:
+                    tok = tok.strip()
+                    if not tok:
+                        continue
+                    if not tok.endswith(")"):
+                        tok = tok + ")"
+                    if tok[0] in ("[", "(") and tok[-1] in ("]", ")"):
+                        left_char = tok[0]
+                        right_char = tok[-1]
+                        content = tok[1:-1]
+                        if "," in content:
+                            lo, hi = [x.strip() for x in content.split(",", 1)]
+                            ranges.append((left_char, lo, hi, right_char))
+        
+                if ranges:
+                    def _sort_key(r):
+                        val = r[1]
+                        if val.lower() == "-inf":
+                            return float("-inf")
+                        try:
+                            return float(val)
+                        except Exception:
+                            return 0.0
+        
+                    ranges_sorted = sorted(ranges, key=_sort_key)
+                    overall_lower_char, overall_lower = ranges_sorted[0][0], ranges_sorted[0][1]
+                    overall_upper_char, overall_upper = ranges_sorted[-1][3], ranges_sorted[-1][2]
+        
+                    range_conds = []
+                    if overall_lower.lower() != "-inf":
+                        op = ">=" if overall_lower_char == "[" else ">"
+                        range_conds.append(f"{col} {op} {overall_lower}")
+                    if overall_upper.lower() != "inf":
+                        op = "<=" if overall_upper_char == "]" else "<"
+                        range_conds.append(f"{col} {op} {overall_upper}")
+        
+                    if range_conds:
+                        sql_conditions.append(" AND ".join(range_conds))
+                    continue
+        
+            # 1b. Merged categorical lists like [[male], [female]] or [[male],[female], [others]],
+            # produced when _expand_adjacent_bins merges adjacent single-bracket categorical bins.
+            # Guard: a single-category value that itself contains brackets (e.g. category "[VIP]"
+            # becomes the label "[[VIP]]") must NOT be treated as a multi-value merge
+            # (Bug 3 partial mitigation — full fix needs escaped rule grammar).
+            if interval.startswith("[[") and bracket_match:
+                cat_tokens = re.findall(r"\[([^\[\]]+)\]", interval)
+                # If the outer form is exactly one nested pair with no sibling tokens
+                # (e.g. "[[VIP]]"), treat as a single literal category value instead.
+                is_single_nested = (
+                    len(cat_tokens) == 1
+                    and re.fullmatch(r"\[\[[^\[\]]+\]\]", interval.strip()) is not None
+                )
+                if is_single_nested:
+                    cleaned = _strip_wrapping_quotes(interval[1:-1])
+                    sql_conditions.append(f"{col} = {_quote_sql_string(cleaned)}")
+                    continue
+                if cat_tokens:
+                    cleaned_items = [_strip_wrapping_quotes(t) for t in cat_tokens]
+                    formatted_items = ", ".join(_quote_sql_string(item) for item in cleaned_items if item)
+                    if formatted_items:
+                        sql_conditions.append(f"{col} IN ({formatted_items})")
+                    continue
+        
+            # 2. Explicit Categoricals
+            def _is_numeric_token(tok: str) -> bool:
+                tok = tok.strip().strip("'\"")
+                if tok.lower() in ("-inf", "inf", "+inf"):
+                    return True
+                try:
+                    float(tok)
+                    return True
+                except ValueError:
+                    return False
+        
             is_categorical = False
             if bracket_match:
                 content = bracket_match.group(1)
-                if any(
-                    k in interval for k in ("'", '"', "Array", "Categorical")
-                ) or not interval.startswith(("[", "(")):
+                tokens = [t for t in content.split(",") if t.strip()]
+                if any(k in interval for k in ("'", '"', "Array", "Categorical")) or not interval.startswith(("[", "(")):
                     is_categorical = True
-                elif len(content.split(",")) > 2:
+                elif len(tokens) > 2:
                     is_categorical = True
-
-            # --- Categorical set handling ---
+                elif not all(_is_numeric_token(t) for t in tokens):
+                    is_categorical = True
+        
             if is_categorical and bracket_match:
-                import ast
-
                 try:
                     raw_items = ast.literal_eval(bracket_match.group(0))
+                    if not isinstance(raw_items, (list, tuple)):
+                        raw_items = [raw_items]
                 except Exception:
                     raw_content = bracket_match.group(1)
                     if "," not in raw_content:
                         raw_content = re.sub(r"'\s+'", "','", raw_content)
                         raw_content = re.sub(r'"\s+"', '","', raw_content)
                         raw_content = re.sub(r"\s+", ",", raw_content)
-
                     raw_items = [
-                        i.strip().strip("'").strip('"')
+                        _strip_wrapping_quotes(i)
                         for i in raw_content.split(",")
                         if i.strip()
                     ]
-
                 formatted_items = ", ".join(
-                    [f"'{item}'" if isinstance(item, str) else str(item) for item in raw_items]
+                    [
+                        _quote_sql_string(item)
+                        if (col_is_categorical or isinstance(item, str))
+                        else str(item)
+                        for item in raw_items
+                    ]
                 )
-
                 if formatted_items:
                     sql_conditions.append(f"{col} IN ({formatted_items})")
                 continue
-
-            # --- Special / Missing ---
+        
+            # 3. Special or Missing values
             if interval in ["Special", "Missing"]:
                 sql_conditions.append(f"{col} IS NULL")
                 continue
-
-            # --- Continuous range ---
+        
+            # 4. Standard Intervals [lo, hi) or Single Bracket Values [val]
             if interval.startswith(("[", "(")):
-                left_char, right_char = interval[0], interval[-1]
-                lower_str, upper_str = [x.strip() for x in interval[1:-1].split(",", 1)]
-
-                range_conds = []
-                if lower_str.lower() != "-inf":
-                    op = ">=" if left_char == "[" else ">"
-                    range_conds.append(f"{col} {op} {lower_str}")
-
-                if upper_str.lower() != "inf":
-                    op = "<=" if right_char == "]" else "<"
-                    range_conds.append(f"{col} {op} {upper_str}")
-
-                if range_conds:
-                    sql_conditions.append(" AND ".join(range_conds))
-
-        return " AND ".join(f"({cond})" if "AND" in cond else cond for cond in sql_conditions)
+                inner = interval[1:-1].strip()
+        
+                if "," in inner:
+                    if col_is_categorical:
+                        raw_items = [_strip_wrapping_quotes(x) for x in inner.split(",") if x.strip()]
+                        formatted_items = ", ".join(_quote_sql_string(item) for item in raw_items)
+                        if formatted_items:
+                            sql_conditions.append(f"{col} IN ({formatted_items})")
+                        continue
+                    left_char, right_char = interval[0], interval[-1]
+                    lower_str, upper_str = [x.strip() for x in inner.split(",", 1)]
+        
+                    range_conds = []
+                    if lower_str.lower() != "-inf":
+                        op = ">=" if left_char == "[" else ">"
+                        range_conds.append(f"{col} {op} {lower_str}")
+                    if upper_str.lower() != "inf":
+                        op = "<=" if right_char == "]" else "<"
+                        range_conds.append(f"{col} {op} {upper_str}")
+        
+                    if range_conds:
+                        sql_conditions.append(" AND ".join(range_conds))
+                else:
+                    # Single value inside brackets, e.g. [123] or [Value]
+                    clean_val = _strip_wrapping_quotes(inner)
+        
+                    if col_is_categorical:
+                        sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
+                    elif clean_val.replace(".", "", 1).replace("-", "", 1).isdigit():
+                        sql_conditions.append(f"{col} = {clean_val}")
+                    else:
+                        sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
+        
+        return " AND ".join(f"({cond})" for cond in sql_conditions)
 
     def extract_segments(self, data: Any) -> List[Dict[str, Any]]:
         """
         Sequentially extracts high‑lift rules on the residual dataset.
-
-        After extraction, the stored counts reflect the final hierarchical segmentation
-        on the original dataset, ensuring consistency with `evaluate_final_coverage()`.
-
-        Args:
-            data: Input data (will be loaded into DuckDB).
-
-        Returns:
-            List of segment dictionaries with keys: segment_id, rule_string, sql_filter,
-            count, rate, lift, meta_applied_sample_size, meta_applied_min_lift.
         """
         logger.info("🚀 Starting hierarchical segment extraction...")
+        # Reset all accumulated state so repeated calls produce independent results
+        self.segments = []
+        self.diagnostics_ = []
+        self.feature_usage_counts = {}
+        
+        # Snapshot threshold before any grid search mutation inside the loop
+        abs_min_sample_size = self.min_sample_size
+        abs_min_events = self.min_events
+        abs_min_lift = self.min_lift
 
-        # Use file‑backed storage for performance
-        if os.path.exists(f"experiment_{timestamp}.db"):
-            os.remove(f"experiment_{timestamp}.db")
-        con = duckdb.connect(f"experiment_{timestamp}.db")
+        con = duckdb.connect(self.db_path)
 
         total_cores = os.cpu_count() or 1
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
-        total_memory_bytes = psutil.virtual_memory().total
-        target_memory_gb = int((total_memory_bytes * 0.5) / (1024 ** 3))
+        total_mem_gb = psutil.virtual_memory().total / (1024**3)
+        target_memory_gb = max(1, int(total_mem_gb * 0.8)) 
 
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
+        con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
+        con.execute("SET preserve_insertion_order = false;")
+        
         logger.info(
-            f"⚙️ DuckDB Configured: Threads={target_threads}/{total_cores}, "
-            f"MemoryLimit={target_memory_gb}GB"
+            f"⚙️ DuckDB Configured for Disk Spilling: Threads={target_threads}/{total_cores}, "
+            f"MemoryLimit={target_memory_gb}GB, TempDir={self.db_temp_dir}"
         )
-        
         logger.info(f"📊 Sort priority: {self.sort_priority}")
+        logger.info(f"📦 Binning method: {self.binning_method} (naive_bins={self.naive_bins})")
         
-        con.execute("CREATE OR REPLACE TABLE current_df AS SELECT * FROM data")
+        con.register("input_data_view", data)
+        # Cast the target to DOUBLE up front so boolean targets work with AVG,
+        # and fail early with a clear message if the target column is missing.
+        cols_info_probe = con.execute("DESCRIBE input_data_view").fetchall()
+        probe_cols = {row[0] for row in cols_info_probe}
+        if self.target not in probe_cols:
+            raise ValueError(
+                f"Target column '{self.target}' not found in input data. "
+                f"Available columns: {sorted(probe_cols)}"
+            )
+        con.execute(
+            f'CREATE OR REPLACE TABLE current_df AS '
+            f'SELECT * REPLACE (CAST("{self.target}" AS DOUBLE) AS "{self.target}") '
+            f'FROM input_data_view'
+        )
 
         cols_info = con.execute("DESCRIBE current_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}
+        self._columns_types = columns_types
+        self._categorical_cols = {
+            col_name
+            for col_name, dtype in columns_types.items()
+            if self._resolve_optb_dtype(dtype) == "categorical"
+        }
         all_cols = list(columns_types.keys())
 
         if self.enable_diversity:
@@ -472,37 +1091,36 @@ class StrategicSegmentBuilder:
         ]
         self.feature_usage_counts = {col: 0 for col in eligible_cols}
 
-        # Build parameter grid experiments
         if self.param_grid:
-            sizes = self.param_grid.get("min_sample_size", [self.min_sample_size])
-            lifts = self.param_grid.get("min_lift", [self.min_lift])
+            sizes = self.param_grid.get("min_sample_size", [self.min_sample_size]) or [self.min_sample_size]
+            lifts = self.param_grid.get("min_lift", [self.min_lift]) or [self.min_lift]
             experiments = [
                 {"min_sample_size": s, "min_lift": l}
                 for s, l in product(sizes, lifts)
             ]
-            logger.info(
-                f"📊 Dynamic Grid Search Enabled: {len(experiments)} configurations."
-            )
+            logger.info(f"📊 Dynamic Grid Search Enabled: {len(experiments)} configurations.")
         else:
             experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
 
-        # Cache original base_rate and absolute constraints
         original_base_rate = con.execute(
             f'SELECT AVG(CAST("{self.target}" AS DOUBLE)) FROM current_df'
         ).fetchone()[0] or 0.0
-        abs_min_sample_size = self.min_sample_size
-        abs_min_events = self.min_events
-        abs_min_lift = self.min_lift
 
         logger.info(f"🔒 Locking Original Base Rate: {original_base_rate*100:.2f}%")
 
         for i in range(1, self.max_segments + 1):
             res = con.execute(
-                f'SELECT AVG("{self.target}"), COUNT(*) FROM current_df'
+                f'SELECT AVG(CAST("{self.target}" AS DOUBLE)), COUNT(*) FROM current_df'
             ).fetchone()
             current_base_rate, current_volume = res[0] or 0.0, res[1] or 0
 
-            min_floor_volume = min(exp["min_sample_size"] for exp in experiments)
+            # Guard the minimum-volume check against an empty experiments list in case
+            # a custom grid is passed with no valid values.
+            min_floor_volume = (
+                min(exp["min_sample_size"] for exp in experiments)
+                if experiments
+                else self.min_sample_size
+            )
 
             if current_base_rate == 0 or current_volume < min_floor_volume:
                 logger.info(
@@ -520,26 +1138,33 @@ class StrategicSegmentBuilder:
                 con, eligible_cols, columns_types
             )
 
-            # --- Diagnostic snapshot ---
-            current_iv_map = {row["variable"]: row["iv"] for row in iv_ranking}
+            if self.selection_metric == "response_rate":
+                current_score_map = {row["variable"]: row["max_rr"] for row in iv_ranking}
+            else:
+                current_score_map = {row["variable"]: row["iv"] for row in iv_ranking}
+                
             top_n_variable_names = [r["variable"] for r in iv_ranking[:self.top_n_vars]]
             iteration_snapshot = {}
             for col in eligible_cols:
                 used_count = self.feature_usage_counts.get(col, 0)
-                current_iv = current_iv_map.get(col, 0.0)
+                current_score = current_score_map.get(col, 0.0)
+                
                 if used_count >= self.max_feature_reuse:
                     status = "Excluded (Max Feature Reuse Exceeded)"
-                elif current_iv <= 0.0:
-                    status = "Excluded (Information Value is Zero/Invalid)"
+                elif current_score <= 0.0:
+                    status = f"Excluded ({self.selection_metric.upper()} is Zero/Invalid)"
                 elif col not in top_n_variable_names:
-                    status = "Excluded (Outside Top N Features by IV)"
+                    status = "Excluded (Outside Top N Features by Score)"
                 else:
                     status = "Eligible for Combination Search"
+                    
                 iteration_snapshot[col] = {
-                    "iv": current_iv,
+                    "metric_score": current_score,
+                    "metric_type": self.selection_metric,
                     "times_used_previously": used_count,
                     "status": status,
                 }
+                
             self.diagnostics_.append(
                 {
                     "iteration": i,
@@ -560,12 +1185,16 @@ class StrategicSegmentBuilder:
                 logger.warning("⚠️ All eligible features exhausted. Aborting.")
                 break
 
-            # Build binned table
-            binned_data = {
-                self.target: con.execute(
-                    f'SELECT "{self.target}" FROM current_df'
-                ).fetchnumpy()[self.target]
-            }
+            raw_target_arr = con.execute(
+                f'SELECT "{self.target}" FROM current_df'
+            ).fetchnumpy()[self.target]
+
+            if isinstance(raw_target_arr, np.ma.MaskedArray):
+                clean_target_arr = raw_target_arr.filled(0)
+            else:
+                clean_target_arr = raw_target_arr
+
+            binned_data = {self.target: clean_target_arr}
             valid_vars = []
             for v in top_vars:
                 if v in precomputed_bins and len(np.unique(precomputed_bins[v])) > 1:
@@ -576,73 +1205,75 @@ class StrategicSegmentBuilder:
                 break
 
             con.execute("DROP TABLE IF EXISTS binned_df")
-            con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
+            # Materialize binned_data via a pandas DataFrame and register it with DuckDB
+            try:
+                binned_df_pd = pd.DataFrame(binned_data)
+                con.register("binned_data_df", binned_df_pd)
+                con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data_df")
+            except Exception:
+                # Fallback to previous direct table creation if DataFrame registration fails
+                con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
 
-            # --- Grid search over parameter configurations ---
+            global_min_sample = (
+                min(exp["min_sample_size"] for exp in experiments)
+                if experiments
+                else self.min_sample_size
+            )
+            global_min_lift = (
+                min(exp["min_lift"] for exp in experiments)
+                if experiments
+                else self.min_lift
+            )
+            
+            # Apply the current grid-search thresholds for this iteration so the candidate
+            # pool is filtered consistently. The original values are restored after the loop.
+            self.min_sample_size = global_min_sample
+            self.min_lift = global_min_lift
+            
+            all_candidate_rules: List[Dict[str, Any]] = []
+
+            # Level 1 (Singles)
+            res_1 = self._agg_combinations(con, [(c,) for c in valid_vars], original_base_rate)
+            valid_1way_vars = set()
+            if res_1:
+                valid_1way_vars = {c["combo_vars"][0] for c in res_1}
+                if self.enable_1way:
+                    all_candidate_rules.extend(res_1)
+
+            # Level 2 (Pairs)
+            valid_2way_sets = set()
+            if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
+                combos_2 = [c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)]
+                if combos_2:
+                    res_2 = self._agg_combinations(con, combos_2, original_base_rate)
+                    if res_2:
+                        valid_2way_sets = {frozenset(c["combo_vars"]) for c in res_2}
+                        if self.enable_2way:
+                            all_candidate_rules.extend(res_2)
+
+            # Level 3 (Triplets)
+            if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
+                combos_3 = [
+                    c for c in combinations(valid_1way_vars, 3)
+                    if self.is_diverse(c) and all(frozenset(p) in valid_2way_sets for p in combinations(c, 2))
+                ]
+                if combos_3:
+                    res_3 = self._agg_combinations(con, combos_3, original_base_rate)
+                    if res_3:
+                        all_candidate_rules.extend(res_3)
+
+            # Build a shortlist of candidates for each grid configuration and keep the top
+            # rule from each configuration for later raw validation against the real table.
             grid_candidates: List[Dict[str, Any]] = []
             for config in experiments:
-                self.min_sample_size = config["min_sample_size"]
-                self.min_lift = config["min_lift"]
-
-                all_rules: List[Dict[str, Any]] = []
-
-                # Level 1 (Singles)
-                res_1 = self._agg_combinations(
-                    con, [(c,) for c in valid_vars], original_base_rate
-                )
-                valid_1way_vars = set()
-                if res_1:
-                    valid_1way_vars = {c["combo_vars"][0] for c in res_1}
-                    if self.enable_1way:
-                        all_rules.extend(res_1)
-
-                if not valid_1way_vars:
-                    continue
-
-                # Level 2 (Pairs)
-                valid_2way_sets = set()
-                if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
-                    combos_2 = [
-                        c
-                        for c in combinations(valid_1way_vars, 2)
-                        if self.is_diverse(c)
-                    ]
-                    if combos_2:
-                        res_2 = self._agg_combinations(con, combos_2, original_base_rate)
-                        if res_2:
-                            valid_2way_sets = {
-                                frozenset(c["combo_vars"]) for c in res_2
-                            }
-                            if self.enable_2way:
-                                all_rules.extend(res_2)
-
-                # Level 3 (Triplets)
-                if (
-                    self.enable_3way
-                    and len(valid_1way_vars) >= 3
-                    and valid_2way_sets
-                ):
-                    combos_3 = [
-                        c
-                        for c in combinations(valid_1way_vars, 3)
-                        if self.is_diverse(c)
-                        and all(
-                            frozenset(p) in valid_2way_sets
-                            for p in combinations(c, 2)
-                        )
-                    ]
-                    if combos_3:
-                        res_3 = self._agg_combinations(con, combos_3, original_base_rate)
-                        if res_3:
-                            all_rules.extend(res_3)
-
-                if all_rules:
-                    # Sort by lift first, then count, then rate (prioritise lift)
-                    all_rules.sort(
-                        key=lambda x: self._get_sort_key(x),
-                        reverse=True,
-                    )
-                    top_match = all_rules[0].copy()
+                valid_for_config = [
+                    r for r in all_candidate_rules
+                    if r["count"] >= config["min_sample_size"] and r["lift"] >= config["min_lift"]
+                ]
+                
+                if valid_for_config:
+                    valid_for_config.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                    top_match = valid_for_config[0].copy()
                     top_match["grid_min_sample_size"] = config["min_sample_size"]
                     top_match["grid_min_lift"] = config["min_lift"]
                     grid_candidates.append(top_match)
@@ -651,22 +1282,20 @@ class StrategicSegmentBuilder:
                 logger.info("⏹️ No candidates cleared the grid. Stopping.")
                 break
 
-            # Rank candidates by (lift, count, rate)
-            grid_candidates.sort(
-                key=lambda x: self._get_sort_key(x), reverse=True
-            )
+            grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
 
+            # Re-run the strongest candidates against the real residual table using SQL.
+            # This step enforces the hard constraints on actual data counts/events rather than
+            # only the binned approximation used during candidate generation.
             selected_candidate = None
             for candidate in grid_candidates:
                 rule_str = candidate["rule"]
                 sql_filter = self.parse_rule_to_sql(rule_str)
-                # Validate on raw current_df (residual)
                 actual = con.execute(
                     f'SELECT COUNT(*) AS cnt, SUM(CAST("{self.target}" AS DOUBLE)) AS evt '
                     f'FROM current_df WHERE ({sql_filter})'
                 ).fetchone()
                 actual_cnt, actual_evt = actual[0], actual[1] or 0
-                # Calculate actual lift for this candidate
                 actual_rate = (actual_evt / actual_cnt * 100.0) if actual_cnt > 0 else 0.0
                 actual_lift = (actual_rate / (original_base_rate * 100.0)) if original_base_rate > 0 else 0.0
 
@@ -694,7 +1323,6 @@ class StrategicSegmentBuilder:
             best_raw_sql = selected_candidate["sql_filter"]
             winning_combo = selected_candidate["combo_vars"]
 
-            # Compute metrics from the residual counts
             actual_rate = (
                 selected_candidate["actual_events"] / selected_candidate["actual_count"]
             ) * 100.0
@@ -711,7 +1339,6 @@ class StrategicSegmentBuilder:
                     f"{self.feature_usage_counts[var]}"
                 )
 
-            # Store the raw rule and raw SQL (no exclusions)
             self.segments.append(
                 {
                     "segment_id": i,
@@ -740,6 +1367,97 @@ class StrategicSegmentBuilder:
                 f"  SQL: {best_raw_sql}"
             )
 
+            expanded_in_this_iter = [
+                r for r in all_candidate_rules
+                if "base_events" in r and r["rule"] != best_rule
+            ]
+            
+            expand_mode = getattr(self, "expand_log_mode", "summary")
+            should_show_champion = expand_mode in ("champion", "full") and expanded_in_this_iter
+            
+            if should_show_champion:
+                expanded_in_this_iter.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                top_exp = expanded_in_this_iter[:5]
+        
+                logger.info("📊 Top adjacent-merge candidates vs final champion")
+                logger.info(
+                    f"   {'Rank':<5} {'Type':<10} {'Lift':>6} {'Rate%':>7} {'Count':>8} {'Events':>8}  Rule"
+                )
+                logger.info("   " + "-" * 90)
+        
+                logger.info(
+                    f"   {'★':<5} {'CHAMPION':<10} "
+                    f"{actual_lift:>6.2f}x {actual_rate:>6.1f}% "
+                    f"{selected_candidate['actual_count']:>8} "
+                    f"{selected_candidate['actual_events']:>8.0f}  "
+                    f"{best_rule}"
+                )
+        
+                for idx, e in enumerate(top_exp, 1):
+                    champ_key = self._get_sort_key({
+                        "lift": actual_lift,
+                        "rate": actual_rate,
+                        "count": selected_candidate["actual_count"],
+                        "events": selected_candidate["actual_events"],
+                    })    
+                    cand_key = self._get_sort_key(e)
+        
+                    if cand_key > champ_key:
+                        reason = "would have beaten champion (but failed raw validation)"
+                    else:
+                        _dim_order = {
+                            "lift_count_rate":   ["lift", "count", "rate"],
+                            "count_lift_rate":   ["count", "lift", "rate"],
+                            "rate_lift_count":   ["rate", "lift", "count"],
+                            "lift_rate_count":   ["lift", "rate", "count"],
+                            "count_rate_lift":   ["count", "rate", "lift"],
+                            "rate_count_lift":   ["rate", "count", "lift"],
+                            "events_lift_rate":  ["events", "lift", "rate"],
+                            "events_rate_lift":  ["events", "rate", "lift"],
+                            "lift_events_rate":  ["lift", "events", "rate"],
+                            "rate_events_lift":  ["rate", "events", "lift"],
+                            "events_count_rate": ["events", "count", "rate"],
+                            "events_rate_count": ["events", "rate", "count"],
+                            "count_events_rate": ["count", "events", "rate"],
+                            "rate_events_count": ["rate", "events", "count"],
+                        }
+                        priority_order = _dim_order.get(
+                            self.sort_priority, ["lift", "rate", "count"])
+                        champ_vals = {
+                            "lift": actual_lift,
+                            "rate": actual_rate,
+                            "count": selected_candidate["actual_count"],
+                            "events": selected_candidate["actual_events"],
+                        }
+                        cand_vals = {
+                            "lift": e["lift"],
+                            "rate": e["rate"],
+                            "count": e["count"],
+                            "events": e["events"],
+                        }
+                        reason = "ranked lower by sort_priority"
+                        for dim in priority_order:
+                            if cand_vals[dim] < champ_vals[dim]:
+                                label = {
+                                    "lift": "lower lift",
+                                    "count": "smaller count",
+                                    "rate": "lower rate",
+                                    "events": "fewer events",
+                                }[dim]
+                                reason = (
+                                    f"{label} ({cand_vals[dim]:.2f} < {champ_vals[dim]:.2f})"
+                                )
+                                break
+                            elif cand_vals[dim] > champ_vals[dim]:
+                                break
+            
+                    logger.info(
+                        f"   {idx:<5} {'expanded':<10} "
+                        f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
+                        f"{e['count']:>8} {e['events']:>8.0f}  "
+                        f"{e['rule']}  → {reason}"
+                    )
+
             self.diagnostics_[-1]["winning_segment"] = {
                 "rule": best_rule,
                 "sql_filter": best_raw_sql,
@@ -748,8 +1466,6 @@ class StrategicSegmentBuilder:
                 "count": int(selected_candidate["actual_count"]),
             }
 
-            # Remove rows matching the raw rule from the residual
-            # NULL‑safe: keep rows where the rule evaluates to NULL
             con.execute(
                 f"""
                 CREATE TABLE temp_residual AS
@@ -760,36 +1476,28 @@ class StrategicSegmentBuilder:
             con.execute("DROP TABLE current_df")
             con.execute("ALTER TABLE temp_residual RENAME TO current_df")
 
-        # Restore original config
         self.min_sample_size = abs_min_sample_size
         self.min_events = abs_min_events
         self.min_lift = abs_min_lift 
-        con.close()
+        try:
+            con.close()
+        except Exception:
+            pass
         logger.info("🏁 Extraction complete.")
         return self.segments
 
     def evaluate_final_coverage(self, original_data: Any) -> List[Dict[str, Any]]:
         """
         Evaluates the hierarchical segmentation on the original dataset.
-
-        The rules are applied in the order they were extracted (first rule gets
-        highest priority). This yields the true hierarchical segmentation.
-
-        Args:
-            original_data: The original (unfiltered) dataset.
-
-        Returns:
-            List of dictionaries with segment KPIs: segment, total_count,
-            target_events, response_rate, base_response_rate, capture_rate, lift.
         """
         if not self.segments:
             return []
 
         logger.info("📊 Evaluating final hierarchical coverage on original data...")
-        con = duckdb.connect(f"experiment_{timestamp}.db")
-        con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM original_data")
+        con = duckdb.connect(":memory:")
+        con.register("input_data_view", original_data)
+        con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view")
 
-        # Build CASE statement with raw SQL filters in order
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
             for seg in self.segments
@@ -809,17 +1517,32 @@ class StrategicSegmentBuilder:
         BASE_KPIS AS (
             SELECT *,
                 SUM(total_count) OVER() AS total_population,
+                SUM(target_events) OVER() AS total_target_events,
                 (SUM(target_events) OVER() * 1.0 / SUM(total_count) OVER()) * 100 AS base_response_rate
             FROM PER_SEG_KPIS
+        ),
+        CUMULATIVE_KPIS AS (
+            SELECT *,
+                SUM(total_count) OVER (
+                    ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
+                ) AS cum_count,
+                SUM(target_events) OVER (
+                    ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
+                ) AS cum_events
+            FROM BASE_KPIS
         )
         SELECT
-            PER_SEG_KPIS.*,
-            BASE_KPIS.base_response_rate,
-            (PER_SEG_KPIS.total_count * 1.0 / BASE_KPIS.total_population) * 100 AS capture_rate,
-            (PER_SEG_KPIS.response_rate / BASE_KPIS.base_response_rate) AS lift
-        FROM PER_SEG_KPIS
-        LEFT JOIN BASE_KPIS ON PER_SEG_KPIS.segment = BASE_KPIS.segment
-        ORDER BY segment
+            segment,
+            total_count,
+            target_events,
+            response_rate,
+            base_response_rate,
+            (total_count * 100.0 / total_population) AS capture_rate,
+            (response_rate / NULLIF(base_response_rate, 0)) AS lift,
+            (cum_count * 100.0 / NULLIF(total_population, 0)) AS cumulative_sample_capture,
+            (cum_events * 100.0 / NULLIF(total_target_events, 0)) AS cumulative_event_capture
+        FROM CUMULATIVE_KPIS
+        ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
         """
 
         res = con.execute(final_query)
@@ -831,9 +1554,6 @@ class StrategicSegmentBuilder:
     def explain_feature_journey(self, feature_name: str) -> None:
         """
         Prints a detailed audit trail of a specific feature across all iterations.
-
-        Args:
-            feature_name: Name of the feature to trace.
         """
         if not self.diagnostics_:
             print("⚠️ No diagnostic records found. Run extract_segments() first.")
@@ -853,7 +1573,10 @@ class StrategicSegmentBuilder:
                 continue
 
             print(f"\n[Iteration {iter_num}]")
-            print(f"  • Current dynamic IV   : {state['iv']:.4f}")
+            metric_val = state.get('metric_score', state.get('iv', 0.0))
+            metric_name = state.get('metric_type', 'iv').upper()
+            
+            print(f"  • Current dynamic {metric_name}   : {metric_val:.4f}")
             print(f"  • Previous times used  : {state['times_used_previously']}")
             print(f"  • Selection Status     : {state['status']}")
 
@@ -866,3 +1589,148 @@ class StrategicSegmentBuilder:
                     f"(Variables: {winner['variables_used']})"
                 )
         print("=" * 80)
+
+    def generate_feature_health_report(
+        self, original_data: Any, features: List[str]
+    ) -> pd.DataFrame:
+        """
+        Generates a feature health report on the original dataset using DuckDB native SQL.
+        """
+        if not features:
+            logger.warning("⚠️ No features provided for health report generation.")
+            return {}
+
+        unique_features = list(dict.fromkeys(features))
+
+        logger.info(
+            f"📋 Generating DuckDB Naive Feature Health Report for {len(unique_features)} feature(s): "
+            f"{unique_features}"
+        )
+
+        con = duckdb.connect(":memory:")
+        con.register("input_data_view", original_data)
+        con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
+
+        cols_info = con.execute("DESCRIBE input_df").fetchall()
+        columns_types = {row[0]: row[1] for row in cols_info}
+
+        target_expr = f"""
+        (CASE 
+            WHEN TRY_CAST("{self.target}" AS DOUBLE) IS NOT NULL THEN TRY_CAST("{self.target}" AS DOUBLE)
+            WHEN LOWER(TRIM(CAST("{self.target}" AS VARCHAR))) IN ('1', 'true', 'yes', 'y', 't') THEN 1.0
+            ELSE 0.0
+        END)
+        """
+
+        health_report: Dict[str, List[Dict[str, Any]]] = {}
+
+        for col in unique_features:
+            if col not in columns_types:
+                logger.warning(f"⚠️ Feature '{col}' not found in dataset columns. Skipping.")
+                continue
+
+            duckdb_type = columns_types[col].upper()
+            is_numeric = any(
+                t in duckdb_type
+                for t in [
+                    "INT",
+                    "BIGINT",
+                    "DOUBLE",
+                    "FLOAT",
+                    "DECIMAL",
+                    "REAL",
+                    "NUMERIC",
+                    "HUGEINT",
+                    "TINYINT",
+                    "SMALLINT",
+                ]
+            )
+
+            if is_numeric:
+                query = f"""
+                WITH ranked AS (
+                    SELECT
+                        "{col}" AS val,
+                        {target_expr} AS target_val,
+                        NTILE({self.naive_bins}) OVER (ORDER BY "{col}") AS tile
+                    FROM input_df
+                    WHERE "{col}" IS NOT NULL
+                ),
+                numeric_bins AS (
+                    SELECT
+                        '[' || ROUND(MIN(val), 4) || ', ' || ROUND(MAX(val), 4) || ']' AS bin,
+                        COUNT(*) AS total_count,
+                        SUM(target_val) AS event_count,
+                        (SUM(target_val) * 100.0 / COUNT(*)) AS response_rate,
+                        FALSE AS is_missing,
+                        MIN(val) AS sort_key
+                    FROM ranked
+                    GROUP BY tile
+                ),
+                missing_bin AS (
+                    SELECT
+                        'Missing' AS bin,
+                        COUNT(*) AS total_count,
+                        SUM({target_expr}) AS event_count,
+                        (SUM({target_expr}) * 100.0 / NULLIF(COUNT(*), 0)) AS response_rate,
+                        TRUE AS is_missing,
+                        1e18 AS sort_key
+                    FROM input_df
+                    WHERE "{col}" IS NULL
+                    HAVING COUNT(*) > 0
+                )
+                SELECT bin, total_count, event_count, response_rate, is_missing
+                FROM (
+                    SELECT * FROM numeric_bins
+                    UNION ALL
+                    SELECT * FROM missing_bin
+                )
+                ORDER BY sort_key
+                """
+            else:
+                query = f"""
+                SELECT
+                    CASE
+                        WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
+                        ELSE '[' || CAST("{col}" AS VARCHAR) || ']'
+                    END AS bin,
+                    COUNT(*) AS total_count,
+                    SUM({target_expr}) AS event_count,
+                    (SUM({target_expr}) * 100.0 / COUNT(*)) AS response_rate,
+                    CASE
+                        WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN TRUE
+                        ELSE FALSE
+                    END AS is_missing
+                FROM input_df
+                GROUP BY 1, 5
+                ORDER BY is_missing ASC, bin ASC
+                """
+
+            res = con.execute(query).fetchall()
+            col_report = [
+                {
+                    "bin": row[0],
+                    "total_count": int(row[1]),
+                    "event_count": int(row[2] or 0),
+                    "response_rate": round(float(row[3] or 0.0), 4),
+                    "is_missing": bool(row[4]),
+                }
+                for row in res
+            ]
+            health_report[col] = col_report
+
+        con.close()
+        rows = []
+        for feature, bins in health_report.items():
+            for b in bins:
+                rows.append({
+                    "feature": feature,
+                    "bin": b["bin"],
+                    "total_count": b["total_count"],
+                    "event_count": b["event_count"],
+                    "response_rate_%": b["response_rate"],
+                    "is_missing": b["is_missing"]
+                })
+    
+        health_report_df = pd.DataFrame(rows)
+        return health_report_df

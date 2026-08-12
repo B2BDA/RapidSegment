@@ -917,7 +917,7 @@ class StrategicSegmentBuilder:
                     and re.fullmatch(r"\[\[[^\[\]]+\]\]", interval.strip()) is not None
                 )
                 if is_single_nested:
-                    cleaned = _strip_wrapping_quotes(cat_tokens[0])
+                    cleaned = _strip_wrapping_quotes(interval[1:-1])
                     sql_conditions.append(f"{col} = {_quote_sql_string(cleaned)}")
                     continue
                 if cat_tokens:

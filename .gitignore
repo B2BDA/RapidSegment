@@ -23,6 +23,7 @@ __pycache__/
 # Package Manager Locks & Temporary DBs (like your file-backed DuckDB storage)
 .uv/
 *.db
+*.duckdb
 
 # Files
 *.csv

@@ -98,7 +98,7 @@ class StrategicSegmentBuilder:
         naive_bins: int = 5 ,
         max_expansion_hops: int = 0,
         selection_metric: str = "iv",
-        expand_log_mode: str = "summary",  # "none" | "summary" | "full",
+        expand_log_mode: str = "summary",  # "none" | "summary" | "champion" | "full",
         db_path: Optional[str] = None,
         db_temp_dir: Optional[str] = None,
     ) -> None:
@@ -124,7 +124,11 @@ class StrategicSegmentBuilder:
             naive_bins: Number of quantile bins used when binning_method is 'naive'.
             selection_metric: Metric used to rank features for top_n_vars selection ("iv" or "response_rate").
             max_expansion_hops: Adjacent-bin merging hop distance limit (0 disables expansion).
-            expand_log_mode: Controls verbosity of adjacent-bin expansion logging ("none", "summary", "full").
+            expand_log_mode: Controls verbosity of adjacent-bin expansion logging ("none", "summary", "champion", "full").
+                - "none": No expansion logging.
+                - "summary": Show summary statistics of adjacent-bin expansions.
+                - "champion": Display champion segment with contenders in a formatted table.
+                - "full": Display summary plus detailed top expanded rules.
         """
         self.target = target
         cpu_count = os.cpu_count() or 1
@@ -156,7 +160,7 @@ class StrategicSegmentBuilder:
         self.naive_bins = naive_bins     
         self.max_expansion_hops = max(0, int(max_expansion_hops))
         self.selection_metric = selection_metric
-        self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "full") else "summary"   
+        self.expand_log_mode = expand_log_mode if expand_log_mode in ("none", "summary", "champion", "full") else "summary"   
         self._columns_types: Dict[str,str] = {}
         self._categorical_cols: set[str] = set()
         # Set up disk-backed DuckDB automatically if not provided
@@ -779,7 +783,7 @@ class StrategicSegmentBuilder:
                     }
 
         mode = getattr(self, "expand_log_mode", "summary")
-        if expansion_stats and mode != "none":
+        if expansion_stats and mode in ("summary", "full"):
             logger.info("🔀 Adjacent-bin expansion summary")
             logger.info(
                 f"   {'Combo':<42} {'#exp':>5}  {'Best Δevents':>12}  {'Best lift':>9}"
@@ -1367,7 +1371,11 @@ class StrategicSegmentBuilder:
                 r for r in all_candidate_rules
                 if "base_events" in r and r["rule"] != best_rule
             ]
-            if expanded_in_this_iter:
+            
+            expand_mode = getattr(self, "expand_log_mode", "summary")
+            should_show_champion = expand_mode in ("champion", "full") and expanded_in_this_iter
+            
+            if should_show_champion:
                 expanded_in_this_iter.sort(key=lambda x: self._get_sort_key(x), reverse=True)
                 top_exp = expanded_in_this_iter[:5]
         

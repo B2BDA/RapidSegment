@@ -22,6 +22,7 @@ from optbinning import OptimalBinning
 import pandas as pd
 import uuid
 import psutil
+import shutil
 
 # -----------------------------------------------------------------------------
 # Module-level configuration
@@ -81,9 +82,9 @@ class StrategicSegmentBuilder:
         target: str,
         n_jobs: int = -1,
         min_sample_size: int = 1000,
-        min_lift: float = 2.0,
-        min_events: int = 5,
-        top_n_vars: int = 20,
+        min_lift: float = 1.5,
+        min_events: int = 100,
+        top_n_vars: int = 15,
         max_segments: int = 10,
         max_feature_reuse: int = 1,
         param_grid: Optional[Dict[str, List[Any]]] = None,
@@ -93,12 +94,12 @@ class StrategicSegmentBuilder:
         enable_3way: bool = True,
         feature_groups: Optional[Dict[str, List[str]]] = None,
         ignore_features: Optional[List[str]] = None,
-        sort_priority: str = "lift_rate_count",  # or "count_lift_rate", "lift_rate_count", etc.
+        sort_priority: str = "rate_lift_count",
         binning_method: str = "optimal",  
         naive_bins: int = 5 ,
         max_expansion_hops: int = 0,
         selection_metric: str = "iv",
-        expand_log_mode: str = "summary",  # "none" | "summary" | "champion" | "full",
+        expand_log_mode: str = "none",
         db_path: Optional[str] = None,
         db_temp_dir: Optional[str] = None,
     ) -> None:
@@ -156,6 +157,7 @@ class StrategicSegmentBuilder:
         }
         self.sort_priority = sort_priority
         self.diagnostics_: List[Dict[str, Any]] = []
+        self.stop_reason: Optional[str] = None
         self.binning_method = binning_method  
         self.naive_bins = naive_bins     
         self.max_expansion_hops = max(0, int(max_expansion_hops))
@@ -164,12 +166,8 @@ class StrategicSegmentBuilder:
         self._columns_types: Dict[str,str] = {}
         self._categorical_cols: set[str] = set()
         # Set up disk-backed DuckDB automatically if not provided
-        if db_path is None or db_temp_dir is None:
-            self.db_path, self.db_temp_dir = setup_disk_backed_db("experiments")
-            logger.info(f"📂 Created disk-backed DB at: {self.db_path}")
-        else:
-            self.db_path = db_path
-            self.db_temp_dir = db_temp_dir
+        self.db_path = db_path
+        self.db_temp_dir = db_temp_dir
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -301,17 +299,26 @@ class StrategicSegmentBuilder:
 
                         case_clauses = []
                         for i in range(len(edges) - 1):
-                            lower, upper = edges[i], edges[i+1]
-                            lower_str = "-inf" if np.isinf(lower) and lower < 0 else str(lower)
-                            upper_str = "inf" if np.isinf(upper) and upper > 0 else str(upper)
+                            lower, upper = edges[i], edges[i + 1]
+                            lower_is_ninf = np.isinf(lower) and lower < 0
+                            upper_is_pinf = np.isinf(upper) and upper > 0
+
+                            # Human-readable label (strings are fine)
+                            lower_str = "-inf" if lower_is_ninf else str(lower)
+                            upper_str = "inf" if upper_is_pinf else str(upper)
                             label = f"[{lower_str}, {upper_str})"
 
-                            if np.isinf(lower) and lower < 0:
+                            if lower_is_ninf and upper_is_pinf:
+                                # Whole domain → every non-null value belongs here
+                                case_clauses.append(f'WHEN "{col}" IS NOT NULL THEN \'{label}\'')
+                            elif lower_is_ninf:
                                 case_clauses.append(f'WHEN "{col}" < {upper} THEN \'{label}\'')
-                            elif np.isinf(upper) and upper > 0:
+                            elif upper_is_pinf:
                                 case_clauses.append(f'WHEN "{col}" >= {lower} THEN \'{label}\'')
                             else:
-                                case_clauses.append(f'WHEN "{col}" >= {lower} AND "{col}" < {upper} THEN \'{label}\'')
+                                case_clauses.append(
+                                    f'WHEN "{col}" >= {lower} AND "{col}" < {upper} THEN \'{label}\''
+                                )
 
                         case_expr = f"""
                         CASE 
@@ -447,7 +454,10 @@ class StrategicSegmentBuilder:
                 logger.debug(f"Computation failed for {col}: {e}")
                 return col, 0.0, 0.0, None
             finally:
-                thread_con.close()
+                try:
+                    thread_con.close()
+                except Exception:
+                    pass
 
         results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_worker)(col) for col in eligible_cols
@@ -726,9 +736,9 @@ class StrategicSegmentBuilder:
                         "events": events,
                         "combo_vars": combo_key,
                        }
-                valid_results.append(entry)
-                if combo_key in per_combo_base:
-                    per_combo_base[combo_key].append(entry)
+                    valid_results.append(entry)
+                    if combo_key in per_combo_base:
+                        per_combo_base[combo_key].append(entry)
 
         valid_results = []
         chunk_size = 100
@@ -1029,6 +1039,7 @@ class StrategicSegmentBuilder:
         """
         logger.info("🚀 Starting hierarchical segment extraction...")
         # Reset all accumulated state so repeated calls produce independent results
+        self.stop_reason = None
         self.segments = []
         self.diagnostics_ = []
         self.feature_usage_counts = {}
@@ -1038,7 +1049,16 @@ class StrategicSegmentBuilder:
         abs_min_events = self.min_events
         abs_min_lift = self.min_lift
 
-        con = duckdb.connect(self.db_path)
+        auto_created_db = False
+        db_path = self.db_path
+        db_temp_dir = self.db_temp_dir
+
+        if db_path is None or db_temp_dir is None:
+            db_path, db_temp_dir = setup_disk_backed_db("experiments")
+            auto_created_db = True
+            logger.info(f"📂 Created temporary disk-backed DB at: {db_path}")
+
+        con = duckdb.connect(db_path)
 
         total_cores = os.cpu_count() or 1
         target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
@@ -1047,7 +1067,8 @@ class StrategicSegmentBuilder:
 
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
-        con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
+        if db_temp_dir:
+            con.execute(f"PRAGMA temp_directory='{db_temp_dir}';")
         con.execute("SET preserve_insertion_order = false;")
         
         logger.info(
@@ -1056,433 +1077,471 @@ class StrategicSegmentBuilder:
         )
         logger.info(f"📊 Sort priority: {self.sort_priority}")
         logger.info(f"📦 Binning method: {self.binning_method} (naive_bins={self.naive_bins})")
-        
-        con.register("input_data_view", data)
-        # Cast the target to DOUBLE up front so boolean targets work with AVG,
-        # and fail early with a clear message if the target column is missing.
-        cols_info_probe = con.execute("DESCRIBE input_data_view").fetchall()
-        probe_cols = {row[0] for row in cols_info_probe}
-        if self.target not in probe_cols:
-            raise ValueError(
-                f"Target column '{self.target}' not found in input data. "
-                f"Available columns: {sorted(probe_cols)}"
-            )
-        con.execute(
-            f'CREATE OR REPLACE TABLE current_df AS '
-            f'SELECT * REPLACE (CAST("{self.target}" AS DOUBLE) AS "{self.target}") '
-            f'FROM input_data_view'
-        )
-
-        cols_info = con.execute("DESCRIBE current_df").fetchall()
-        columns_types = {row[0]: row[1] for row in cols_info}
-        self._columns_types = columns_types
-        self._categorical_cols = {
-            col_name
-            for col_name, dtype in columns_types.items()
-            if self._resolve_optb_dtype(dtype) == "categorical"
-        }
-        all_cols = list(columns_types.keys())
-
-        if self.enable_diversity:
-            self._validate_feature_groups(all_cols)
-
-        eligible_cols = [
-            c for c in all_cols if c != self.target and c not in self.ignore_features
-        ]
-        self.feature_usage_counts = {col: 0 for col in eligible_cols}
-
-        if self.param_grid:
-            sizes = self.param_grid.get("min_sample_size", [self.min_sample_size]) or [self.min_sample_size]
-            lifts = self.param_grid.get("min_lift", [self.min_lift]) or [self.min_lift]
-            experiments = [
-                {"min_sample_size": s, "min_lift": l}
-                for s, l in product(sizes, lifts)
-            ]
-            logger.info(f"📊 Dynamic Grid Search Enabled: {len(experiments)} configurations.")
-        else:
-            experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
-
-        original_base_rate = con.execute(
-            f'SELECT AVG(CAST("{self.target}" AS DOUBLE)) FROM current_df'
-        ).fetchone()[0] or 0.0
-
-        logger.info(f"🔒 Locking Original Base Rate: {original_base_rate*100:.2f}%")
-
-        for i in range(1, self.max_segments + 1):
-            res = con.execute(
-                f'SELECT AVG(CAST("{self.target}" AS DOUBLE)), COUNT(*) FROM current_df'
-            ).fetchone()
-            current_base_rate, current_volume = res[0] or 0.0, res[1] or 0
-
-            # Guard the minimum-volume check against an empty experiments list in case
-            # a custom grid is passed with no valid values.
-            min_floor_volume = (
-                min(exp["min_sample_size"] for exp in experiments)
-                if experiments
-                else self.min_sample_size
-            )
-
-            if current_base_rate == 0 or current_volume < min_floor_volume:
-                logger.info(
-                    f"⏹️ Stopping: base_rate={current_base_rate}, volume={current_volume} < "
-                    f"min_floor={min_floor_volume}"
+        try:
+            con.register("input_data_view", data)
+            # Cast the target to DOUBLE up front so boolean targets work with AVG,
+            # and fail early with a clear message if the target column is missing.
+            cols_info_probe = con.execute("DESCRIBE input_data_view").fetchall()
+            probe_cols = {row[0] for row in cols_info_probe}
+            if self.target not in probe_cols:
+                raise ValueError(
+                    f"Target column '{self.target}' not found in input data. "
+                    f"Available columns: {sorted(probe_cols)}"
                 )
-                break
-
-            logger.info(
-                f"🔄 Iteration {i} | Remaining Volume: {current_volume:,} | "
-                f"Base Rate: {current_base_rate*100:.2f}%"
+            con.execute(
+                f'CREATE OR REPLACE TABLE current_df AS '
+                f'SELECT * REPLACE (CAST("{self.target}" AS DOUBLE) AS "{self.target}") '
+                f'FROM input_data_view'
             )
 
-            iv_ranking, precomputed_bins = self.compute_iv_ranking_and_bin(
-                con, eligible_cols, columns_types
-            )
+            cols_info = con.execute("DESCRIBE current_df").fetchall()
+            columns_types = {row[0]: row[1] for row in cols_info}
+            self._columns_types = columns_types
+            self._categorical_cols = {
+                col_name
+                for col_name, dtype in columns_types.items()
+                if self._resolve_optb_dtype(dtype) == "categorical"
+            }
+            all_cols = list(columns_types.keys())
 
-            if self.selection_metric == "response_rate":
-                current_score_map = {row["variable"]: row["max_rr"] for row in iv_ranking}
-            else:
-                current_score_map = {row["variable"]: row["iv"] for row in iv_ranking}
-                
-            top_n_variable_names = [r["variable"] for r in iv_ranking[:self.top_n_vars]]
-            iteration_snapshot = {}
-            for col in eligible_cols:
-                used_count = self.feature_usage_counts.get(col, 0)
-                current_score = current_score_map.get(col, 0.0)
-                
-                if used_count >= self.max_feature_reuse:
-                    status = "Excluded (Max Feature Reuse Exceeded)"
-                elif current_score <= 0.0:
-                    status = f"Excluded ({self.selection_metric.upper()} is Zero/Invalid)"
-                elif col not in top_n_variable_names:
-                    status = "Excluded (Outside Top N Features by Score)"
-                else:
-                    status = "Eligible for Combination Search"
-                    
-                iteration_snapshot[col] = {
-                    "metric_score": current_score,
-                    "metric_type": self.selection_metric,
-                    "times_used_previously": used_count,
-                    "status": status,
-                }
-                
-            self.diagnostics_.append(
-                {
-                    "iteration": i,
-                    "residual_volume": current_volume,
-                    "base_rate": current_base_rate,
-                    "features_state": iteration_snapshot,
-                    "winning_segment": None,
-                }
-            )
+            if self.enable_diversity:
+                self._validate_feature_groups(all_cols)
 
-            allowed_vars = [
-                row["variable"]
-                for row in iv_ranking
-                if self.feature_usage_counts.get(row["variable"], 0) < self.max_feature_reuse
+            eligible_cols = [
+                c for c in all_cols if c != self.target and c not in self.ignore_features
             ]
-            top_vars = allowed_vars[:self.top_n_vars]
-            if not top_vars:
-                logger.warning("⚠️ All eligible features exhausted. Aborting.")
-                break
+            self.feature_usage_counts = {col: 0 for col in eligible_cols}
 
-            raw_target_arr = con.execute(
-                f'SELECT "{self.target}" FROM current_df'
-            ).fetchnumpy()[self.target]
-
-            if isinstance(raw_target_arr, np.ma.MaskedArray):
-                clean_target_arr = raw_target_arr.filled(0)
+            if self.param_grid:
+                sizes = self.param_grid.get("min_sample_size", [self.min_sample_size]) or [self.min_sample_size]
+                lifts = self.param_grid.get("min_lift", [self.min_lift]) or [self.min_lift]
+                experiments = [
+                    {"min_sample_size": s, "min_lift": l}
+                    for s, l in product(sizes, lifts)
+                ]
+                logger.info(f"📊 Dynamic Grid Search Enabled: {len(experiments)} configurations.")
             else:
-                clean_target_arr = raw_target_arr
+                experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
 
-            binned_data = {self.target: clean_target_arr}
-            valid_vars = []
-            for v in top_vars:
-                if v in precomputed_bins and len(np.unique(precomputed_bins[v])) > 1:
-                    binned_data[v] = precomputed_bins[v]
-                    valid_vars.append(v)
-            if not valid_vars:
-                logger.warning("⚠️ No valid binned variables found. Stopping.")
-                break
+            original_base_rate = con.execute(
+                f'SELECT AVG(CAST("{self.target}" AS DOUBLE)) FROM current_df'
+            ).fetchone()[0] or 0.0
 
-            con.execute("DROP TABLE IF EXISTS binned_df")
-            # Materialize binned_data via a pandas DataFrame and register it with DuckDB
-            try:
-                binned_df_pd = pd.DataFrame(binned_data)
-                con.register("binned_data_df", binned_df_pd)
-                con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data_df")
-            except Exception:
-                # Fallback to previous direct table creation if DataFrame registration fails
-                con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
+            logger.info(f"🔒 Locking Original Base Rate: {original_base_rate*100:.2f}%")
 
-            global_min_sample = (
-                min(exp["min_sample_size"] for exp in experiments)
-                if experiments
-                else self.min_sample_size
-            )
-            global_min_lift = (
-                min(exp["min_lift"] for exp in experiments)
-                if experiments
-                else self.min_lift
-            )
-            
-            # Apply the current grid-search thresholds for this iteration so the candidate
-            # pool is filtered consistently. The original values are restored after the loop.
-            self.min_sample_size = global_min_sample
-            self.min_lift = global_min_lift
-            
-            all_candidate_rules: List[Dict[str, Any]] = []
-
-            # Level 1 (Singles)
-            res_1 = self._agg_combinations(con, [(c,) for c in valid_vars], original_base_rate)
-            valid_1way_vars = set()
-            if res_1:
-                valid_1way_vars = {c["combo_vars"][0] for c in res_1}
-                if self.enable_1way:
-                    all_candidate_rules.extend(res_1)
-
-            # Level 2 (Pairs)
-            valid_2way_sets = set()
-            if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
-                combos_2 = [c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)]
-                if combos_2:
-                    res_2 = self._agg_combinations(con, combos_2, original_base_rate)
-                    if res_2:
-                        valid_2way_sets = {frozenset(c["combo_vars"]) for c in res_2}
-                        if self.enable_2way:
-                            all_candidate_rules.extend(res_2)
-
-            # Level 3 (Triplets)
-            if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
-                combos_3 = [
-                    c for c in combinations(valid_1way_vars, 3)
-                    if self.is_diverse(c) and all(frozenset(p) in valid_2way_sets for p in combinations(c, 2))
-                ]
-                if combos_3:
-                    res_3 = self._agg_combinations(con, combos_3, original_base_rate)
-                    if res_3:
-                        all_candidate_rules.extend(res_3)
-
-            # Build a shortlist of candidates for each grid configuration and keep the top
-            # rule from each configuration for later raw validation against the real table.
-            grid_candidates: List[Dict[str, Any]] = []
-            for config in experiments:
-                valid_for_config = [
-                    r for r in all_candidate_rules
-                    if r["count"] >= config["min_sample_size"] and r["lift"] >= config["min_lift"]
-                ]
-                
-                if valid_for_config:
-                    valid_for_config.sort(key=lambda x: self._get_sort_key(x), reverse=True)
-                    top_match = valid_for_config[0].copy()
-                    top_match["grid_min_sample_size"] = config["min_sample_size"]
-                    top_match["grid_min_lift"] = config["min_lift"]
-                    grid_candidates.append(top_match)
-
-            if not grid_candidates:
-                logger.info("⏹️ No candidates cleared the grid. Stopping.")
-                break
-
-            grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
-
-            # Re-run the strongest candidates against the real residual table using SQL.
-            # This step enforces the hard constraints on actual data counts/events rather than
-            # only the binned approximation used during candidate generation.
-            selected_candidate = None
-            for candidate in grid_candidates:
-                rule_str = candidate["rule"]
-                sql_filter = self.parse_rule_to_sql(rule_str)
-                actual = con.execute(
-                    f'SELECT COUNT(*) AS cnt, SUM(CAST("{self.target}" AS DOUBLE)) AS evt '
-                    f'FROM current_df WHERE ({sql_filter})'
+            for i in range(1, self.max_segments + 1):
+                res = con.execute(
+                    f'SELECT AVG(CAST("{self.target}" AS DOUBLE)), COUNT(*) FROM current_df'
                 ).fetchone()
-                actual_cnt, actual_evt = actual[0], actual[1] or 0
-                actual_rate = (actual_evt / actual_cnt * 100.0) if actual_cnt > 0 else 0.0
-                actual_lift = (actual_rate / (original_base_rate * 100.0)) if original_base_rate > 0 else 0.0
+                current_base_rate, current_volume = res[0] or 0.0, res[1] or 0
 
-                if actual_cnt >= abs_min_sample_size and actual_evt >= abs_min_events and actual_lift >= abs_min_lift:
-                    selected_candidate = {
-                        **candidate,
-                        "sql_filter": sql_filter,
-                        "actual_count": actual_cnt,
-                        "actual_events": actual_evt,
-                    }
+                # Guard the minimum-volume check against an empty experiments list in case
+                # a custom grid is passed with no valid values.
+                min_floor_volume = (
+                    min(exp["min_sample_size"] for exp in experiments)
+                    if experiments
+                    else self.min_sample_size
+                )
+
+                if current_base_rate == 0 or current_volume < min_floor_volume:
+                    self.stop_reason = (
+                        f"Insufficient remaining volume ({current_volume:,}) or base rate is zero."
+                    )
+                    logger.info(
+                        f"⏹️ Stopping: base_rate={current_base_rate}, volume={current_volume} < "
+                        f"min_floor={min_floor_volume}"
+                    )
                     break
+
+                logger.info(
+                    f"🔄 Iteration {i} | Remaining Volume: {current_volume:,} | "
+                    f"Base Rate: {current_base_rate*100:.2f}%"
+                )
+
+                iv_ranking, precomputed_bins = self.compute_iv_ranking_and_bin(
+                    con, eligible_cols, columns_types
+                )
+
+                if self.selection_metric == "response_rate":
+                    current_score_map = {row["variable"]: row["max_rr"] for row in iv_ranking}
                 else:
-                    logger.debug(
-                        f"Candidate rejected by raw validation: {rule_str} -> "
-                        f"rows={actual_cnt}, events={actual_evt}"
+                    current_score_map = {row["variable"]: row["iv"] for row in iv_ranking}
+                    
+                top_n_variable_names = [r["variable"] for r in iv_ranking[:self.top_n_vars]]
+                iteration_snapshot = {}
+                for col in eligible_cols:
+                    used_count = self.feature_usage_counts.get(col, 0)
+                    current_score = current_score_map.get(col, 0.0)
+                    
+                    if used_count >= self.max_feature_reuse:
+                        status = "Excluded (Max Feature Reuse Exceeded)"
+                    elif current_score <= 0.0:
+                        status = f"Excluded ({self.selection_metric.upper()} is Zero/Invalid)"
+                    elif col not in top_n_variable_names:
+                        status = "Excluded (Outside Top N Features by Score)"
+                    else:
+                        status = "Eligible for Combination Search"
+                        
+                    iteration_snapshot[col] = {
+                        "metric_score": current_score,
+                        "metric_type": self.selection_metric,
+                        "times_used_previously": used_count,
+                        "status": status,
+                    }
+                    
+                self.diagnostics_.append(
+                    {
+                        "iteration": i,
+                        "residual_volume": current_volume,
+                        "base_rate": current_base_rate,
+                        "features_state": iteration_snapshot,
+                        "winning_segment": None,
+                    }
+                )
+
+                allowed_vars = [
+                    row["variable"]
+                    for row in iv_ranking
+                    if self.feature_usage_counts.get(row["variable"], 0) < self.max_feature_reuse
+                ]
+                top_vars = allowed_vars[:self.top_n_vars]
+                if not top_vars:
+                    self.stop_reason = "All eligible features exhausted or failed dynamic score threshold."
+                    logger.warning("⚠️ All eligible features exhausted. Aborting.")
+                    break
+
+                raw_target_arr = con.execute(
+                    f'SELECT "{self.target}" FROM current_df'
+                ).fetchnumpy()[self.target]
+
+                if isinstance(raw_target_arr, np.ma.MaskedArray):
+                    clean_target_arr = raw_target_arr.filled(0)
+                else:
+                    clean_target_arr = raw_target_arr
+
+                binned_data = {self.target: clean_target_arr}
+                valid_vars = []
+                for v in top_vars:
+                    if v in precomputed_bins and len(np.unique(precomputed_bins[v])) > 1:
+                        binned_data[v] = precomputed_bins[v]
+                        valid_vars.append(v)
+                if not valid_vars:
+                    self.stop_reason = "No features had valid binned variation to construct candidate rules."
+                    logger.warning("⚠️ No valid binned variables found. Stopping.")
+                    break
+
+                con.execute("DROP TABLE IF EXISTS binned_df")
+                # Materialize binned_data via a pandas DataFrame and register it with DuckDB
+                try:
+                    binned_df_pd = pd.DataFrame(binned_data)
+                    con.register("binned_data_df", binned_df_pd)
+                    con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data_df")
+                except Exception:
+                    # Fallback to previous direct table creation if DataFrame registration fails
+                    con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
+
+                global_min_sample = (
+                    min(exp["min_sample_size"] for exp in experiments)
+                    if experiments
+                    else self.min_sample_size
+                )
+                global_min_lift = (
+                    min(exp["min_lift"] for exp in experiments)
+                    if experiments
+                    else self.min_lift
+                )
+                
+                # Apply the current grid-search thresholds for this iteration so the candidate
+                # pool is filtered consistently. The original values are restored after the loop.
+                self.min_sample_size = global_min_sample
+                self.min_lift = global_min_lift
+                
+                all_candidate_rules: List[Dict[str, Any]] = []
+
+                # Level 1 (Singles)
+                res_1 = self._agg_combinations(con, [(c,) for c in valid_vars], original_base_rate)
+                valid_1way_vars = set()
+                if res_1:
+                    valid_1way_vars = {c["combo_vars"][0] for c in res_1}
+                    if self.enable_1way:
+                        all_candidate_rules.extend(res_1)
+
+                # Level 2 (Pairs)
+                valid_2way_sets = set()
+                if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
+                    combos_2 = [c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)]
+                    if combos_2:
+                        res_2 = self._agg_combinations(con, combos_2, original_base_rate)
+                        if res_2:
+                            valid_2way_sets = {frozenset(c["combo_vars"]) for c in res_2}
+                            if self.enable_2way:
+                                all_candidate_rules.extend(res_2)
+
+                # Level 3 (Triplets)
+                if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
+                    combos_3 = [
+                        c for c in combinations(valid_1way_vars, 3)
+                        if self.is_diverse(c) and all(frozenset(p) in valid_2way_sets for p in combinations(c, 2))
+                    ]
+                    if combos_3:
+                        res_3 = self._agg_combinations(con, combos_3, original_base_rate)
+                        if res_3:
+                            all_candidate_rules.extend(res_3)
+
+                # Build a shortlist of candidates for each grid configuration and keep the top
+                # rule from each configuration for later raw validation against the real table.
+                grid_candidates: List[Dict[str, Any]] = []
+                for config in experiments:
+                    valid_for_config = [
+                        r for r in all_candidate_rules
+                        if r["count"] >= config["min_sample_size"] and r["lift"] >= config["min_lift"]
+                    ]
+                    
+                    if valid_for_config:
+                        valid_for_config.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                        top_match = valid_for_config[0].copy()
+                        top_match["grid_min_sample_size"] = config["min_sample_size"]
+                        top_match["grid_min_lift"] = config["min_lift"]
+                        grid_candidates.append(top_match)
+
+                if not grid_candidates:
+                    self.stop_reason = "No candidate rules met the minimum grid thresholds (sample size / lift)."
+                    logger.info("⏹️ No candidates cleared the grid. Stopping.")
+                    break
+
+                grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                self.diagnostics_[-1]["candidate_funnel"] = {
+                    "total_candidates_before_grid": len(all_candidate_rules),
+                    "candidates_after_grid": len(grid_candidates),
+                }
+
+                # Re-run the strongest candidates against the real residual table using SQL.
+                # This step enforces the hard constraints on actual data counts/events rather than
+                # only the binned approximation used during candidate generation.
+                selected_candidate = None
+                closest_miss = None
+                for candidate in grid_candidates:
+                    rule_str = candidate["rule"]
+                    sql_filter = self.parse_rule_to_sql(rule_str)
+                    actual = con.execute(
+                        f'SELECT COUNT(*) AS cnt, SUM(CAST("{self.target}" AS DOUBLE)) AS evt '
+                        f'FROM current_df WHERE ({sql_filter})'
+                    ).fetchone()
+                    actual_cnt, actual_evt = actual[0], actual[1] or 0
+                    actual_rate = (actual_evt / actual_cnt * 100.0) if actual_cnt > 0 else 0.0
+                    actual_lift = (actual_rate / (original_base_rate * 100.0)) if original_base_rate > 0 else 0.0
+
+                    if actual_cnt >= abs_min_sample_size and actual_evt >= abs_min_events and actual_lift >= abs_min_lift:
+                        selected_candidate = {
+                            **candidate,
+                            "sql_filter": sql_filter,
+                            "actual_count": actual_cnt,
+                            "actual_events": actual_evt,
+                        }
+                        break
+                    else:
+                        # NEW CODE: 3B - Capture the highest-ranked failed candidate
+                        if closest_miss is None:
+                            closest_miss = {
+                                "rule": candidate["rule"],
+                                "gaps": {
+                                    "sample_size": {"actual": actual_cnt, "required": abs_min_sample_size, "ok": actual_cnt >= abs_min_sample_size},
+                                    "events": {"actual": actual_evt, "required": abs_min_events, "ok": actual_evt >= abs_min_events},
+                                    "lift": {"actual": actual_lift, "required": abs_min_lift, "ok": actual_lift >= abs_min_lift},
+                                }
+                            }
+                        
+                        logger.debug(
+                            f"Candidate rejected by raw validation: {rule_str} -> "
+                            f"rows={actual_cnt}, events={actual_evt}"
+                        )
+
+                if selected_candidate is None:
+                    self.diagnostics_[-1]["near_miss"] = closest_miss
+                    self.stop_reason = "Candidates existed but all failed raw SQL validation (sample size, min events, or lift)."
+                    logger.warning(
+                        f"⚠️ Iteration {i}: No candidate passed hard constraints. Stopping."
+                    )
+                    break
+
+                best_rule = selected_candidate["rule"]
+                best_raw_sql = selected_candidate["sql_filter"]
+                winning_combo = selected_candidate["combo_vars"]
+
+                actual_rate = (
+                    selected_candidate["actual_events"] / selected_candidate["actual_count"]
+                ) * 100.0
+                actual_lift = (
+                    actual_rate / (original_base_rate * 100.0) if original_base_rate > 0 else 0.0
+                )
+
+                for var in winning_combo:
+                    self.feature_usage_counts[var] = (
+                        self.feature_usage_counts.get(var, 0) + 1
+                    )
+                    logger.info(
+                        f"📌 Feature Usage Tracker Update -> '{var}' used count = "
+                        f"{self.feature_usage_counts[var]}"
                     )
 
-            if selected_candidate is None:
-                logger.warning(
-                    f"⚠️ Iteration {i}: No candidate passed hard constraints. Stopping."
+                self.segments.append(
+                    {
+                        "segment_id": i,
+                        "rule_string": best_rule,
+                        "sql_filter": best_raw_sql,
+                        "count": int(selected_candidate["actual_count"]),
+                        "rate": float(actual_rate),
+                        "lift": float(actual_lift),
+                        "meta_applied_sample_size": int(
+                            selected_candidate["grid_min_sample_size"]
+                        ),
+                        "meta_applied_min_lift": float(
+                            selected_candidate["grid_min_lift"]
+                        ),
+                    }
                 )
-                break
 
-            best_rule = selected_candidate["rule"]
-            best_raw_sql = selected_candidate["sql_filter"]
-            winning_combo = selected_candidate["combo_vars"]
-
-            actual_rate = (
-                selected_candidate["actual_events"] / selected_candidate["actual_count"]
-            ) * 100.0
-            actual_lift = (
-                actual_rate / (original_base_rate * 100.0) if original_base_rate > 0 else 0.0
-            )
-
-            for var in winning_combo:
-                self.feature_usage_counts[var] = (
-                    self.feature_usage_counts.get(var, 0) + 1
-                )
                 logger.info(
-                    f"📌 Feature Usage Tracker Update -> '{var}' used count = "
-                    f"{self.feature_usage_counts[var]}"
+                    f"✅ Segment {i} Captured (Size Floor: "
+                    f"{selected_candidate['grid_min_sample_size']} | "
+                    f"Lift Floor: {selected_candidate['grid_min_lift']}): "
+                    f"rows={selected_candidate['actual_count']}, "
+                    f"events={selected_candidate['actual_events']}, "
+                    f"lift={actual_lift:.2f}\n"
+                    f"  Rule: {best_rule}\n"
+                    f"  SQL: {best_raw_sql}"
                 )
 
-            self.segments.append(
-                {
-                    "segment_id": i,
-                    "rule_string": best_rule,
-                    "sql_filter": best_raw_sql,
-                    "count": int(selected_candidate["actual_count"]),
-                    "rate": float(actual_rate),
-                    "lift": float(actual_lift),
-                    "meta_applied_sample_size": int(
-                        selected_candidate["grid_min_sample_size"]
-                    ),
-                    "meta_applied_min_lift": float(
-                        selected_candidate["grid_min_lift"]
-                    ),
-                }
-            )
-
-            logger.info(
-                f"✅ Segment {i} Captured (Size Floor: "
-                f"{selected_candidate['grid_min_sample_size']} | "
-                f"Lift Floor: {selected_candidate['grid_min_lift']}): "
-                f"rows={selected_candidate['actual_count']}, "
-                f"events={selected_candidate['actual_events']}, "
-                f"lift={actual_lift:.2f}\n"
-                f"  Rule: {best_rule}\n"
-                f"  SQL: {best_raw_sql}"
-            )
-
-            expanded_in_this_iter = [
-                r for r in all_candidate_rules
-                if "base_events" in r and r["rule"] != best_rule
-            ]
+                expanded_in_this_iter = [
+                    r for r in all_candidate_rules
+                    if "base_events" in r and r["rule"] != best_rule
+                ]
+                
+                expand_mode = getattr(self, "expand_log_mode", "summary")
+                should_show_champion = expand_mode in ("champion", "full") and expanded_in_this_iter
+                
+                if should_show_champion:
+                    expanded_in_this_iter.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                    top_exp = expanded_in_this_iter[:5]
             
-            expand_mode = getattr(self, "expand_log_mode", "summary")
-            should_show_champion = expand_mode in ("champion", "full") and expanded_in_this_iter
+                    logger.info("📊 Top adjacent-merge candidates vs final champion")
+                    logger.info(
+                        f"   {'Rank':<5} {'Type':<10} {'Lift':>6} {'Rate%':>7} {'Count':>8} {'Events':>8}  Rule"
+                    )
+                    logger.info("   " + "-" * 90)
             
-            if should_show_champion:
-                expanded_in_this_iter.sort(key=lambda x: self._get_sort_key(x), reverse=True)
-                top_exp = expanded_in_this_iter[:5]
-        
-                logger.info("📊 Top adjacent-merge candidates vs final champion")
-                logger.info(
-                    f"   {'Rank':<5} {'Type':<10} {'Lift':>6} {'Rate%':>7} {'Count':>8} {'Events':>8}  Rule"
-                )
-                logger.info("   " + "-" * 90)
-        
-                logger.info(
-                    f"   {'★':<5} {'CHAMPION':<10} "
-                    f"{actual_lift:>6.2f}x {actual_rate:>6.1f}% "
-                    f"{selected_candidate['actual_count']:>8} "
-                    f"{selected_candidate['actual_events']:>8.0f}  "
-                    f"{best_rule}"
-                )
-        
-                for idx, e in enumerate(top_exp, 1):
-                    champ_key = self._get_sort_key({
-                        "lift": actual_lift,
-                        "rate": actual_rate,
-                        "count": selected_candidate["actual_count"],
-                        "events": selected_candidate["actual_events"],
-                    })    
-                    cand_key = self._get_sort_key(e)
-        
-                    if cand_key > champ_key:
-                        reason = "would have beaten champion (but failed raw validation)"
-                    else:
-                        _dim_order = {
-                            "lift_count_rate":   ["lift", "count", "rate"],
-                            "count_lift_rate":   ["count", "lift", "rate"],
-                            "rate_lift_count":   ["rate", "lift", "count"],
-                            "lift_rate_count":   ["lift", "rate", "count"],
-                            "count_rate_lift":   ["count", "rate", "lift"],
-                            "rate_count_lift":   ["rate", "count", "lift"],
-                            "events_lift_rate":  ["events", "lift", "rate"],
-                            "events_rate_lift":  ["events", "rate", "lift"],
-                            "lift_events_rate":  ["lift", "events", "rate"],
-                            "rate_events_lift":  ["rate", "events", "lift"],
-                            "events_count_rate": ["events", "count", "rate"],
-                            "events_rate_count": ["events", "rate", "count"],
-                            "count_events_rate": ["count", "events", "rate"],
-                            "rate_events_count": ["rate", "events", "count"],
-                        }
-                        priority_order = _dim_order.get(
-                            self.sort_priority, ["lift", "rate", "count"])
-                        champ_vals = {
+                    logger.info(
+                        f"   {'★':<5} {'CHAMPION':<10} "
+                        f"{actual_lift:>6.2f}x {actual_rate:>6.1f}% "
+                        f"{selected_candidate['actual_count']:>8} "
+                        f"{selected_candidate['actual_events']:>8.0f}  "
+                        f"{best_rule}"
+                    )
+            
+                    for idx, e in enumerate(top_exp, 1):
+                        champ_key = self._get_sort_key({
                             "lift": actual_lift,
                             "rate": actual_rate,
                             "count": selected_candidate["actual_count"],
                             "events": selected_candidate["actual_events"],
-                        }
-                        cand_vals = {
-                            "lift": e["lift"],
-                            "rate": e["rate"],
-                            "count": e["count"],
-                            "events": e["events"],
-                        }
-                        reason = "ranked lower by sort_priority"
-                        for dim in priority_order:
-                            if cand_vals[dim] < champ_vals[dim]:
-                                label = {
-                                    "lift": "lower lift",
-                                    "count": "smaller count",
-                                    "rate": "lower rate",
-                                    "events": "fewer events",
-                                }[dim]
-                                reason = (
-                                    f"{label} ({cand_vals[dim]:.2f} < {champ_vals[dim]:.2f})"
-                                )
-                                break
-                            elif cand_vals[dim] > champ_vals[dim]:
-                                break
+                        })    
+                        cand_key = self._get_sort_key(e)
             
-                    logger.info(
-                        f"   {idx:<5} {'expanded':<10} "
-                        f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
-                        f"{e['count']:>8} {e['events']:>8.0f}  "
-                        f"{e['rule']}  → {reason}"
-                    )
+                        if cand_key > champ_key:
+                            reason = "would have beaten champion (but failed raw validation)"
+                        else:
+                            _dim_order = {
+                                "lift_count_rate":   ["lift", "count", "rate"],
+                                "count_lift_rate":   ["count", "lift", "rate"],
+                                "rate_lift_count":   ["rate", "lift", "count"],
+                                "lift_rate_count":   ["lift", "rate", "count"],
+                                "count_rate_lift":   ["count", "rate", "lift"],
+                                "rate_count_lift":   ["rate", "count", "lift"],
+                                "events_lift_rate":  ["events", "lift", "rate"],
+                                "events_rate_lift":  ["events", "rate", "lift"],
+                                "lift_events_rate":  ["lift", "events", "rate"],
+                                "rate_events_lift":  ["rate", "events", "lift"],
+                                "events_count_rate": ["events", "count", "rate"],
+                                "events_rate_count": ["events", "rate", "count"],
+                                "count_events_rate": ["count", "events", "rate"],
+                                "rate_events_count": ["rate", "events", "count"],
+                            }
+                            priority_order = _dim_order.get(
+                                self.sort_priority, ["lift", "rate", "count"])
+                            champ_vals = {
+                                "lift": actual_lift,
+                                "rate": actual_rate,
+                                "count": selected_candidate["actual_count"],
+                                "events": selected_candidate["actual_events"],
+                            }
+                            cand_vals = {
+                                "lift": e["lift"],
+                                "rate": e["rate"],
+                                "count": e["count"],
+                                "events": e["events"],
+                            }
+                            reason = "ranked lower by sort_priority"
+                            for dim in priority_order:
+                                if cand_vals[dim] < champ_vals[dim]:
+                                    label = {
+                                        "lift": "lower lift",
+                                        "count": "smaller count",
+                                        "rate": "lower rate",
+                                        "events": "fewer events",
+                                    }[dim]
+                                    reason = (
+                                        f"{label} ({cand_vals[dim]:.2f} < {champ_vals[dim]:.2f})"
+                                    )
+                                    break
+                                elif cand_vals[dim] > champ_vals[dim]:
+                                    break
+                
+                        logger.info(
+                            f"   {idx:<5} {'expanded':<10} "
+                            f"{e['lift']:>6.2f}x {e['rate']:>6.1f}% "
+                            f"{e['count']:>8} {e['events']:>8.0f}  "
+                            f"{e['rule']}  → {reason}"
+                        )
 
-            self.diagnostics_[-1]["winning_segment"] = {
-                "rule": best_rule,
-                "sql_filter": best_raw_sql,
-                "variables_used": list(winning_combo),
-                "lift": actual_lift,
-                "count": int(selected_candidate["actual_count"]),
-            }
+                self.diagnostics_[-1]["winning_segment"] = {
+                    "rule": best_rule,
+                    "sql_filter": best_raw_sql,
+                    "variables_used": list(winning_combo),
+                    "lift": actual_lift,
+                    "count": int(selected_candidate["actual_count"]),
+                }
 
-            con.execute(
-                f"""
-                CREATE TABLE temp_residual AS
-                SELECT * FROM current_df
-                WHERE NOT ({best_raw_sql}) OR ({best_raw_sql}) IS NULL
-            """
-            )
-            con.execute("DROP TABLE current_df")
-            con.execute("ALTER TABLE temp_residual RENAME TO current_df")
+                con.execute(
+                    f"""
+                    CREATE TABLE temp_residual AS
+                    SELECT * FROM current_df
+                    WHERE NOT ({best_raw_sql}) OR ({best_raw_sql}) IS NULL
+                """
+                )
+                con.execute("DROP TABLE current_df")
+                con.execute("ALTER TABLE temp_residual RENAME TO current_df")
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+            if auto_created_db:
+                if os.path.exists(db_path):
+                    try:
+                        os.remove(db_path)
+                    except Exception as e:
+                        logger.debug(f"Cleanup failed for {db_path}: {e}")
+                if os.path.exists(db_temp_dir):
+                    try:
+                        shutil.rmtree(db_temp_dir)
+                    except Exception as e:
+                        logger.debug(f"Cleanup failed for {db_temp_dir}: {e}")
 
         self.min_sample_size = abs_min_sample_size
         self.min_events = abs_min_events
         self.min_lift = abs_min_lift 
-        try:
-            con.close()
-        except Exception:
-            pass
+        if not self.stop_reason and len(self.segments) == self.max_segments:
+            self.stop_reason = f"Reached max_segments limit ({self.max_segments})."
         logger.info("🏁 Extraction complete.")
         return self.segments
 
@@ -1494,7 +1553,10 @@ class StrategicSegmentBuilder:
             return []
 
         logger.info("📊 Evaluating final hierarchical coverage on original data...")
-        con = duckdb.connect(":memory:")
+        target_db = self.db_path if self.db_path else ":memory:"
+        con = duckdb.connect(target_db)
+        if self.db_temp_dir and os.path.exists(self.db_temp_dir):
+            con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
         con.register("input_data_view", original_data)
         con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view")
 
@@ -1589,6 +1651,72 @@ class StrategicSegmentBuilder:
                     f"(Variables: {winner['variables_used']})"
                 )
         print("=" * 80)
+        
+    def explain_no_segments(self) -> str:
+        """
+        Produces a human-readable diagnostic report explaining why
+        extract_segments() returned zero segments or stopped early.
+        """
+        if not self.diagnostics_:
+            if self.stop_reason:
+                return f"Extraction produced 0 segment(s).\nStop reason: {self.stop_reason}"
+            return "No diagnostics available -- call extract_segments() first."
+
+        lines: List[str] = []
+        n_found = len(self.segments)
+        last = self.diagnostics_[-1]
+
+        lines.append("=" * 80)
+        lines.append("SEGMENT EXTRACTION DIAGNOSTIC REPORT")
+        lines.append("=" * 80)
+        lines.append(f"Segments Extracted : {n_found} / {self.max_segments}")
+        lines.append(f"Iterations Run     : {len(self.diagnostics_)}")
+        lines.append(f"Stop Reason        : {self.stop_reason or 'Unknown'}")
+        lines.append("-" * 80)
+
+        # Configured thresholds
+        lines.append("Active Constraints:")
+        lines.append(f"  - min_sample_size : {self.min_sample_size:,}")
+        lines.append(f"  - min_lift        : {self.min_lift:.2f}x")
+        lines.append(f"  - min_events      : {self.min_events}")
+        lines.append(f"  - selection_metric: {self.selection_metric}")
+        lines.append("")
+
+        # Feature eligibility snapshot
+        features_state = last.get("features_state", {})
+        if features_state:
+            status_counts: Dict[str, int] = {}
+            for v in features_state.values():
+                status_counts[v["status"]] = status_counts.get(v["status"], 0) + 1
+
+            lines.append(f"Feature Eligibility Summary (Iteration {last['iteration']}):")
+            for status, cnt in sorted(status_counts.items(), key=lambda x: -x[1]):
+                lines.append(f"  - {cnt:<3} feature(s): {status}")
+            lines.append("")
+
+        # Candidate generation funnel
+        funnel = last.get("candidate_funnel")
+        if funnel:
+            lines.append(f"Candidate Funnel (Iteration {last['iteration']}):")
+            lines.append(f"  - 1-way candidates passing base criteria : {funnel.get('1way_candidates', 0):,}")
+            lines.append(f"  - 2-way candidates passing base criteria : {funnel.get('2way_candidates', 0):,}")
+            lines.append(f"  - 3-way candidates passing base criteria : {funnel.get('3way_candidates', 0):,}")
+            lines.append(f"  - Total candidates before grid search   : {funnel.get('total_candidates_before_grid', 0):,}")
+            lines.append(f"  - Candidates clearing grid filter       : {funnel.get('candidates_after_grid', 0):,}")
+            lines.append("")
+
+        # Closest near miss that failed raw SQL evaluation
+        near_miss = last.get("near_miss")
+        if near_miss:
+            lines.append("Closest Candidate Reject (Failed Raw Validation):")
+            lines.append(f"  Rule: {near_miss['rule']}")
+            for dim, info in near_miss["gaps"].items():
+                status = "OK" if info["ok"] else "FAIL"
+                lines.append(f"    • {dim:<12}: actual={info['actual']:.4g} | required={info['required']:.4g} [{status}]")
+            lines.append("")
+
+        lines.append("=" * 80)
+        return "\n".join(lines)
 
     def generate_feature_health_report(
         self, original_data: Any, features: List[str]
@@ -1598,7 +1726,7 @@ class StrategicSegmentBuilder:
         """
         if not features:
             logger.warning("⚠️ No features provided for health report generation.")
-            return {}
+            return pd.DataFrame()
 
         unique_features = list(dict.fromkeys(features))
 
@@ -1607,7 +1735,10 @@ class StrategicSegmentBuilder:
             f"{unique_features}"
         )
 
-        con = duckdb.connect(":memory:")
+        target_db = self.db_path if self.db_path else ":memory:"
+        con = duckdb.connect(target_db)
+        if self.db_temp_dir and os.path.exists(self.db_temp_dir):
+            con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
         con.register("input_data_view", original_data)
         con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
 

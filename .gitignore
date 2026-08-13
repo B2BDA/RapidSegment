@@ -26,7 +26,6 @@ __pycache__/
 *.duckdb
 
 # Files
-*.csv
 *.log
 *.parquet
 *.json

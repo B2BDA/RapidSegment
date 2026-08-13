@@ -34,13 +34,14 @@
 
 ## ✨ Features
 
-- **🔎 Automated Rule Discovery** – Uses Optimal Binning + Apriori pruning to find multi‑way (1‑, 2‑, 3‑way) conditions that maximise lift and volume.
+- **🔎 Automated Rule Discovery** – Uses Optimal Binning (or fast naive quantile binning) + Apriori pruning to find multi‑way (1‑, 2‑, 3‑way) conditions that maximise lift and volume.
 - **🧩 Hierarchical Segments** – Extracts mutually exclusive rules sequentially on a shrinking residual dataset, ensuring clean portfolio decomposition.
-- **⚡ Hyper‑Efficient** – Leverages **DuckDB** for vectorised SQL aggregations and **NumPy** (or DuckDB’s native quantiles) for blazing‑fast scoring.
+- **🔀 Adjacent-Bin Expansion** – Optionally merges neighbouring bins (`max_expansion_hops`) to recover higher-event rules that pure single-bin candidates miss.
+- **⚡ Hyper‑Efficient & Out-of-Core** – Leverages **DuckDB** (disk-backed by default) for vectorised SQL aggregations; spills to disk so large datasets fit in limited RAM.
 - **☁️ BigQuery Ready** – Optional feature screening runs natively inside Google BigQuery, downloading only the most predictive columns.
 - **📦 Production‑Ready Outputs** – Exports pure ANSI SQL filters and a JSON scorecard with decile thresholds, ready for deployment.
 - **📊 Transparent Weighting** – Uses the segment response rate to compute intuitive integer weights, while retaining lift, response rate, and capture rate for each segment.
-- **🔬 Audit Trail** – Built‑in diagnostic (`explain_feature_journey`) to trace any feature’s lifecycle through the extraction process.
+- **🔬 Full Audit Trail** – `explain_feature_journey`, `explain_no_segments`, and `generate_feature_health_report` for complete diagnostics.
 
 ---
 
@@ -97,14 +98,16 @@ builder = StrategicSegmentBuilder(
     top_n_vars=15,
     max_segments=5,
     max_feature_reuse=1,
-    param_grid={"min_sample_size": [1000,2500,5000], "min_lift": [2.0,3.5,5.0]},
+    param_grid={"min_sample_size": [1000, 2500, 5000], "min_lift": [1.5, 2.0, 3.0]},
     enable_diversity=True,
     feature_groups={
         "delinquency": ["max_dpd_12m", "risk_segment"],
         "utilization": ["utilization_avg_3m"]
     },
     ignore_features=["cust_id"],
-    sort_priority="lift_rate_count"
+    sort_priority="rate_lift_count",   # current default
+    binning_method="optimal",          # or "naive"
+    max_expansion_hops=1,              # enable adjacent-bin expansion
 )
 
 # 3. Extract hierarchical segments
@@ -165,7 +168,10 @@ flowchart LR
 ### 🔍 `StrategicSegmentBuilder`
 - **Purpose**: The core segmentation engine. It discovers high‑lift rules using Optimal Binning + Apriori pruning + grid search.
 - **Outputs**: A list of segments, each with a pure ANSI SQL `WHERE` clause, plus metrics (count, rate, lift).
-- **Unique Feature**: Built‑in diagnostic (`explain_feature_journey`) to audit feature usage across iterations.
+- **Diagnostics**
+  - `explain_feature_journey(feature)` – full audit trail of a feature across iterations.
+  - `explain_no_segments()` – human-readable report explaining why extraction stopped early or returned zero segments.
+  - `generate_feature_health_report(data, features)` – DuckDB-native bin-level health report (counts, events, response rate, missing flag).
 
 ### 📊 `StrategicSegmentScore`
 - **Purpose**: Converts binary segment flags into a weighted scorecard with decile thresholds.
@@ -267,6 +273,31 @@ flowchart TD
 ### 1. Feature Ranking & Binning
 Optimal Binning (via `optbinning`) computes the Information Value (IV) for each feature, automatically handling categorical and numerical types. Only the top `top_n_vars` features proceed.
 
+### Naive Binning (Fast Quantile Path)
+
+When `binning_method="naive"`, the engine skips OptBinning and builds bins directly inside DuckDB:
+
+**Numerical features**
+- Compute `naive_bins` quantiles with `QUANTILE_CONT`.
+- Force the outermost edges to `-∞` and `+∞`.
+- Assign every row to a half-open interval: `[lower, upper)`.
+- Nulls go into a dedicated `Missing` bin.
+
+**Categorical features**
+- Each distinct value becomes its own bin: `[value]`.
+- Null / empty / “None” / “nan” values are grouped into `Missing`.
+
+**Why it exists**
+- Extremely fast on large data (pure SQL, no Python loops).
+- Produces stable, equal-frequency bins that are easy to interpret.
+- Works seamlessly with **adjacent-bin expansion** (`max_expansion_hops > 0`), which can later merge neighbouring bins to recover higher-event rules.
+
+**Trade-off**
+- Optimal Binning usually finds slightly more predictive cut-points.
+- Naive binning is preferred when speed or simplicity matters more than maximal IV.
+
+Both paths feed the same downstream pipeline (IV ranking → Apriori → expansion → champion selection).
+
 ### 2. Apriori Pruning
 The engine evaluates combinations in a layered fashion:
 
@@ -339,18 +370,25 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `target` | `str` | **Required** | Binary target column name. |
-| `n_jobs` | `int` | `-1` | Number of parallel workers. |
-| `min_sample_size` | `int` | `1000` | Minimum rows for a rule. |
-| `min_lift` | `float` | `2.0` | Minimum lift ratio. |
-| `min_events` | `int` | `5` | Minimum positive events. |
-| `top_n_vars` | `int` | `20` | Number of top‑IV features to consider. |
+| `n_jobs` | `int` | `-1` | Parallel workers for IV/binning (`-1` = all but one core). |
+| `min_sample_size` | `int` | `1000` | Absolute minimum rows for a valid rule. |
+| `min_lift` | `float` | `1.5` | Absolute minimum lift (hard constraint). |
+| `min_events` | `int` | `100` | Minimum positive events for a valid rule. |
+| `top_n_vars` | `int` | `15` | Number of top features passed to the Apriori engine. |
 | `max_segments` | `int` | `10` | Maximum segments to extract. |
-| `max_feature_reuse` | `int` | `1` | How many times a feature can appear. |
-| `enable_diversity` | `bool` | `False` | Prevent same‑group feature combinations. |
-| `enable_1way/2way/3way` | `bool` | `True` | Toggle rule complexity levels. |
-| `feature_groups` | `dict` | `{}` | Business‑category mapping for diversity. |
-| `ignore_features` | `list` | `[]` | Columns to drop before processing. |
-| `sort_priority` | `STR` | `lift_count_rate` | Order in which rules will ranked and selected. Sample capture heavy/Response Rate Heavy/Lift Heavy. |
+| `max_feature_reuse` | `int` | `1` | Max times any single feature may appear across segments. |
+| `param_grid` | `dict` | `{}` | Optional grid of `{min_sample_size, min_lift}` to sweep. |
+| `enable_diversity` | `bool` | `False` | Block combinations that mix features from the same group. |
+| `enable_1way` / `enable_2way` / `enable_3way` | `bool` | `True` | Toggle 1-, 2-, and 3-way rules. |
+| `feature_groups` | `dict` | `{}` | Business-category → column list (used by diversity). |
+| `ignore_features` | `list` | `[]` | Columns to exclude before IV calculation. |
+| `sort_priority` | `str` | `"rate_lift_count"` | Ranking key for champion selection (many variants supported). |
+| `binning_method` | `str` | `"optimal"` | `"optimal"` (OptBinning) or `"naive"` (quantile bins). |
+| `naive_bins` | `int` | `5` | Number of quantile bins when `binning_method="naive"`. |
+| `max_expansion_hops` | `int` | `0` | Adjacent-bin merge distance (0 = disabled). |
+| `selection_metric` | `str` | `"iv"` | Rank features by `"iv"` or `"response_rate"`. |
+| `expand_log_mode` | `str` | `"none"` | Expansion logging: `"none"` \| `"summary"` \| `"champion"` \| `"full"`. |
+| `db_path` / `db_temp_dir` | `str` | `None` | Optional explicit DuckDB file + temp dir (auto-created otherwise). |
 
 **Output** – list of dicts with keys: `segment_id`, `rule_string`, `sql_filter`, `count`, `rate`, `lift`, `meta_applied_sample_size`, `meta_applied_min_lift`.
 

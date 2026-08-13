@@ -442,7 +442,7 @@ This project is licensed under the MIT License – see the [LICENSE](LICENSE) fi
 
 ---
 
-**Built with ❤️ by Bishwarup Biswas, Gemini & DeepSeek.**  
+**Built with ❤️ by Bishwarup Biswas**  
 Special Thanks to Mr. [Guillermo Navas Palencia](https://github.com/guillermo-navas-palencia)  for creating [Optbinning](https://github.com/guillermo-navas-palencia/optbinning) library.
 
 _Independent, open‑source, and ready for production._

@@ -95,7 +95,8 @@ class StrategicSegmentBuilder:
         feature_groups: Optional[Dict[str, List[str]]] = None,
         ignore_features: Optional[List[str]] = None,
         sort_priority: str = "rate_lift_count",
-        binning_method: str = "optimal_cart",  # "naive" | "optimal_cart" | "optimal_quantile" | "optimal" (alias of cart)        naive_bins: int = 5 ,
+        binning_method: str = "optimal_cart",  # "naive" | "optimal_cart" | "optimal_quantile" | "optimal" (alias of cart)        
+        naive_bins: int = 5 ,
         max_expansion_hops: int = 0,
         selection_metric: str = "iv",
         expand_log_mode: str = "none",

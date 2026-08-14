@@ -419,6 +419,15 @@ class StrategicSegmentBuilder:
                     # (CART) can split differently when tied samples arrive in a
                     # different order, which changes bins/IV and cascades into
                     # different segments across runs.
+                    #
+                    # IMPORTANT: only the *fitting* input is sorted. The transform
+                    # below must run on the ORIGINAL (unsorted) arrays so the
+                    # returned bin labels stay aligned with "__rs_row_id" / the
+                    # row order of current_df. Otherwise binned_df pairs the wrong
+                    # target values with the wrong bin labels, corrupting both the
+                    # event counts of 1-way rules and the row alignment of 2/3-way
+                    # rules (which is what produced spurious candidates whose SQL
+                    # re-validation then failed against the real table).
                     try:
                         col_arr = np.asarray(col_arr)
                         target_arr = np.asarray(target_arr)
@@ -430,15 +439,16 @@ class StrategicSegmentBuilder:
                         else:
                             col_as_str = col_arr.astype(str)
                             order = np.lexsort((target_arr, col_as_str))
-                        col_arr = col_arr[order]
-                        target_arr = target_arr[order]
+                        col_fit = col_arr[order]
+                        target_fit = target_arr[order]
                     except Exception:
-                        pass
+                        col_fit = col_arr
+                        target_fit = target_arr
 
                     # Fit an Optimal Binning model to the current feature/target pair so we can
                     # create monotonic, high-signal bins without relying on a fixed quantile grid.
                     optb = OptimalBinning(name=col, dtype=dtype)
-                    optb.fit(col_arr, target_arr)
+                    optb.fit(col_fit, target_fit)
 
                     bin_table = optb.binning_table.build()
                     iv_val = float(bin_table["IV"].values[-1])
@@ -874,6 +884,11 @@ class StrategicSegmentBuilder:
         parts = [p.strip() for p in rule_str.split("&")]
         sql_conditions: List[str] = []
 
+        def _quote_sql_ident(ident: str) -> str:
+            # Quote every emitted column identifier so DuckDB reserved words
+            # (e.g. "default") and exotic column names do not break the predicate.
+            return '"' + str(ident).replace('"', '""') + '"'
+
         def _quote_sql_string(val: Any) -> str:
             txt = str(val)
             # escape single quotes for SQL and wrap in single quotes
@@ -948,10 +963,10 @@ class StrategicSegmentBuilder:
                     range_conds = []
                     if overall_lower.lower() != "-inf":
                         op = ">=" if overall_lower_char == "[" else ">"
-                        range_conds.append(f"{col} {op} {overall_lower}")
+                        range_conds.append(f"{_quote_sql_ident(col)} {op} {overall_lower}")
                     if overall_upper.lower() != "inf":
                         op = "<=" if overall_upper_char == "]" else "<"
-                        range_conds.append(f"{col} {op} {overall_upper}")
+                        range_conds.append(f"{_quote_sql_ident(col)} {op} {overall_upper}")
         
                     if range_conds:
                         sql_conditions.append(" AND ".join(range_conds))
@@ -972,13 +987,13 @@ class StrategicSegmentBuilder:
                 )
                 if is_single_nested:
                     cleaned = _strip_wrapping_quotes(interval[1:-1])
-                    sql_conditions.append(f"{col} = {_quote_sql_string(cleaned)}")
+                    sql_conditions.append(f"{_quote_sql_ident(col)} = {_quote_sql_string(cleaned)}")
                     continue
                 if cat_tokens:
                     cleaned_items = [_strip_wrapping_quotes(t) for t in cat_tokens]
                     formatted_items = ", ".join(_quote_sql_string(item) for item in cleaned_items if item)
                     if formatted_items:
-                        sql_conditions.append(f"{col} IN ({formatted_items})")
+                        sql_conditions.append(f"{_quote_sql_ident(col)} IN ({formatted_items})")
                     continue
         
             # 2. Explicit Categoricals
@@ -1028,12 +1043,12 @@ class StrategicSegmentBuilder:
                     ]
                 )
                 if formatted_items:
-                    sql_conditions.append(f"{col} IN ({formatted_items})")
+                    sql_conditions.append(f"{_quote_sql_ident(col)} IN ({formatted_items})")
                 continue
-        
+
             # 3. Special or Missing values
             if interval in ["Special", "Missing"]:
-                sql_conditions.append(f"{col} IS NULL")
+                sql_conditions.append(f"{_quote_sql_ident(col)} IS NULL")
                 continue
         
             # 4. Standard Intervals [lo, hi) or Single Bracket Values [val]
@@ -1045,7 +1060,7 @@ class StrategicSegmentBuilder:
                         raw_items = [_strip_wrapping_quotes(x) for x in inner.split(",") if x.strip()]
                         formatted_items = ", ".join(_quote_sql_string(item) for item in raw_items)
                         if formatted_items:
-                            sql_conditions.append(f"{col} IN ({formatted_items})")
+                            sql_conditions.append(f"{_quote_sql_ident(col)} IN ({formatted_items})")
                         continue
                     left_char, right_char = interval[0], interval[-1]
                     lower_str, upper_str = [x.strip() for x in inner.split(",", 1)]
@@ -1053,10 +1068,10 @@ class StrategicSegmentBuilder:
                     range_conds = []
                     if lower_str.lower() != "-inf":
                         op = ">=" if left_char == "[" else ">"
-                        range_conds.append(f"{col} {op} {lower_str}")
+                        range_conds.append(f"{_quote_sql_ident(col)} {op} {lower_str}")
                     if upper_str.lower() != "inf":
                         op = "<=" if right_char == "]" else "<"
-                        range_conds.append(f"{col} {op} {upper_str}")
+                        range_conds.append(f"{_quote_sql_ident(col)} {op} {upper_str}")
         
                     if range_conds:
                         sql_conditions.append(" AND ".join(range_conds))
@@ -1065,11 +1080,11 @@ class StrategicSegmentBuilder:
                     clean_val = _strip_wrapping_quotes(inner)
         
                     if col_is_categorical:
-                        sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
+                        sql_conditions.append(f"{_quote_sql_ident(col)} = {_quote_sql_string(clean_val)}")
                     elif clean_val.replace(".", "", 1).replace("-", "", 1).isdigit():
-                        sql_conditions.append(f"{col} = {clean_val}")
+                        sql_conditions.append(f"{_quote_sql_ident(col)} = {clean_val}")
                     else:
-                        sql_conditions.append(f"{col} = {_quote_sql_string(clean_val)}")
+                        sql_conditions.append(f"{_quote_sql_ident(col)} = {_quote_sql_string(clean_val)}")
         
         return " AND ".join(f"({cond})" for cond in sql_conditions)
 

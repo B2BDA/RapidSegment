@@ -387,14 +387,25 @@ class StrategicSegmentBuilder:
                     # Transform bins array in DuckDB
                     transformed_bins = thread_con.execute(
                         f"""
-                        SELECT {case_expr} AS bin_label FROM current_df
+                        SELECT
+                            "__rs_row_id",
+                            {case_expr} AS bin_label
+                        FROM current_df
+                        ORDER BY "__rs_row_id"
                         """
                     ).fetchnumpy()["bin_label"].astype(str)
 
                 else:
                     # Optimal binning fallback
                     data_dict = thread_con.execute(
-                        f'SELECT "{col}", "{self.target}" FROM current_df'
+                        f'''
+                        SELECT
+                            "__rs_row_id",
+                            "{col}",
+                            "{self.target}"
+                        FROM current_df
+                        ORDER BY "__rs_row_id"
+                        '''
                     ).fetchnumpy()
 
                     col_arr_raw = data_dict[col]
@@ -402,6 +413,27 @@ class StrategicSegmentBuilder:
 
                     col_arr = col_arr_raw.filled(np.nan if np.issubdtype(col_arr_raw.dtype, np.number) else None) if isinstance(col_arr_raw, np.ma.MaskedArray) else col_arr_raw
                     target_arr = target_arr_raw.filled(0) if isinstance(target_arr_raw, np.ma.MaskedArray) else target_arr_raw
+
+                    # Deterministic row order before CART prebinning.
+                    # DuckDB SELECT has no ORDER BY; OptBinning's default prebinning
+                    # (CART) can split differently when tied samples arrive in a
+                    # different order, which changes bins/IV and cascades into
+                    # different segments across runs.
+                    try:
+                        col_arr = np.asarray(col_arr)
+                        target_arr = np.asarray(target_arr)
+                        if np.issubdtype(col_arr.dtype, np.number):
+                            order = np.lexsort((
+                                target_arr,
+                                np.nan_to_num(col_arr.astype(float, copy=False), nan=np.inf),
+                            ))
+                        else:
+                            col_as_str = col_arr.astype(str)
+                            order = np.lexsort((target_arr, col_as_str))
+                        col_arr = col_arr[order]
+                        target_arr = target_arr[order]
+                    except Exception:
+                        pass
 
                     # Fit an Optimal Binning model to the current feature/target pair so we can
                     # create monotonic, high-signal bins without relying on a fixed quantile grid.
@@ -476,11 +508,12 @@ class StrategicSegmentBuilder:
             ranking.append({"variable": col, "iv": iv, "max_rr": rr})
             if bins is not None:
                 precomputed_bins[col] = bins
-
+        # Stable sort: primary metric descending, variable name ascending on ties
+        # so top_n_vars is identical across runs when scores collide.
         if self.selection_metric == "response_rate":
-            ranking.sort(key=lambda x: x["max_rr"], reverse=True)
+            ranking.sort(key=lambda x: (-x["max_rr"], x["variable"]))
         else:
-            ranking.sort(key=lambda x: x["iv"], reverse=True)
+            ranking.sort(key=lambda x: (-x["iv"], x["variable"]))
 
         return ranking, precomputed_bins
 
@@ -1076,7 +1109,7 @@ class StrategicSegmentBuilder:
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
         if db_temp_dir:
             con.execute(f"PRAGMA temp_directory='{db_temp_dir}';")
-        con.execute("SET preserve_insertion_order = false;")
+        # con.execute("SET preserve_insertion_order = false;")
         
         logger.info(
             f"⚙️ DuckDB Configured for Disk Spilling: Threads={target_threads}/{total_cores}, "
@@ -1096,9 +1129,15 @@ class StrategicSegmentBuilder:
                     f"Available columns: {sorted(probe_cols)}"
                 )
             con.execute(
-                f'CREATE OR REPLACE TABLE current_df AS '
-                f'SELECT * REPLACE (CAST("{self.target}" AS DOUBLE) AS "{self.target}") '
-                f'FROM input_data_view'
+                f'''
+                CREATE OR REPLACE TABLE current_df AS
+                SELECT
+                    ROW_NUMBER() OVER () AS "__rs_row_id",
+                    * REPLACE (
+                        CAST("{self.target}" AS DOUBLE) AS "{self.target}"
+                    )
+                FROM input_data_view
+                '''
             )
 
             cols_info = con.execute("DESCRIBE current_df").fetchall()
@@ -1114,9 +1153,15 @@ class StrategicSegmentBuilder:
             if self.enable_diversity:
                 self._validate_feature_groups(all_cols)
 
-            eligible_cols = [
-                c for c in all_cols if c != self.target and c not in self.ignore_features
-            ]
+            eligible_cols = sorted(
+                c
+                for c in all_cols
+                if (
+                    c != self.target
+                    and c != "__rs_row_id"
+                    and c not in self.ignore_features
+                )
+)
             self.feature_usage_counts = {col: 0 for col in eligible_cols}
 
             if self.param_grid:
@@ -1218,7 +1263,11 @@ class StrategicSegmentBuilder:
                     break
 
                 raw_target_arr = con.execute(
-                    f'SELECT "{self.target}" FROM current_df'
+                    f'''
+                    SELECT "{self.target}"
+                    FROM current_df
+                    ORDER BY "__rs_row_id"
+                    '''
                 ).fetchnumpy()[self.target]
 
                 if isinstance(raw_target_arr, np.ma.MaskedArray):
@@ -1238,14 +1287,16 @@ class StrategicSegmentBuilder:
                     break
 
                 con.execute("DROP TABLE IF EXISTS binned_df")
-                # Materialize binned_data via a pandas DataFrame and register it with DuckDB
-                try:
-                    binned_df_pd = pd.DataFrame(binned_data)
-                    con.register("binned_data_df", binned_df_pd)
-                    con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data_df")
-                except Exception:
-                    # Fallback to previous direct table creation if DataFrame registration fails
-                    con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
+
+                con.register("binned_data_view", binned_data)
+
+                con.execute("""
+                    CREATE TABLE binned_df AS
+                    SELECT *
+                    FROM binned_data_view
+                """)
+
+                con.unregister("binned_data_view")
 
                 global_min_sample = (
                     min(exp["min_sample_size"] for exp in experiments)

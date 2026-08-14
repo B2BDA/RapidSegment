@@ -95,8 +95,7 @@ class StrategicSegmentBuilder:
         feature_groups: Optional[Dict[str, List[str]]] = None,
         ignore_features: Optional[List[str]] = None,
         sort_priority: str = "rate_lift_count",
-        binning_method: str = "optimal",  
-        naive_bins: int = 5 ,
+        binning_method: str = "optimal_cart",  # "naive" | "optimal_cart" | "optimal_quantile" | "optimal" (alias of cart)        naive_bins: int = 5 ,
         max_expansion_hops: int = 0,
         selection_metric: str = "iv",
         expand_log_mode: str = "none",
@@ -121,8 +120,12 @@ class StrategicSegmentBuilder:
             feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
             ignore_features: Explicit list of columns to drop prior to IV calculation.
             sort_priority: Ranking criteria for selecting champion segments.
-            binning_method: Which binning engine to use ('optimal' or 'naive').
-            naive_bins: Number of quantile bins used when binning_method is 'naive'.
+            binning_method: Binning engine:
+                - "naive": DuckDB equal-frequency quantiles (supports adjacent-bin expansion).
+                - "optimal_cart": OptBinning with CART prebinning (target-aware cuts).
+                - "optimal_quantile": OptBinning with quantile prebinning (more stable).
+                - "optimal": alias for "optimal_cart" (backward compatible).
+            naive_bins: Number of quantile bins when binning_method is "naive".
             selection_metric: Metric used to rank features for top_n_vars selection ("iv" or "response_rate").
             max_expansion_hops: Adjacent-bin merging hop distance limit (0 disables expansion).
             expand_log_mode: Controls verbosity of adjacent-bin expansion logging ("none", "summary", "champion", "full").
@@ -159,6 +162,16 @@ class StrategicSegmentBuilder:
         self.diagnostics_: List[Dict[str, Any]] = []
         self.stop_reason: Optional[str] = None
         self.binning_method = binning_method  
+        # Normalize aliases
+        _bm = (binning_method or "optimal_cart").lower().strip()
+        if _bm == "optimal":
+            _bm = "optimal_cart"
+        if _bm not in ("naive", "optimal_cart", "optimal_quantile"):
+            raise ValueError(
+                f"binning_method must be one of 'naive', 'optimal_cart', "
+                f"'optimal_quantile', or 'optimal' (alias of cart); got {_bm!r}"
+            )
+        self.binning_method = _bm
         self.naive_bins = naive_bins     
         self.max_expansion_hops = max(0, int(max_expansion_hops))
         self.selection_metric = selection_metric
@@ -447,7 +460,14 @@ class StrategicSegmentBuilder:
 
                     # Fit an Optimal Binning model to the current feature/target pair so we can
                     # create monotonic, high-signal bins without relying on a fixed quantile grid.
-                    optb = OptimalBinning(name=col, dtype=dtype)
+                    prebinning_method = (
+                        "quantile" if self.binning_method == "optimal_quantile" else "cart"
+                    )
+                    optb = OptimalBinning(
+                        name=col,
+                        dtype=dtype,
+                        prebinning_method=prebinning_method,
+                    )
                     optb.fit(col_fit, target_fit)
 
                     bin_table = optb.binning_table.build()
@@ -1131,7 +1151,10 @@ class StrategicSegmentBuilder:
             f"MemoryLimit={target_memory_gb}GB, TempDir={self.db_temp_dir}"
         )
         logger.info(f"📊 Sort priority: {self.sort_priority}")
-        logger.info(f"📦 Binning method: {self.binning_method} (naive_bins={self.naive_bins})")
+        logger.info(
+            f"📦 Binning method: {self.binning_method}"
+            + (f" (naive_bins={self.naive_bins})" if self.binning_method == "naive" else "")
+        )
         try:
             con.register("input_data_view", data)
             # Cast the target to DOUBLE up front so boolean targets work with AVG,

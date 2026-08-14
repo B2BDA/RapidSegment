@@ -383,7 +383,7 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `feature_groups` | `dict` | `{}` | Business-category → column list (used by diversity). |
 | `ignore_features` | `list` | `[]` | Columns to exclude before IV calculation. |
 | `sort_priority` | `str` | `"rate_lift_count"` | Ranking key for champion selection (many variants supported). |
-| `binning_method` | `str` | `"optimal"` | `"optimal"` (OptBinning) or `"naive"` (quantile bins). |
+| `binning_method` | `str` | `"optimal"` | `"optimal_cart"` or `optimal` (OptBinning with CART) or `"optimal_quantile"` (OptBinning with Quantile) or `"naive"` (quantile bins). |
 | `naive_bins` | `int` | `5` | Number of quantile bins when `binning_method="naive"`. |
 | `max_expansion_hops` | `int` | `0` | Adjacent-bin merge distance (0 = disabled). |
 | `selection_metric` | `str` | `"iv"` | Rank features by `"iv"` or `"response_rate"`. |

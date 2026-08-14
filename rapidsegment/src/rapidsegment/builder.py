@@ -230,35 +230,42 @@ class StrategicSegmentBuilder:
         """
         priority = self.sort_priority
         if priority == "lift_count_rate":
-            return (rule["lift"], rule["count"], rule["rate"])
+            key = (rule["lift"], rule["count"], rule["rate"])
         elif priority == "count_lift_rate":
-            return (rule["count"], rule["lift"], rule["rate"])
+            key = (rule["count"], rule["lift"], rule["rate"])
         elif priority == "rate_lift_count":
-            return (rule["rate"], rule["lift"], rule["count"])
+            key = (rule["rate"], rule["lift"], rule["count"])
         elif priority == "lift_rate_count":
-            return (rule["lift"], rule["rate"], rule["count"])
+            key = (rule["lift"], rule["rate"], rule["count"])
         elif priority == "count_rate_lift":
-            return (rule["count"], rule["rate"], rule["lift"])
+            key = (rule["count"], rule["rate"], rule["lift"])
         elif priority == "rate_count_lift":
-            return (rule["rate"], rule["count"], rule["lift"])
+            key = (rule["rate"], rule["count"], rule["lift"])
         elif priority == "events_lift_rate":
-            return (rule["events"], rule["lift"], rule["rate"])
+            key = (rule["events"], rule["lift"], rule["rate"])
         elif priority == "events_rate_lift":
-            return (rule["events"], rule["rate"], rule["lift"])
+            key = (rule["events"], rule["rate"], rule["lift"])
         elif priority == "lift_events_rate":
-            return (rule["lift"], rule["events"], rule["rate"])
+            key = (rule["lift"], rule["events"], rule["rate"])
         elif priority == "rate_events_lift":
-            return (rule["rate"], rule["events"], rule["lift"])
+            key = (rule["rate"], rule["events"], rule["lift"])
         elif priority == "events_count_rate":
-            return (rule["events"], rule["count"], rule["rate"])
+            key = (rule["events"], rule["count"], rule["rate"])
         elif priority == "events_rate_count":
-            return (rule["events"], rule["rate"], rule["count"])
+            key = (rule["events"], rule["rate"], rule["count"])
         elif priority == "count_events_rate":
-            return (rule["count"], rule["events"], rule["rate"])
+            key = (rule["count"], rule["events"], rule["rate"])
         elif priority == "rate_events_count":
-            return (rule["rate"], rule["events"], rule["count"])
+            key = (rule["rate"], rule["events"], rule["count"])
         else:
-            return (rule["lift"], rule["rate"], rule["count"])
+            key = (rule["lift"], rule["rate"], rule["count"])
+        # Deterministic tie-breaker: when every configured priority dimension
+        # is exactly equal between two candidates, the winner must not depend
+        # on incoming list order (which itself can vary run-to-run due to
+        # Python's per-process string hash randomization affecting set/dict
+        # iteration order, and unordered SQL GROUP BY results). Sorting on
+        # the rule string last makes ties resolve identically every run.
+        return key + (rule.get("rule", ""),)
 
     def compute_iv_ranking_and_bin(
         self,
@@ -1269,7 +1276,7 @@ class StrategicSegmentBuilder:
                 # Level 2 (Pairs)
                 valid_2way_sets = set()
                 if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
-                    combos_2 = [c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)]
+                    combos_2 = [c for c in combinations(sorted(valid_1way_vars), 2) if self.is_diverse(c)]
                     if combos_2:
                         res_2 = self._agg_combinations(con, combos_2, original_base_rate)
                         if res_2:
@@ -1280,7 +1287,7 @@ class StrategicSegmentBuilder:
                 # Level 3 (Triplets)
                 if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
                     combos_3 = [
-                        c for c in combinations(valid_1way_vars, 3)
+                        c for c in combinations(sorted(valid_1way_vars), 3)
                         if self.is_diverse(c) and all(frozenset(p) in valid_2way_sets for p in combinations(c, 2))
                     ]
                     if combos_3:
@@ -1290,12 +1297,6 @@ class StrategicSegmentBuilder:
 
                 # Build a shortlist of candidates for each grid configuration and keep the top
                 # rule from each configuration for later raw validation against the real table.
-                # Build a shortlist of candidates for each grid configuration and keep the top
-                # rule from each configuration for later raw validation against the real table.
-                n_1way = sum(1 for r in all_candidate_rules if len(r["combo_vars"]) == 1)
-                n_2way = sum(1 for r in all_candidate_rules if len(r["combo_vars"]) == 2)
-                n_3way = sum(1 for r in all_candidate_rules if len(r["combo_vars"]) == 3)
-
                 grid_candidates: List[Dict[str, Any]] = []
                 for config in experiments:
                     valid_for_config = [
@@ -1310,21 +1311,20 @@ class StrategicSegmentBuilder:
                         top_match["grid_min_lift"] = config["min_lift"]
                         grid_candidates.append(top_match)
 
-                # Record funnel BEFORE the empty check so zero-candidate cases are still diagnosed
-                self.diagnostics_[-1]["candidate_funnel"] = {
-                    "1way_candidates": n_1way,
-                    "2way_candidates": n_2way,
-                    "3way_candidates": n_3way,
-                    "total_candidates_before_grid": len(all_candidate_rules),
-                    "candidates_after_grid": len(grid_candidates),
-                }
-
                 if not grid_candidates:
+                    self.diagnostics_[-1]["candidate_funnel"] = {
+                        "total_candidates_before_grid": len(all_candidate_rules),
+                        "candidates_after_grid": 0,
+                    }
                     self.stop_reason = "No candidate rules met the minimum grid thresholds (sample size / lift)."
                     logger.info("⏹️ No candidates cleared the grid. Stopping.")
                     break
 
                 grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
+                self.diagnostics_[-1]["candidate_funnel"] = {
+                    "total_candidates_before_grid": len(all_candidate_rules),
+                    "candidates_after_grid": len(grid_candidates),
+                }
 
                 # Re-run the strongest candidates against the real residual table using SQL.
                 # This step enforces the hard constraints on actual data counts/events rather than

@@ -1290,6 +1290,12 @@ class StrategicSegmentBuilder:
 
                 # Build a shortlist of candidates for each grid configuration and keep the top
                 # rule from each configuration for later raw validation against the real table.
+                # Build a shortlist of candidates for each grid configuration and keep the top
+                # rule from each configuration for later raw validation against the real table.
+                n_1way = sum(1 for r in all_candidate_rules if len(r["combo_vars"]) == 1)
+                n_2way = sum(1 for r in all_candidate_rules if len(r["combo_vars"]) == 2)
+                n_3way = sum(1 for r in all_candidate_rules if len(r["combo_vars"]) == 3)
+
                 grid_candidates: List[Dict[str, Any]] = []
                 for config in experiments:
                     valid_for_config = [
@@ -1304,16 +1310,21 @@ class StrategicSegmentBuilder:
                         top_match["grid_min_lift"] = config["min_lift"]
                         grid_candidates.append(top_match)
 
+                # Record funnel BEFORE the empty check so zero-candidate cases are still diagnosed
+                self.diagnostics_[-1]["candidate_funnel"] = {
+                    "1way_candidates": n_1way,
+                    "2way_candidates": n_2way,
+                    "3way_candidates": n_3way,
+                    "total_candidates_before_grid": len(all_candidate_rules),
+                    "candidates_after_grid": len(grid_candidates),
+                }
+
                 if not grid_candidates:
                     self.stop_reason = "No candidate rules met the minimum grid thresholds (sample size / lift)."
                     logger.info("⏹️ No candidates cleared the grid. Stopping.")
                     break
 
                 grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
-                self.diagnostics_[-1]["candidate_funnel"] = {
-                    "total_candidates_before_grid": len(all_candidate_rules),
-                    "candidates_after_grid": len(grid_candidates),
-                }
 
                 # Re-run the strongest candidates against the real residual table using SQL.
                 # This step enforces the hard constraints on actual data counts/events rather than

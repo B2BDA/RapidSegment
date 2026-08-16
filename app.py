@@ -4,27 +4,53 @@ import solara.lab
 from pathlib import Path
 import json
 
+
+def _prewarm_duckdb():
+    """Ensure duckdb's C extension is fully initialized before the app runs.
+
+    Solara's autorouting executes this module (often more than once). A
+    partially-initialized ``_duckdb`` left in ``sys.modules`` causes the
+    intermittent ``No module named '_duckdb._sqltypes'`` error; this helper
+    cleans poisoned modules and retries the import.
+    """
+    import sys
+    for _ in range(3):
+        try:
+            import duckdb  # noqa: F401
+            import _duckdb  # noqa: F401
+            if not hasattr(_duckdb, "_sqltypes"):
+                raise RuntimeError("_duckdb._sqltypes not attached")
+            return duckdb
+        except Exception:
+            for m in list(sys.modules):
+                if m == "_duckdb" or m.startswith("_duckdb.") or m == "duckdb" or m.startswith("duckdb."):
+                    sys.modules.pop(m, None)
+            continue
+    import duckdb  # final attempt
+    return duckdb
+
+
+_prewarm_duckdb()
+
 from rapidsegment_suite.db import SuiteDB
 from rapidsegment_suite.builder_runner import RapidSegmentRunner
 from rapidsegment_suite.data_profiler_duckdb import DuckDBProfiler
+from rapidsegment_suite.module1_data_source import (
+    DataSourceModule,
+    profile_report as m1_profile_report,
+)
 
 db = SuiteDB()
 profiler = DuckDBProfiler(db_path=".rapidsegment_suite/profiling.db")
 runner = RapidSegmentRunner(db=db)
 
 theme_mode = solara.reactive("light")
-source_type = solara.reactive("local")
-local_file_path = solara.reactive("")
-bq_full_path = solara.reactive("")
-bq_project = solara.reactive("")
-bq_dataset = solara.reactive("")
-bq_table = solara.reactive("")
+tab_index = solara.reactive(0)
 data_table_name = solara.reactive("main_data")
 target_col = solara.reactive("")
 primary_key = solara.reactive("")
 exp_name = solara.reactive("exp_first_run")
-status_msg = solara.reactive("Ready - paste file path OR BigQuery table path below")
-profiling_report = solara.reactive(None)
+status_msg = solara.reactive("Ready - load a dataset in Module 1 to begin")
 column_list = solara.reactive([])
 selected_exp = solara.reactive("")
 exp_a = solara.reactive("")
@@ -44,58 +70,19 @@ def refresh_exps():
     except:
         exp_list.value = []
 
-def parse_bq(s):
-    try:
-        p = s.strip().replace("bq://","").replace("bigquery://","")
-        parts = p.split(".")
-        if len(parts) == 3:
-            bq_project.value, bq_dataset.value, bq_table.value = parts
-        elif len(parts) == 2:
-            bq_dataset.value, bq_table.value = parts
-    except:
-        pass
-
-def load_data():
-    try:
-        if source_type.value == "local":
-            fp = local_file_path.value.strip()
-            if not fp:
-                status_msg.value = "Enter file path first"
-                return
-            if not Path(fp).exists():
-                status_msg.value = f"File not found: {fp}"
-                return
-            profiler.load_table(file_path=fp, table_name=data_table_name.value)
-        else:
-            if bq_full_path.value:
-                parse_bq(bq_full_path.value)
-            if not bq_dataset.value or not bq_table.value:
-                status_msg.value = "Enter BQ dataset.table"
-                return
-            profiler.load_from_bq(bq_path=bq_full_path.value or None, project_id=bq_project.value or None, dataset_id=bq_dataset.value, table_id=bq_table.value, table_name=data_table_name.value)
-        cols = profiler._get_columns_meta(data_table_name.value)
-        column_list.value = [c["name"] for c in cols]
-        rep = profiler.profile(data_table_name.value, target_col=None)
-        profiling_report.value = rep
-        status_msg.value = f"Loaded {rep['total_rows']:,} rows x {rep['total_columns']} cols | DB {rep['size_info']['file_size_mb']} MB"
-        refresh_exps()
-    except Exception as e:
-        status_msg.value = f"Load error: {e}"
-
-def calc_event():
-    try:
-        if not target_col.value:
-            status_msg.value = "Select target"
-            return
-        rep = profiler.profile(data_table_name.value, target_col=target_col.value)
-        profiling_report.value = rep
-        bp = dict(builder_params.value)
-        bp["target"] = target_col.value
-        builder_params.value = bp
-        ev = rep.get('event_info',{})
-        status_msg.value = f"Target {target_col.value}: {ev.get('event_rate_pct','?')}%"
-    except Exception as e:
-        status_msg.value = f"Error: {e}"
+def proceed_to_workbench(target, table_name, pk):
+    """Wired to Module 1's 'Proceed to Workbench' action."""
+    data_table_name.value = table_name
+    target_col.value = target
+    primary_key.value = pk or ""
+    column_list.value = [c["name"] for c in profiler._get_columns_meta(table_name)]
+    bp = dict(builder_params.value)
+    bp["target"] = target
+    builder_params.value = bp
+    if m1_profile_report.value:
+        status_msg.value = (f"Ready to run | target={target} | "
+                            f"{m1_profile_report.value['total_rows']:,} rows")
+    tab_index.value = 1
 
 def run_experiment():
     try:
@@ -115,25 +102,6 @@ def run_experiment():
 
 def toggle_theme():
     theme_mode.value = "dark" if theme_mode.value == "light" else "light"
-
-@solara.component
-def DataTab():
-    with solara.Column(style={"gap": "10px"}):
-        solara.Select(label="Source type: local file path OR BigQuery path", values=["local", "bigquery"], value=source_type)
-        if source_type.value == "local":
-            solara.InputText(label="Local file path (e.g. /workspaces/RapidSegment/data.csv)", value=local_file_path, placeholder="/home/user/data.csv")
-        else:
-            solara.InputText(label="Full BQ path project.dataset.table", value=bq_full_path, placeholder="my-project.analytics.events", on_value=lambda v: parse_bq(v))
-            with solara.Row():
-                solara.InputText(label="Dataset", value=bq_dataset)
-                solara.InputText(label="Table", value=bq_table)
-        with solara.Row():
-            solara.Button(label="1. Load & Profile (DuckDB disk)", on_click=load_data, style={"background": "black", "color": "white"})
-            solara.Select(label="Target variable", values=column_list.value, value=target_col)
-            solara.Button(label="2. Calc Event Rate", on_click=calc_event)
-        if profiling_report.value:
-            rep = profiling_report.value
-            solara.Text(f"{rep['total_rows']} rows, {rep['total_columns']} cols, Num {rep['num_numeric']} Cat {rep['num_categorical']}, DB {rep['size_info']['file_size_mb']} MB")
 
 @solara.component
 def WorkbenchTab():
@@ -180,9 +148,9 @@ def Page():
             with solara.Row():
                 solara.Text(f"{profiler.get_db_size_info()['file_size_mb']} MB | {status_msg.value}", style={"font-size": "11px", "max-width": "600px"})
                 solara.Button(label="DARK" if theme_mode.value=="light" else "LIGHT", on_click=toggle_theme)
-        with solara.lab.Tabs():
-            with solara.lab.Tab("Data Source & Profiling"):
-                DataTab()
+        with solara.lab.Tabs(value=tab_index):
+            with solara.lab.Tab("Module 1 - Data Source & Profiling"):
+                DataSourceModule(profiler=profiler, on_proceed=proceed_to_workbench)
             with solara.lab.Tab("Workbench"):
                 WorkbenchTab()
             with solara.lab.Tab("Leaderboard"):

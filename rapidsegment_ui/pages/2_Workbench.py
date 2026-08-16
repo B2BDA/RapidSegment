@@ -63,6 +63,38 @@ METRIC_OPTIONS = ["IV", "Response Rate"]
 METRIC_MAP = {"IV": "iv", "Response Rate": "response_rate"}
 METRIC_RMAP = {v: k for k, v in METRIC_MAP.items()}
 
+SORT_PRIORITY_OPTIONS = [
+    ("rate_lift_count", "Rate → Lift → Count (default)"),
+    ("lift_rate_count", "Lift → Rate → Count"),
+    ("lift_count_rate", "Lift → Count → Rate"),
+    ("count_lift_rate", "Count → Lift → Rate"),
+    ("count_rate_lift", "Count → Rate → Lift"),
+    ("rate_count_lift", "Rate → Count → Lift"),
+    ("events_lift_rate", "Events → Lift → Rate"),
+    ("events_rate_lift", "Events → Rate → Lift"),
+    ("lift_events_rate", "Lift → Events → Rate"),
+    ("rate_events_lift", "Rate → Events → Lift"),
+    ("events_count_rate", "Events → Count → Rate"),
+    ("events_rate_count", "Events → Rate → Count"),
+    ("count_events_rate", "Count → Events → Rate"),
+    ("rate_events_count", "Rate → Events → Count"),
+]
+SORT_PRIORITY_MAP = dict(SORT_PRIORITY_OPTIONS)
+SORT_PRIORITY_RMAP = {v: k for k, v in SORT_PRIORITY_OPTIONS}
+SORT_PRIORITY_HELP = (
+    "Ranking strategy for champion selection — sorted descending, so the first "
+    "dimension dominates. E.g. 'Rate → Lift → Count' prefers the highest response "
+    "rate, then lift, then volume. All 14 combinations of rate / lift / count / "
+    "events are supported by the library."
+)
+
+MAX_JOBS = max(1, os.cpu_count() or 4)
+N_JOBS_OPTIONS = ["-1 (all but one core)"] + [str(i) for i in range(1, MAX_JOBS + 1)]
+N_JOBS_MAP = {opt: -1 if opt.startswith("-1") else int(opt) for opt in N_JOBS_OPTIONS}
+N_JOBS_RMAP = {v: k for k, v in N_JOBS_MAP.items()}
+
+EXPAND_LOG_OPTIONS = ["none", "summary", "champion", "full"]
+
 GRID_SIZE_OPTIONS = [250, 500, 750, 1000, 1500, 2000, 2500, 3000, 5000]
 GRID_LIFT_OPTIONS = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
 
@@ -85,6 +117,9 @@ QUICK_DISCOVERY = {
     "min_lift": 1.2,
     "min_events": 50,
     "param_grid": None,
+    "sort_priority": "rate_lift_count",
+    "n_jobs": -1,
+    "expand_log_mode": "none",
 }
 
 CONSERVATIVE = {
@@ -106,6 +141,9 @@ CONSERVATIVE = {
     "min_lift": 2.0,
     "min_events": 500,
     "param_grid": None,
+    "sort_priority": "rate_lift_count",
+    "n_jobs": -1,
+    "expand_log_mode": "none",
 }
 
 
@@ -219,9 +257,9 @@ def build_params():
         "min_lift": float(st.session_state["wb_min_lift"]),
         "min_events": int(st.session_state["wb_min_events"]),
         "param_grid": grid,
-        "sort_priority": "rate_lift_count",
-        "n_jobs": -1,
-        "expand_log_mode": "none",
+        "sort_priority": SORT_PRIORITY_RMAP[st.session_state["wb_sort_priority"]],
+        "n_jobs": N_JOBS_MAP[st.session_state["wb_n_jobs"]],
+        "expand_log_mode": st.session_state["wb_expand_log_mode"],
     }
 
 
@@ -390,6 +428,9 @@ def apply_config(cfg):
         "min_sample_size": "wb_min_sample_size",
         "min_lift": "wb_min_lift",
         "min_events": "wb_min_events",
+        "sort_priority": "wb_sort_priority",
+        "n_jobs": "wb_n_jobs",
+        "expand_log_mode": "wb_expand_log_mode",
     }
     for cfg_key, widget_key in mapping.items():
         if cfg_key not in cfg or cfg[cfg_key] is None or cfg[cfg_key] == "":
@@ -399,6 +440,10 @@ def apply_config(cfg):
             value = BIN_RMAP.get(value, value)
         if cfg_key == "selection_metric":
             value = METRIC_RMAP.get(value, value)
+        if cfg_key == "sort_priority":
+            value = SORT_PRIORITY_MAP.get(value, value)
+        if cfg_key == "n_jobs":
+            value = N_JOBS_RMAP.get(value, "-1 (all but one core)")
         st.session_state[widget_key] = value
     fg = cfg.get("feature_groups")
     if isinstance(fg, dict):
@@ -489,7 +534,7 @@ def run_builder(cfg, df):
         naive_bins=cfg["naive_bins"],
         max_expansion_hops=cfg["max_expansion_hops"],
         selection_metric=cfg["selection_metric"],
-        expand_log_mode="none",
+        expand_log_mode=cfg.get("expand_log_mode", "none"),
         db_path=os.path.join(exp_dir, "workbench.duckdb"),
         db_temp_dir=os.path.join(exp_dir, "tmp"),
     )
@@ -642,6 +687,9 @@ defaults = {
     "wb_min_sample_size": 1000,
     "wb_min_lift": 1.5,
     "wb_min_events": 100,
+    "wb_sort_priority": SORT_PRIORITY_MAP["rate_lift_count"],
+    "wb_n_jobs": "-1 (all but one core)",
+    "wb_expand_log_mode": "none",
     "wb_enable_grid": False,
     "wb_grid_sizes": [500, 1000, 2000],
     "wb_grid_lifts": [1.5, 2.0, 3.0],
@@ -802,6 +850,20 @@ with left:
         d2.slider("max_segments", 1, 20, key="wb_max_segments")
         d3.slider("max_feature_reuse", 1, 5, key="wb_max_feature_reuse")
 
+        s1, s2 = st.columns(2)
+        s1.selectbox(
+            "Sort priority (champion ranking)",
+            list(SORT_PRIORITY_MAP.values()),
+            key="wb_sort_priority",
+            help=SORT_PRIORITY_HELP,
+        )
+        s2.selectbox(
+            "Parallel jobs",
+            N_JOBS_OPTIONS,
+            key="wb_n_jobs",
+            help="-1 uses all but one CPU core for IV computation.",
+        )
+
         with st.expander("Feature grouping (business categories)"):
             gname = st.text_input(
                 "Business category name",
@@ -876,6 +938,13 @@ with left:
             key="wb_selection_metric",
             help="Metric used to rank features for top_n_vars selection.",
         )
+        st.selectbox(
+            "Expansion log mode",
+            EXPAND_LOG_OPTIONS,
+            key="wb_expand_log_mode",
+            help="Verbosity of adjacent-bin expansion logging: 'none' is quiet; "
+            "'champion'/'full' print ranked champion-vs-expanded comparisons in the run log.",
+        )
 
     with st.expander("Hard Constraints", expanded=True):
         h1, h2, h3 = st.columns(3)
@@ -884,8 +953,10 @@ with left:
             key="wb_min_sample_size",
         )
         h2.number_input(
-            "min_lift", min_value=1.0, max_value=10.0, step=0.1, format="%.2f",
+            "min_lift", min_value=0.5, max_value=20.0, step=0.1, format="%.2f",
             key="wb_min_lift",
+            help="Values below 1.0 are accepted — a rule with lift < 1 sits below "
+            "the base response rate and will only rank if later dimensions dominate.",
         )
         h3.number_input(
             "min_events", min_value=1, max_value=1_000_000, step=10,

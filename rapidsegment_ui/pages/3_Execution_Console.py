@@ -586,7 +586,7 @@ def _start_run(cfg):
         naive_bins=cfg["naive_bins"],
         max_expansion_hops=cfg["max_expansion_hops"],
         selection_metric=cfg["selection_metric"],
-        expand_log_mode="none",
+        expand_log_mode=cfg.get("expand_log_mode", "none"),
         db_path=os.path.join(exp_dir, "workbench.duckdb"),
         db_temp_dir=os.path.join(exp_dir, "tmp"),
     )

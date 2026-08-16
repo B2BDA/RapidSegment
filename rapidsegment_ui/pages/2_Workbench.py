@@ -10,13 +10,19 @@ Consumes Module 1 (data loader) output:
     - st.session_state["target_col"]    str       validated target column
     - st.session_state["tinfo"]         dict      profiling info incl. event_rate
 
-Produces for Module 3 (results / execution console):
-    - st.session_state["experiment"]    dict      {exp_id, name, created_at, status,
+Hands off to Module 3 (execution console) — the Run button no longer
+executes inline; it validates the config, then:
+    - st.session_state["pending_run"]    dict      validated config consumed by
+                                                  pages/3_Execution_Console.py
+                                                  (Module 3), which then writes
+    - st.session_state["experiment"]     dict      {exp_id, name, created_at, status,
                                                   execution_time_sec, target_col,
                                                   primary_key, data_rows, data_cols,
                                                   config (builder params JSON),
                                                   result (segments + coverage summary)}
     - st.session_state["last_config"]   dict      last experiment config (clone support)
+`run_builder`, `compute_coverage_local` and `upsert_experiment` are kept for
+reference / reuse — execution now happens in Module 3.
 
 Files touched:
     read  .rapidsegment_suite/module1_data.duckdb   (udl_data)
@@ -33,10 +39,10 @@ import threading
 import time
 import uuid
 from datetime import datetime
-
+import pandas as pd
 import duckdb
 import streamlit as st
-import pandas as pd
+
 from rapidsegment import StrategicSegmentBuilder
 
 # ── Constants & storage ───────────────────────────────────────────────────────
@@ -964,62 +970,15 @@ with footer:
             if issues:
                 notice.error("Validation failed:\n" + "\n".join(f"• {item}" for item in issues))
             else:
-                df = db_query("SELECT * FROM udl_data")
-                segments, coverage, stop_reason, elapsed, err, exp_id = run_builder(cfg_now, df)
-                if err:
-                    notice.error(f"Experiment failed: {err}")
-                else:
-                    lifts = [float(s.get("lift") or 0) for s in segments if s.get("lift") is not None]
-                    cov_pct = sum(
-                        float(r.get("capture_rate") or 0)
-                        for r in coverage
-                        if r.get("segment") != 0
+                st.session_state["pending_run"] = _jsonable(cfg_now)
+                try:
+                    st.switch_page("pages/3_Execution_Console.py")
+                except AttributeError:
+                    st.experimental_switch_page("pages/3_Execution_Console.py")
+                except Exception:
+                    notice.success(
+                        "Configuration saved — open Module 3 (Execution Console) to run it."
                     )
-                    baseline = (
-                        float(coverage[0].get("base_response_rate") or 0)
-                        if coverage
-                        else None
-                    )
-                    if baseline is None:
-                        baseline = float((tinfo or {}).get("event_rate") or 0) * 100
-                    experiment = {
-                        "exp_id": exp_id,
-                        "name": cfg_now["experiment_name"],
-                        "created_at": datetime.now().isoformat(timespec="seconds"),
-                        "status": "completed",
-                        "execution_time_sec": round(elapsed, 2),
-                        "target_col": cfg_now["target_col"],
-                        "primary_key": cfg_now["primary_key"],
-                        "data_rows": n_rows,
-                        "data_cols": n_cols,
-                        "config": _jsonable(cfg_now),
-                        "result": _jsonable(
-                            {
-                                "segments": segments,
-                                "coverage": coverage,
-                                "stop_reason": stop_reason,
-                                "segments_count": len(segments),
-                                "avg_lift": round(sum(lifts) / len(lifts), 4) if lifts else 0.0,
-                                "max_lift": round(max(lifts), 4) if lifts else 0.0,
-                                "coverage_pct": round(cov_pct, 3),
-                                "baseline_rate_pct": round(baseline, 3),
-                            }
-                        ),
-                    }
-                    st.session_state["experiment"] = experiment
-                    st.session_state["last_config"] = _jsonable(cfg_now)
-                    try:
-                        upsert_experiment(experiment)
-                        persisted = True
-                    except Exception:
-                        persisted = False
-                    message = (
-                        f"Experiment `{experiment['name']}` complete — "
-                        f"{len(segments)} segment(s) in {fmt_duration(elapsed)}"
-                    )
-                    if not persisted:
-                        message += " (warning: could not persist to suite_data.db)"
-                    notice.success(message)
         estimated = estimate_seconds(cfg_now, n_rows)
         st.caption(f"Estimated time: **{fmt_duration(estimated)}**")
 

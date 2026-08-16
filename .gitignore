@@ -2,3 +2,5 @@
 *.db.wal
 *.parquet
 *.json
+__pycache__
+.rapidsegment_suite

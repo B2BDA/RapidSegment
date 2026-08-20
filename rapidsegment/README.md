@@ -4,7 +4,7 @@
 > This open‑source library (`RapidSegment`) is an independent, community‑driven predictive analytics framework. It is **completely unaffiliated** with any commercial products, SaaS platforms, or enterprise solutions of the same or similar name. Any overlap in nomenclature is purely coincidental.
 
 <p align="center">
-  <img width="1983" height="793" alt="f09fbbc6-17b6-4e86-96e7-5291a4175456" src="https://github.com/user-attachments/assets/f2584720-246b-4bda-b5a2-1b843bbec474" />
+  <img width="300" height="500" alt="adfd9cdf-251f-44e4-af79-20802d4a7a01" src="https://github.com/user-attachments/assets/803790d0-7ebe-4e79-a415-65f1daaea40b" />
 </p>
 
 # 🚀 RapidSegment – Strategic Segmentation & Scorecard Engine
@@ -310,6 +310,60 @@ flowchart LR
 ```
 
 If a 1‑way rule fails the thresholds, all higher‑order combinations containing that feature are pruned – drastically reducing the search space.
+
+## How 1-Way → 2-Way → 3-Way Segment Search Works
+ 
+RapidSegment builds candidate segments in layers: it tests single features first, then only pairs the survivors, then only tries triplets whose *every* underlying pair already proved itself. This is Apriori-style pruning — the same idea used in market-basket analysis — applied to churn/response segmentation.
+ 
+### Worked example — from 1-way to 3-way on real-looking data
+ 
+Say the target is `churned` (1 = customer left), the overall base rate is **20%** (2,000 of 10,000 customers churned), `min_lift = 1.5`, and `min_sample_size = 300`. Three binned features are in play: `tenure_bin`, `plan_type`, `support_tickets_bin`.
+ 
+#### Step 1 — 1-way: test each bin of each feature alone
+ 
+Every individual bin is checked against the base rate. A rule only survives if its `count ≥ min_sample_size` and `lift ≥ min_lift` (`lift = segment_rate / base_rate`):
+ 
+| Rule (1-way) | Count | Churn rate | Lift | Survives? |
+|---|---|---|---|:---:|
+| `tenure_bin = [0-3mo]` | 1,200 | 42% | 2.1x | ✅ |
+| `plan_type = [Basic]` | 900 | 35% | 1.75x | ✅ |
+| `support_tickets_bin = [3+]` | 600 | 55% | 2.75x | ✅ |
+| `plan_type = [Premium]` | 800 | 8% | 0.4x | ❌ (below 1.0, protective not risky) |
+| `tenure_bin = [12mo+]` | 3,000 | 6% | 0.3x | ❌ |
+ 
+Only bins that pass move forward. Say the survivors are `{[0-3mo], [Basic], [3+ tickets]}` — call them **A**, **B**, **C** for short. Anything that failed (like `[Premium]` or `[12mo+]`) is now completely dropped: it will never be tried in any pair or triplet, because pairing a bad bin with anything can't undo the fact that alone it wasn't predictive enough at the volume required.
+ 
+#### Step 2 — 2-way: pair up only the survivors
+ 
+With 3 survivors there are `C(3,2) = 3` possible pairs: `A+B`, `A+C`, `B+C`. Each pair is aggregated as its own joint segment:
+ 
+| Rule (2-way) | Count | Churn rate | Lift | Survives? |
+|---|---|---|---|:---:|
+| `A+B` = `[0-3mo] AND [Basic]` | 420 | 51% | 2.55x | ✅ |
+| `A+C` = `[0-3mo] AND [3+ tickets]` | 310 | 58% | 2.9x | ✅ |
+| `B+C` = `[Basic] AND [3+ tickets]` | 180 | 60% | 3.0x | ❌ — count 180 < min_sample_size 300 |
+ 
+Notice `B+C` actually has the *highest* churn rate and lift of the three pairs — but it's still rejected, because too few customers (180) fall into that exact overlap to trust the number. This is the key trade-off: **survival is about count AND lift together, not lift alone.**
+ 
+Survivors: `valid_2way_sets = { {A,B}, {A,C} }`.
+ 
+#### Step 3 — 3-way: only try triplets where every pair inside them already passed
+ 
+With 3 bins there's only one possible triplet: `A+B+C`. Before RapidSegment even bothers aggregating it, it checks: are all three of its pairs — `{A,B}`, `{A,C}`, `{B,C}` — in `valid_2way_sets`?
+ 
+| Pair inside the triplet | In `valid_2way_sets`? |
+|---|:---:|
+| `{A,B}` | ✅ |
+| `{A,C}` | ✅ |
+| `{B,C}` | ❌ (rejected in Step 2 for low count) |
+ 
+Because `{B,C}` never passed, the triplet `A+B+C` is **skipped entirely** — it is never even aggregated, no matter how strong its true joint churn rate might be. This is the pruning payoff: instead of testing every possible triplet from scratch, the engine only tests triplets whose *every* pairwise sub-relationship already proved itself statistically solid on its own.
+ 
+### Why prune this way instead of just testing every triplet directly?
+ 
+- **Speed:** with `top_n_vars = 15`, testing all triplets directly is `C(15,3) = 455` SQL aggregations. Pruning by pairwise survival first can cut that dramatically, since most triplets get eliminated before ever touching the data.
+- **The cost:** a genuinely strong 3-way interaction can be missed if one of its underlying pairs happened to fall just under `min_sample_size` (as `{B,C}` did above at count 180) — even if the full triplet would have had a healthy count. This is the same trade-off classic Apriori pruning makes in market-basket analysis: cheap, scalable, but not exhaustive.
+---
 
 ### 3. Grid Search
 For each iteration, the engine sweeps over a user‑defined grid of `(min_sample_size, min_lift)` values. Each grid point produces a candidate champion. After all grid points are evaluated, the global champion is chosen by sorting on `(lift, count, rate)`.

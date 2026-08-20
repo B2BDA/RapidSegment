@@ -196,7 +196,7 @@ class StrategicSegmentScore:
         logger.info("📈 Calibrating deciles across active populations...")
 
         # Filter out baseline customers (score = 0) – unchanged from original
-        filter_clause = "WHERE total_score <> 0" if zero_inflation_rate >= 0 else ""
+        filter_clause = "WHERE total_score > 0" if zero_inflation_rate >= 0 else ""
 
         # Compute all 10 deciles in a single table scan using quantile_disc
         quantile_query = f"""

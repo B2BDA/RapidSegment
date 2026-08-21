@@ -884,6 +884,11 @@ def _render_view(exp):
                          label="Configure new experiment in Workbench (Module 2)", icon="⚙️")
         except Exception:
             st.caption("Configure a new experiment in the Workbench (Module 2).")
+        try:
+            st.page_link("pages/4_Results_Dashboard.py",
+                         label="Open Results Dashboard (Module 4)", icon="📊")
+        except Exception:
+            st.caption("Open the Results Dashboard (Module 4) from the sidebar.")
 
 
 def _render_final(run):

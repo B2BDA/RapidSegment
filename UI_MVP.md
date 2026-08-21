@@ -46,6 +46,27 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 
 ---
 
+## Project Status (Implementation Tracker)
+
+> The Streamlit multipage app lives in `rapidsegment_ui/` (run `streamlit run app.py`); standalone module files (`Module_*.py`) mirror the pages.
+
+| Module | Status | Notes |
+|---|---|---|
+| 1 — Data Source & Profiling | ✅ **Done** | Local file / BigQuery / sample datasets, DuckDB persistence, profiling tabs, target validation, quality report, Proceed→Workbench |
+| 2 — Workbench | ✅ **Done** | All 23 `StrategicSegmentBuilder` constructor params exposed (incl. 14 `sort_priority` values, `n_jobs`, `expand_log_mode`), presets, feature groups, grid search, templates, validation, latest-results preview |
+| 3 — Execution & Artifact Console | ✅ **Done** | 6-step timeline, live KPIs, log terminal + SQL inspector, cancel-with-partial-save, export hub (Logs.txt / SQL.sql / Config.json), `suite_data.db` persistence |
+| 4 — Results Dashboard & Visualization | ✅ **Done** | Summary cards, segments table (with scorecard weight column), 5 Plotly charts (lift-vs-volume scatter, stacked distribution, **rule-complexity sunburst** — inner ring groups segments by 1/2/3-way complexity, outer ring per segment sized by population, `StrategicSegmentScore` scorecard + JSON preview, diagnostics with **dedicated Feature Journey expander** (audit trail per feature), feature health report, no-segments explanation, export hub (CSV/JSON/SQL/HTML/ZIP) |
+| 5 — Leaderboard | ⬜ **Pending** | Reads existing `suite_data.db` experiments table; clone-to-workbench via `apply_config` |
+| 6 — Arena (1v1 comparison) | ⬜ **Pending** | |
+
+**Known caveats / deviations:**
+- ⚠ `builder.evaluate_final_coverage()` hangs in this environment (DuckDB file-lock on shared `db_path`) — never call it; coverage is computed locally (`compute_coverage_local`).
+- Scorecard (`StrategicSegmentScore`) needs ≥10 distinct segments for smooth decile resolution (library warns otherwise) — guide users to `max_segments ≥ 10`.
+- Solara→Streamlit conversion: `st.switch_page` / `st.page_link` for navigation; there is no Jupyter-native mode.
+- `db_path`/`db_temp_dir` are internal-only (per-experiment artifact dirs), not user-facing.
+
+---
+
 ## Module 1: Enhanced Data Source & Profiling
 
 ### Purpose
@@ -243,7 +264,7 @@ Monitor extraction progress and immediately access logs, SQL filters, and genera
 
 ---
 
-## Module 4: Results Dashboard & Visualization
+## Module 4: Results Dashboard & Visualization — ✅ Done
 
 ### Purpose
 Display extracted segments with rich context, metrics, and actionable export options.
@@ -617,9 +638,10 @@ By end of Phase 3:
 ## Next Steps
 
 1. ✅ **Review & approve** this enhanced design
-2. **Create Figma wireframes** for each module (interactive mockups)
-3. **Refactor Solara components** (extract reusable UI primitives)
-4. **Implement Phase 1** (6–8 weeks estimated)
-5. **Beta test** with internal users
-6. **Iterate** based on feedback
-7. **Release Phase 2 & 3**
+2. ✅ **Implement Module 1** (Data Loader) — `Module_1_data_loader.py`
+3. ✅ **Implement Module 2** (Workbench) — `Module_2_workbench.py`
+4. ✅ **Implement Module 3** (Execution & Artifact Console) — `Module_3_execution.py`
+5. ✅ **Implement Module 4** (Results Dashboard) — `Module_4_results.py`
+6. ⬜ **Implement Module 5** (Leaderboard) — reads `suite_data.db` experiments; clone-to-workbench via `apply_config`; sparklines
+7. ⬜ **Implement Module 6** (Arena) — 1v1 KPI face-off, param diff, SQL diff
+8. ⬜ **Beta test** with internal users, then iterate

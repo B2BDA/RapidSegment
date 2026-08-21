@@ -8,6 +8,7 @@ Run it interactively:
 Or fully headless:
     python3 Examples/compare_segmenters_general.py \
         --data data.csv --target Response --positive yes \
+        --ignore-columns id customer_id \
         --plot-out comparison.png --report-out comparison.md
 
 Behavior
@@ -18,6 +19,9 @@ Behavior
   found), asks you to pick one.
 * Checks whether the target is already binary 0/1 (or boolean). If not, it
   asks which class value should be treated as the positive event (1).
+* Optionally drops columns listed via --ignore-columns (IDs, PII, leakage
+  features, etc.) before fitting either model. RapidSegment also receives
+  them as ignore_features so they never enter IV ranking.
 * Runs the bare iterative decision tree and RapidSegment with comparable
   constraints, then prints per-method hierarchical tables, a summary, and
   optionally saves a capture-curve chart and/or a markdown report.
@@ -163,10 +167,43 @@ def ensure_binary(frame: pd.DataFrame, target: str, positive, allow_input: bool)
     return frame, f"'{positive}' mapped to 1; everything else to 0"
 
 
+def resolve_ignore_columns(frame: pd.DataFrame, ignore_columns, target: str):
+    """
+    Validate and normalize the list of columns to ignore.
+
+    Returns a list of column names that exist in the frame and are not the
+    target. Missing names are reported and skipped.
+    """
+    if not ignore_columns:
+        return []
+    resolved = []
+    missing = []
+    for col in ignore_columns:
+        if col == target:
+            print(f"  Warning: ignore column '{col}' is the target — skipping.")
+            continue
+        if col not in frame.columns:
+            missing.append(col)
+            continue
+        resolved.append(col)
+    if missing:
+        print(f"  Warning: ignore columns not found in data (skipped): {missing}")
+    if resolved:
+        print(f"  Ignoring columns: {resolved}")
+    return resolved
+
+
+def apply_ignore_columns(frame: pd.DataFrame, ignore_columns):
+    """Return a copy of frame with ignore_columns dropped."""
+    if not ignore_columns:
+        return frame
+    return frame.drop(columns=list(ignore_columns))
+
+
 # --------------------------------------------------------------------------- #
 # Running both segmenters
 # --------------------------------------------------------------------------- #
-def run_rapidsegment(frame, target, args):
+def run_rapidsegment(frame, target, args, ignore_features):
     builder = StrategicSegmentBuilder(
         target=target,
         min_sample_size=args.min_sample_size,
@@ -176,6 +213,7 @@ def run_rapidsegment(frame, target, args):
         max_segments=args.max_segments,
         max_feature_reuse=args.max_feature_reuse,
         sort_priority=args.rs_sort_priority,
+        ignore_features=list(ignore_features) if ignore_features else [],
     )
     start = time.time()
     segments = builder.extract_segments(frame)
@@ -199,10 +237,13 @@ def run_rapidsegment(frame, target, args):
     return rows, elapsed, builder.stop_reason
 
 
-def run_decision_tree(frame, target, args):
+def run_decision_tree(frame, target, args, ignore_columns):
+    # DT has no ignore_features param; drop columns before fitting so the
+    # comparison is fair (same feature space as RapidSegment).
+    dt_frame = apply_ignore_columns(frame, ignore_columns)
     start = time.time()
     raw = run_decision_tree_segmentation(
-        frame, target_col=target,
+        dt_frame, target_col=target,
         max_segments=args.max_segments,
         min_sample_size=args.dt_min_sample_size,
         min_events=args.dt_min_events,
@@ -366,6 +407,10 @@ def parse_args(argv=None):
     p.add_argument("--data", help="Path to the dataset (csv/parquet/arrow/feather/xlsx)")
     p.add_argument("--target", help="Target column name")
     p.add_argument("--positive", help="Which class value is the positive event (1)")
+    p.add_argument("--ignore-columns", nargs="*", default=None,
+                   help="Column names to ignore / drop before fitting "
+                        "(IDs, PII, leakage features). Passed to RapidSegment as "
+                        "ignore_features and dropped from the Decision Tree frame.")
     p.add_argument("--no-input", action="store_true",
                    help="Never prompt; error out when input would be required")
 
@@ -412,12 +457,14 @@ def main(argv=None) -> None:
     if note:
         print(f"  ({note})")
 
+    ignore_columns = resolve_ignore_columns(frame, args.ignore_columns, target)
+
     print("\nRunning RapidSegment (this can take a while) ...")
-    rs_rows, rs_time, rs_stop = run_rapidsegment(frame, target, args)
+    rs_rows, rs_time, rs_stop = run_rapidsegment(frame, target, args, ignore_columns)
     print(f"  -> {len(rs_rows)} segments in {rs_time:.1f}s")
 
     print("Running decision tree ...")
-    dt_rows, dt_time, dt_stop = run_decision_tree(frame, target, args)
+    dt_rows, dt_time, dt_stop = run_decision_tree(frame, target, args, ignore_columns)
     print(f"  -> {len(dt_rows)} segments in {dt_time:.1f}s")
 
     print_table(f"RapidSegment ({args.rs_sort_priority}, reuse={args.max_feature_reuse}, "
@@ -440,6 +487,7 @@ def main(argv=None) -> None:
             f"- Target: `{target}`" + (f" (positive class = `{args.positive}`)" if note else ""),
             f"- Rows: {total_pop:,} | positive events: {total_events:,} "
             f"({total_events/total_pop*100:.2f}%)",
+            f"- Ignored columns: {ignore_columns if ignore_columns else '(none)'}",
             f"- RapidSegment config: sort_priority=`{args.rs_sort_priority}`, "
             f"max_feature_reuse={args.max_feature_reuse}, min_lift={args.rs_min_lift}, "
             f"top_n_vars={args.top_n_vars}, max_segments={args.max_segments}",

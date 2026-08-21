@@ -16,6 +16,7 @@ ENV/
 
 # Python Cache (Compiled bytecode)
 __pycache__/
+experiments/
 *.pyc
 *.pyo
 *.pyd

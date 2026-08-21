@@ -17,7 +17,7 @@ Workflow:
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_string_dtype
+from pandas.api.types import is_bool_dtype, is_string_dtype
 from prettytable import PrettyTable
 from sklearn.preprocessing import LabelEncoder
 from sklearn.tree import DecisionTreeClassifier
@@ -185,15 +185,41 @@ def _best_path(frame, target, clf, base_rate, feature_names, encoders, constrain
     return best
 
 
-def run_decision_tree_segmentation(data: pd.DataFrame) -> list:
+def run_decision_tree_segmentation(
+    data: pd.DataFrame,
+    target_col: str = TARGET_COL,
+    max_segments: int = MAX_SEGMENTS,
+    max_depth: int = MAX_DEPTH,
+    min_samples_leaf: int = MIN_SAMPLES_LEAF,
+    min_sample_size: int = MIN_SAMPLE_SIZE,
+    min_events: int = MIN_EVENTS,
+    min_lift: float = MIN_LIFT,
+    class_weight: str = CLASS_WEIGHT,
+) -> list:
     """
     Run greedy hierarchical decision-path extraction and return the segment list.
+
+    The target column is expected to be binary. String targets are handled
+    automatically only when the two classes are literally {"yes", "no"};
+    boolean targets are mapped to 0/1. For any other encoding, binarize the
+    target yourself (0/1) before calling this function.
     """
     frame = data.copy()
 
-    if TARGET_COL in frame.columns and is_string_dtype(frame[TARGET_COL]):
-        frame[TARGET_COL] = (frame[TARGET_COL] == "yes").astype(int)
-    target = TARGET_COL
+    if target_col in frame.columns:
+        if is_string_dtype(frame[target_col]):
+            unique_values = {v for v in frame[target_col].dropna().unique()}
+            if unique_values <= {"yes", "no"}:
+                frame[target_col] = (frame[target_col] == "yes").astype(int)
+            else:
+                raise ValueError(
+                    f"Target column '{target_col}' has string values "
+                    f"{sorted(unique_values)}. Convert it to 0/1 first "
+                    f"(e.g. via compare_segmenters_general.py)."
+                )
+        elif is_bool_dtype(frame[target_col]):
+            frame[target_col] = frame[target_col].astype(int)
+    target = target_col
 
     categorical_cols = [c for c in frame.columns if is_string_dtype(frame[c])]
     encoders = {}
@@ -207,24 +233,24 @@ def run_decision_tree_segmentation(data: pd.DataFrame) -> list:
     total_events = int(frame[target].sum())
 
     constraints = {
-        "min_sample_size": MIN_SAMPLE_SIZE,
-        "min_events": MIN_EVENTS,
-        "min_lift": MIN_LIFT,
+        "min_sample_size": min_sample_size,
+        "min_events": min_events,
+        "min_lift": min_lift,
     }
 
     clf = DecisionTreeClassifier(
-        max_depth=MAX_DEPTH,
-        min_samples_leaf=MIN_SAMPLES_LEAF,
-        class_weight=CLASS_WEIGHT,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        class_weight=class_weight,
     )
 
     segments = []
     remaining = np.ones(len(frame), dtype=bool)
     stop_reason = "Reached max_segments"
 
-    for seg_id in range(1, MAX_SEGMENTS + 1):
+    for seg_id in range(1, max_segments + 1):
         residual = frame.loc[remaining]
-        if residual.shape[0] < MIN_SAMPLE_SIZE:
+        if residual.shape[0] < min_sample_size:
             stop_reason = "Residual population smaller than min_sample_size"
             break
 
@@ -255,7 +281,7 @@ def run_decision_tree_segmentation(data: pd.DataFrame) -> list:
         )
         remaining &= ~matched
 
-        if remaining.sum() < MIN_SAMPLE_SIZE:
+        if remaining.sum() < min_sample_size:
             stop_reason = "Remaining rows below min_sample_size"
             break
 

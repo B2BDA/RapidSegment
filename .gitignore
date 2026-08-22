@@ -17,6 +17,7 @@ ENV/
 # Python Cache (Compiled bytecode)
 __pycache__/
 experiments/
+.rapidsegment_suite
 *.pyc
 *.pyo
 *.pyd
@@ -31,4 +32,5 @@ experiments/
 *.parquet
 *.json
 *.png
+
 

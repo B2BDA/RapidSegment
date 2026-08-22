@@ -46,11 +46,19 @@ import streamlit as st
 from rapidsegment import StrategicSegmentBuilder
 
 # ── Constants & storage ───────────────────────────────────────────────────────
-SUITE_DIR = os.path.join(os.getcwd(), ".rapidsegment_suite")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
+SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
+DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
 SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
 TEMPLATES_FILE = os.path.join(SUITE_DIR, "templates.json")
+
+
+def active_db():
+    """Read the materialized *modified* dataset if it exists, else the raw load."""
+    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
 
 BIN_OPTIONS = ["Optimal (CART)", "Optimal (Quantile)", "Naive"]
 BIN_MAP = {
@@ -156,14 +164,14 @@ def rerun():
 
 
 def db_query(sql, read_only=True):
-    con = duckdb.connect(DB_FILE, read_only=read_only)
+    con = duckdb.connect(active_db(), read_only=read_only)
     result = con.execute(sql).df()
     con.close()
     return result
 
 
 def db_scalar(sql):
-    con = duckdb.connect(DB_FILE, read_only=True)
+    con = duckdb.connect(active_db(), read_only=True)
     result = con.execute(sql).fetchone()[0]
     con.close()
     return result
@@ -726,7 +734,7 @@ with right:
     if st.session_state.get("wb_preset") not in preset_names:
         st.session_state["wb_preset"] = "Quick Discovery"
     preset = st.selectbox("Preset templates", preset_names, key="wb_preset")
-    if st.button("Apply Preset", use_container_width=True):
+    if st.button("Apply Preset", width='stretch'):
         if preset == "Quick Discovery":
             preset_cfg = dict(QUICK_DISCOVERY)
         elif preset == "Conservative":
@@ -870,7 +878,7 @@ with left:
                 key="wb_new_group",
                 placeholder="e.g. Delinquency",
             )
-            if st.button("Add category", use_container_width=True):
+            if st.button("Add category", width='stretch'):
                 name = gname.strip()
                 groups = st.session_state["wb_groups"]
                 if not name or any(g["name"] == name for g in groups):
@@ -898,7 +906,7 @@ with left:
                     if st.button(
                         f"Remove category '{group['name']}'",
                         key=f"wb_group_rm_{gi}",
-                        use_container_width=True,
+                        width='stretch',
                     ):
                         st.session_state["wb_groups"].pop(gi)
                         clear_group_keys()
@@ -994,7 +1002,7 @@ with footer:
     f1, f2, f3 = st.columns([1.35, 1.7, 1.9], gap="medium")
     with f1:
         st.text_input("Template name", key="wb_template_name", placeholder="e.g. FastBinning")
-        if st.button("Save as Template", use_container_width=True):
+        if st.button("Save as Template", width='stretch'):
             tname = str(st.session_state["wb_template_name"]).strip()
             if not tname:
                 tname = str(st.session_state["wb_experiment_name"]).strip()
@@ -1025,7 +1033,7 @@ with footer:
             if st.session_state.get("wb_lb_exp") not in lb_names:
                 st.session_state["wb_lb_exp"] = lb_names[0]
             st.selectbox("Clone from Leaderboard", lb_names, key="wb_lb_exp")
-            if st.button("Apply Clone", use_container_width=True):
+            if st.button("Apply Clone", width='stretch'):
                 row = leaderboard[lb_names.index(st.session_state["wb_lb_exp"])]
                 cloned_cfg = cfg_from_json(row[3])
                 if cloned_cfg:
@@ -1036,7 +1044,7 @@ with footer:
 
     with f3:
         cfg_now = build_params()
-        if st.button("Run Experiment", type="primary", use_container_width=True):
+        if st.button("Run Experiment", type="primary", width='stretch'):
             issues = validate_params(cfg_now, all_cols)
             if issues:
                 notice.error("Validation failed:\n" + "\n".join(f"• {item}" for item in issues))
@@ -1075,11 +1083,11 @@ if exp:
         st.markdown("**Segments**")
         st.dataframe(
             seg_df[[c for c in seg_cols if c in seg_df.columns]],
-            height=300, use_container_width=True, hide_index=True,
+            height=300, width='stretch', hide_index=True,
         )
     if coverage:
         cov_df = pd.DataFrame(coverage)
         st.markdown("**Final coverage (events vs. non-events)**")
-        st.dataframe(cov_df, height=300, use_container_width=True, hide_index=True)
+        st.dataframe(cov_df, height=300, width='stretch', hide_index=True)
     else:
         st.caption("No coverage rows — experiment produced no segments.")

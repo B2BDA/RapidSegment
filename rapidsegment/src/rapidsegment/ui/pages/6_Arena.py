@@ -18,7 +18,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ── Paths (must match modules 1–5) ──────────────────────────────────────────
-SUITE_DIR = os.path.join(os.getcwd(), ".rapidsegment_suite")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
+SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
 ARTIFACTS_DIR = os.path.join(SUITE_DIR, "artifacts")
@@ -135,7 +137,7 @@ def _kpi_faceoff(ea, eb):
     df = pd.DataFrame([
         {"Metric": m, "Run A": round(av, 3), "Run B": round(bv, 3),
          "Winner": _winner(av, bv, hb)} for m, av, bv, hb in rows])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)
 
 
 def _param_diff_view(ca, cb):
@@ -145,7 +147,7 @@ def _param_diff_view(ca, cb):
          "Run B": str((cb or {}).get(k)),
          "Different?": "YES" if (ca or {}).get(k) != (cb or {}).get(k) else ""}
         for k in keys])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)
 
 
 def _segment_comparison(segs_a, segs_b):
@@ -180,7 +182,7 @@ def _segment_comparison(segs_a, segs_b):
     fig.update_layout(title="Segment Lift Distribution",
                       yaxis_title="lift", xaxis_title="segment index",
                       height=360, template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     if shared:
         st.write("**Shared segments — lift by run**")
@@ -189,7 +191,7 @@ def _segment_comparison(segs_a, segs_b):
              "B lift": round(float(rules_b[r].get("lift") or 0), 3),
              "Δ lift": round(float(rules_b[r].get("lift") or 0) -
                              float(rules_a[r].get("lift") or 0), 3)}
-            for r in sorted(shared)]), use_container_width=True, hide_index=True)
+            for r in sorted(shared)]), width='stretch', hide_index=True)
     else:
         st.caption("No shared segment rules between these runs.")
 
@@ -206,7 +208,7 @@ def _sql_diff(segs_a, segs_b):
          "Run A SQL": (rules_a.get(r, {}) or {}).get("sql_filter", ""),
          "Run B SQL": (rules_b.get(r, {}) or {}).get("sql_filter", "")}
         for r in all_rules])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)
 
 
 def main():

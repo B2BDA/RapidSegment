@@ -18,10 +18,23 @@ import streamlit as st
 from rapidsegment.utils.data_loader import UniversalDataLoader
 
 # ── Constants & storage ───────────────────────────────────────────────────────
-SUITE_DIR = os.path.join(os.getcwd(), ".rapidsegment_suite")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
+SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
+DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
 OAUTH_CACHE = os.path.join(SUITE_DIR, "oauth_cache.json")
+
+
+def active_db():
+    """Return the materialized *modified* dataset if it exists, else the raw load.
+
+    Module 1 writes a transformed copy (`module1_data_modified.duckdb`) when the
+    user applies metadata (type overrides + target 1/0). Every downstream read
+    goes through this so DuckDB sees the actual changed types, not just the UI.
+    """
+    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
 MAX_UPLOAD_MB = 500
 SAMPLE_NAMES = ["bank-full.csv", "train.csv"]
 
@@ -49,21 +62,21 @@ def db_write(arrow_table):
 
 
 def db_query(sql, read_only=True):
-    con = duckdb.connect(DB_FILE, read_only=read_only)
+    con = duckdb.connect(active_db(), read_only=read_only)
     result = con.execute(sql).df()
     con.close()
     return result
 
 
 def db_scalar(sql):
-    con = duckdb.connect(DB_FILE, read_only=True)
+    con = duckdb.connect(active_db(), read_only=True)
     result = con.execute(sql).fetchone()[0]
     con.close()
     return result
 
 
 def db_exec(sql):
-    con = duckdb.connect(DB_FILE)
+    con = duckdb.connect(active_db())
     con.execute(sql)
     con.close()
 
@@ -75,8 +88,86 @@ def reset_dataset():
         con.close()
     except Exception:
         pass
+    try:
+        if os.path.exists(DB_FILE_MOD):
+            os.remove(DB_FILE_MOD)
+    except Exception:
+        pass
     st.session_state["loaded"] = False
     st.session_state["tinfo"] = None
+    st.session_state["data_modified"] = False
+    rerun()
+
+
+# ── File helpers ──────────────────────────────────────────────────────────────
+def materialize_modified(positive_value=None):
+    """Write a transformed copy of the data to `module1_data_modified.duckdb`.
+
+    Applies the UI type overrides (CATEGORICAL → VARCHAR, NUMERIC → DOUBLE) and
+    converts the target column to integer 0/1 so the *actual* DuckDB types
+    reflect the metadata the user set (no per-run overhead downstream).
+
+    - positive_value=None  → binary target (known encoding) converted in place to 0/1
+    - positive_value=val   → multi-class target binarized into `<col>__binary` (0/1)
+    """
+    if not os.path.exists(DB_FILE):
+        st.error("Load a dataset first.")
+        return
+    con_raw = duckdb.connect(DB_FILE, read_only=True)
+    try:
+        raw = con_raw.execute("SELECT * FROM udl_data").df()
+    finally:
+        con_raw.close()
+    if raw.empty:
+        st.error("No data to materialize.")
+        return
+
+    overrides = st.session_state.get("type_overrides") or {}
+    target_col = st.session_state.get("target_col")
+    tinfo = st.session_state.get("tinfo") or {}
+
+    select_parts = []
+    new_target = target_col
+    for col in raw.columns:
+        if col == target_col and target_col:
+            if positive_value is not None:
+                pv = str(positive_value).replace("'", "''")
+                select_parts.append(f'"{col}"')
+                select_parts.append(
+                    f"(CASE WHEN LOWER(TRIM(CAST(\"{col}\" AS VARCHAR)))='{pv.lower()}' "
+                    f"THEN 1 ELSE 0 END)::INT AS \"{col}__binary\""
+                )
+                new_target = f"{col}__binary"
+            elif tinfo.get("is_binary") and tinfo.get("binary_label"):
+                select_parts.append(
+                    f"(CASE WHEN TRY_CAST(\"{col}\" AS DOUBLE) IS NOT NULL "
+                    f"THEN CAST(TRY_CAST(\"{col}\" AS DOUBLE) AS INT) "
+                    f"WHEN LOWER(TRIM(CAST(\"{col}\" AS VARCHAR))) "
+                    f"IN ('1','true','yes','y','t') THEN 1 ELSE 0 END)::INT AS \"{col}\""
+                )
+            else:
+                select_parts.append(f'"{col}"')
+        else:
+            ov = overrides.get(str(col), "AUTO")
+            if ov == "CATEGORICAL":
+                select_parts.append(f'CAST("{col}" AS VARCHAR) AS "{col}"')
+            elif ov == "NUMERIC":
+                select_parts.append(f'TRY_CAST("{col}" AS DOUBLE) AS "{col}"')
+            else:
+                select_parts.append(f'"{col}"')
+
+    select_sql = ", ".join(select_parts)
+    con = duckdb.connect(DB_FILE_MOD)
+    con.register("raw_df", raw)
+    con.execute("DROP TABLE IF EXISTS udl_data")
+    con.execute(f"CREATE TABLE udl_data AS SELECT {select_sql} FROM raw_df")
+    con.close()
+
+    if new_target != target_col:
+        st.session_state["target_col"] = new_target
+        st.session_state["tinfo"] = None
+    st.session_state["data_modified"] = True
+    st.success("✅ Modified dataset written to `module1_data_modified.duckdb` and is now active.")
     rerun()
 
 
@@ -122,14 +213,23 @@ def load_file_udl(path, encoding="Auto-detect"):
         raise
 
 
-def load_and_persist(arrow_table, progress=None):
+def load_and_persist(arrow_table, progress=None, dataset_name=None):
     if progress:
         progress.progress(0.2, text="Persisting to DuckDB…")
+    # A fresh raw load invalidates any previously materialized modified copy.
+    try:
+        if os.path.exists(DB_FILE_MOD):
+            os.remove(DB_FILE_MOD)
+    except Exception:
+        pass
     db_write(arrow_table)
     if progress:
         progress.progress(0.5, text="Profiling columns…")
     st.session_state["loaded"] = True
     st.session_state["tinfo"] = None
+    st.session_state["data_modified"] = False
+    if dataset_name:
+        st.session_state["dataset_name"] = dataset_name
     if progress:
         progress.progress(1.0, text="Done")
 
@@ -167,10 +267,17 @@ def find_sample_datasets():
 st.set_page_config(page_title="RapidSegment — Data Loader & Profiling", layout="wide")
 st.title("RapidSegment — Module 1: Data Source & Profiling")
 
+st.session_state["dataset_name"] = st.text_input(
+    "Dataset name",
+    value=st.session_state.get("dataset_name", ""),
+    help="Used to group experiments for the same dataset in the Leaderboard.",
+).strip()
+
 for key, val in {
     "loaded": False, "tinfo": None, "bq_client": None,
     "bq_datasets": None, "bq_preview": None,
     "type_overrides": {}, "target_col": None,
+    "dataset_name": "", "data_modified": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -199,7 +306,7 @@ with st.sidebar:
                         try:
                             progress = st.progress(0, text="Loading…")
                             data = load_file_udl(fp, encoding)
-                            load_and_persist(data, progress)
+                            load_and_persist(data, progress, dataset_name=os.path.basename(fp))
                             st.success(f"Loaded: {os.path.basename(fp)}")
                         except Exception as exc:
                             st.error(str(exc))
@@ -226,7 +333,7 @@ with st.sidebar:
                                     tmp_path = tmp.name
                                 progress = st.progress(0, text="Loading…")
                                 data = load_file_udl(tmp_path, encoding)
-                                load_and_persist(data, progress)
+                                load_and_persist(data, progress, dataset_name=uploaded.name)
                                 st.success(f"Loaded '{uploaded.name}'")
                             except Exception as exc:
                                 st.error(str(exc))
@@ -281,7 +388,7 @@ with st.sidebar:
                                 try:
                                     progress = st.progress(0, text="Loading from BigQuery…")
                                     data = UniversalDataLoader(project_id=pid, dataset_id=did, table_id=tid).load()
-                                    load_and_persist(data, progress)
+                                    load_and_persist(data, progress, dataset_name=full_id)
                                     st.success("Loaded from BigQuery")
                                 except Exception as exc:
                                     st.error(str(exc))
@@ -291,7 +398,7 @@ with st.sidebar:
         preview = st.session_state.get("bq_preview")
         if preview is not None:
             with st.expander("BigQuery streaming preview (first 1000 rows)"):
-                st.dataframe(preview, height=300, use_container_width=True)
+                st.dataframe(preview, height=300, width='stretch')
 
     else:  # Sample Datasets
         samples = find_sample_datasets()
@@ -304,7 +411,7 @@ with st.sidebar:
                     try:
                         progress = st.progress(0, text="Loading…")
                         data = UniversalDataLoader(file_path=fp).load()
-                        load_and_persist(data, progress)
+                        load_and_persist(data, progress, dataset_name=name)
                         st.success(f"Loaded sample: {name}")
                     except Exception as exc:
                         st.error(str(exc))
@@ -316,7 +423,7 @@ with st.sidebar:
                     try:
                         progress = st.progress(0, text="Loading…")
                         data = UniversalDataLoader(file_path=manual).load()
-                        load_and_persist(data, progress)
+                        load_and_persist(data, progress, dataset_name=os.path.basename(manual))
                         st.success("Loaded")
                     except Exception as exc:
                         st.error(str(exc))
@@ -335,7 +442,7 @@ with tab_preview:
     st.subheader("Preview — first 100 rows")
     df = db_query("SELECT * FROM udl_data LIMIT 100")
     st.caption(f"DuckDB: `{DB_FILE}`")
-    st.dataframe(df, height=360, use_container_width=True)
+    st.dataframe(df, height=360, width='stretch')
 
 
 # ── Shared profiling helpers ──────────────────────────────────────────────────
@@ -442,7 +549,7 @@ with tab_quality:
     else:
         st.warning(f"⚠️ {len(null_df)} column(s) have missing values (worst offenders first)")
         null_df["Null %"] = null_df["Null %"].apply(lambda x: f"{x:.1f}%")
-        st.dataframe(null_df[["Column", "Null %"]].reset_index(drop=True), use_container_width=True)
+        st.dataframe(null_df[["Column", "Null %"]].reset_index(drop=True), width='stretch')
 
     warns = build_metadata(summ)
     warns = warns[warns["Warning"] != "✓"]
@@ -471,16 +578,35 @@ with tab_meta:
                     "Column": st.column_config.TextColumn(disabled=True),
                     "Override": st.column_config.SelectboxColumn(options=["AUTO", "NUMERIC", "CATEGORICAL"]),
                 },
-                hide_index=True, use_container_width=True,
+                hide_index=True, width='stretch',
             )
         except AttributeError:
-            edited = st.data_editor(base, hide_index=True, use_container_width=True)
+            edited = st.data_editor(base, hide_index=True, width='stretch')
         if st.button("Apply type overrides"):
             st.session_state["type_overrides"] = dict(zip(edited["Column"], edited["Override"]))
-            st.success("Overrides applied")
+            st.success("Overrides stored — click 'Apply metadata' below to materialize them.")
+
+    st.divider()
+    st.subheader("Materialize modified dataset")
+    st.caption(
+        "Write a transformed copy (`module1_data_modified.duckdb`) with the type "
+        "overrides applied and the target converted to 1/0. Downstream modules "
+        "(Workbench, Execution, Results) read this copy automatically."
+    )
+    if st.button("Apply metadata & create modified dataset", type="primary"):
+        materialize_modified()
+    if os.path.exists(DB_FILE_MOD):
+        st.success("✅ Modified dataset is active.")
+        if st.button("Discard modified dataset (revert to raw)"):
+            try:
+                os.remove(DB_FILE_MOD)
+            except Exception:
+                pass
+            st.session_state["data_modified"] = False
+            rerun()
 
     meta = build_metadata(summ)
-    st.dataframe(meta, height=420, use_container_width=True, hide_index=True)
+    st.dataframe(meta, height=420, width='stretch', hide_index=True)
 
 
 # ── Tab 4: Target Selection ───────────────────────────────────────────────────
@@ -563,22 +689,16 @@ with tab_target:
         else:
             st.warning(f"⚠️ Multi-class — {info['n_distinct']} distinct values. Use the binarization helper below.")
 
-            with st.expander("Binarization helper"):
-                dist = info["dist_df"]
-                options = [str(v) for v in dist["val"].tolist() if v is not None][:10]
-                pos = st.selectbox("Positive (event) value", options)
-                if st.button("Binarize into 0/1 column"):
-                    col_safe = sel_col.replace('"', '""')
-                    pos_esc = pos.replace("'", "''")
-                    db_exec(
-                        f'CREATE OR REPLACE TABLE udl_data AS '
-                        f'SELECT *, CASE WHEN CAST("{col_safe}" AS VARCHAR) = \'{pos_esc}\' THEN 1 ELSE 0 END '
-                        f'AS "{col_safe}__binary" FROM udl_data'
-                    )
-                    st.session_state["tinfo"] = None
-                    st.session_state["target_col"] = f"{sel_col}__binary"
-                    st.success(f"Created binary column `{sel_col}__binary` — select it and validate.")
-                    rerun()
+        with st.expander("Binarization helper"):
+            st.caption(
+                "Multi-class target? Pick the positive value to create a 0/1 column "
+                "(also applies type overrides and writes the modified dataset)."
+            )
+            dist = info["dist_df"]
+            options = [str(v) for v in dist["val"].tolist() if v is not None][:10]
+            pos = st.selectbox("Positive (event) value", options)
+            if st.button("Binarize into 0/1 column"):
+                materialize_modified(positive_value=pos)
 
         if info["null_pct"] > 0:
             st.error(f"⚠️ Target column has {info['null_pct']:.1f}% nulls ({info['null_count']:,} rows)")
@@ -598,7 +718,7 @@ with tab_target:
             height=350, margin=dict(l=40, r=20, t=50, b=40),
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
@@ -610,13 +730,13 @@ ready = bool(info and info["is_binary"])
 
 c1, c2, c3 = st.columns([2, 2, 3])
 with c1:
-    if st.button("Proceed to Workbench", type="primary", disabled=not ready, use_container_width=True):
+    if st.button("Proceed to Workbench", type="primary", disabled=not ready, width='stretch'):
         st.session_state["workbench_ready"] = True
         st.switch_page("pages/2_Workbench.py")
     if not ready:
         st.caption("Enabled after a binary target is validated.")
 with c2:
-    if st.button("Upload Different File", use_container_width=True):
+    if st.button("Upload Different File", width='stretch'):
         reset_dataset()
 with c3:
     summ = db_query("SUMMARIZE udl_data")
@@ -624,7 +744,7 @@ with c3:
     st.download_button(
         "Download Profiling Report (CSV)",
         report_df.to_csv(index=False).encode("utf-8"),
-        file_name="profiling_report.csv", mime="text/csv", use_container_width=True,
+        file_name="profiling_report.csv", mime="text/csv", width='stretch',
     )
     report_json = json.dumps(
         {"columns": report_df.to_dict(orient="records"),
@@ -635,5 +755,5 @@ with c3:
     st.download_button(
         "Download Profiling Report (JSON)",
         report_json.encode("utf-8"),
-        file_name="profiling_report.json", mime="application/json", use_container_width=True,
+        file_name="profiling_report.json", mime="application/json", width='stretch',
     )

@@ -1,9 +1,11 @@
 """
-RapidSegment — Module 5: Enhanced Leaderboard (Experiment Tracking)
-────────────────────────────────────────────────────────────────────
-Reads experiments from `suite_data.db`, ranks them, shows inline
-sparklines per experiment, offers row-level actions (clone to workbench,
-view results, compare, duplicate, delete, export), and summary stats.
+RapidSegment — Module 5: Leaderboard (Best Experiment per Dataset)
+──────────────────────────────────────────────────────────────────
+For a single dataset, ranks every experiment by a chosen performance KPI
+(avg lift, max lift, coverage, segment count) and highlights the best
+performer. Reads from `suite_data.db`, offers row-level actions (clone to
+workbench, view results, compare, duplicate, delete, export) and summary
+stats.
 
 Run from the app root:  streamlit run app.py  (then open "5 · Leaderboard")
 Standalone mirror:  Module_5_leaderboard.py
@@ -11,16 +13,18 @@ Standalone mirror:  Module_5_leaderboard.py
 
 import json
 import os
+import shutil
 import uuid
 from datetime import datetime
 
 import duckdb
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
 # ── Paths (must match modules 1–4) ──────────────────────────────────────────
-SUITE_DIR = os.path.join(os.getcwd(), ".rapidsegment_suite")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
+SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
 ARTIFACTS_DIR = os.path.join(SUITE_DIR, "artifacts")
@@ -29,325 +33,334 @@ EXP_COLS = [
     "exp_id", "name", "created_at", "data_rows", "data_cols", "status",
     "execution_time_sec", "target_col", "primary_key", "builder_params",
     "segments_count", "avg_lift", "max_lift", "coverage_pct",
-    "baseline_rate", "error_msg",
+    "baseline_rate", "error_msg", "dataset_name",
 ]
 
-
-def _jsonable(v):
-    if isinstance(v, dict):
-        return {k: _jsonable(val) for k, val in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_jsonable(x) for x in v]
-    if isinstance(v, (str, int, float, bool)) or v is None:
-        return v
-    return str(v)
+# Ranking KPIs the user can pick from
+KPI_OPTS = {
+    "Avg Lift ×": "avg_lift",
+    "Max Lift ×": "max_lift",
+    "Coverage %": "coverage_pct",
+    "Segments": "segments_count",
+}
 
 
-# ── Data access ──────────────────────────────────────────────────────────────
+# ── Column coercion helpers (DB gives Decimal/None) ──────────────────────────
+def _s(x):
+    return str(x) if x is not None else ""
+
+
+def _i(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _f(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _b(x):
+    return bool(x)
+
+
+def _dataset_name(r):
+    """The dataset a run belongs to (set in Module 1)."""
+    return _s(r.get("dataset_name")) or "(unnamed)"
+
+
+# ── Read ─────────────────────────────────────────────────────────────────────
 def read_all_experiments():
-    """Return all experiments as a list of dicts (newest first)."""
+    """Read every experiment row. Mirrors the columns written by Module 3."""
+    st.session_state.pop("m5_read_error", None)
     if not os.path.exists(SUITE_DB):
         return []
     try:
-        con = duckdb.connect(SUITE_DB, read_only=True)
-        has = con.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_name='experiments'"
-        ).fetchone()
-        if not has:
-            con.close()
-            return []
+        con = duckdb.connect(SUITE_DB, read_only=False)
+        try:
+            con.execute("ALTER TABLE experiments ADD COLUMN dataset_name TEXT")
+        except Exception:
+            pass
         rows = con.execute(
-            "SELECT {} FROM experiments ORDER BY created_at DESC".format(
-                ", ".join(EXP_COLS)
-            )
+            f"SELECT {','.join(EXP_COLS)} FROM experiments ORDER BY created_at DESC"
         ).fetchall()
         con.close()
-        out = []
-        for r in rows:
-            d = dict(zip(EXP_COLS, r))
-            try:
-                d["config"] = _jsonable(json.loads(d["builder_params"])) \
-                    if d.get("builder_params") else {}
-            except Exception:
-                d["config"] = {}
-            out.append(d)
-        return out
-    except Exception as exc:
-        st.error(f"Failed to read experiments: {exc}")
+    except Exception as e:  # surface, don't crash the page
+        st.session_state["m5_read_error"] = str(e)
         return []
 
+    out = []
+    for r in rows:
+        d = dict(zip(EXP_COLS, r))
+        for k in ("builder_params", "error_msg"):
+            if isinstance(d.get(k), str) and d[k]:
+                try:
+                    d[k] = json.loads(d[k])
+                except Exception:
+                    pass
+        out.append(d)
+    return out
 
+
+def load_full_experiment(exp_id):
+    p = os.path.join(ARTIFACTS_DIR, exp_id, "result.json")
+    if not os.path.exists(p):
+        st.error(f"No artifacts for `{exp_id}`.")
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Could not load run artifacts: {e}")
+        return None
+
+
+# ── Write / mutate ────────────────────────────────────────────────────────────
 def delete_experiment(exp_id):
     con = duckdb.connect(SUITE_DB)
     con.execute("DELETE FROM experiments WHERE exp_id = ?", [exp_id])
     con.close()
+    art = os.path.join(ARTIFACTS_DIR, exp_id)
+    if os.path.isdir(art):
+        shutil.rmtree(art, ignore_errors=True)
 
 
-def duplicate_experiment(exp):
-    new_id = uuid.uuid4().hex
-    created = datetime.now()
+def duplicate_experiment(exp_id):
+    full = load_full_experiment(exp_id)
+    if not full:
+        return
+    new_id = str(uuid.uuid4())
+    row = dict(full)
+    row["exp_id"] = new_id
+    row["name"] = f"{full.get('name', 'exp')} (copy)"
+    row["created_at"] = datetime.now().isoformat()
     con = duckdb.connect(SUITE_DB)
+    placeholders = ",".join(["?"] * len(EXP_COLS))
     con.execute(
-        """
-        INSERT OR REPLACE INTO experiments
-        (exp_id, name, created_at, data_rows, data_cols, status,
-         execution_time_sec, target_col, primary_key, builder_params,
-         segments_count, avg_lift, max_lift, coverage_pct, baseline_rate, error_msg)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            new_id, f"{exp['name']} (copy)", created,
-            exp["data_rows"], exp["data_cols"], exp["status"],
-            exp["execution_time_sec"], exp["target_col"], exp["primary_key"],
-            json.dumps(_jsonable(exp["config"])),
-            exp["segments_count"], exp["avg_lift"], exp["max_lift"],
-            exp["coverage_pct"], exp["baseline_rate"], exp["error_msg"],
-        ],
+        f"INSERT OR REPLACE INTO experiments ({','.join(EXP_COLS)}) VALUES ({placeholders})",
+        [row.get(c) for c in EXP_COLS],
     )
     con.close()
-    return new_id
+    os.makedirs(os.path.join(ARTIFACTS_DIR, new_id), exist_ok=True)
+    src = os.path.join(ARTIFACTS_DIR, exp_id, "result.json")
+    dst = os.path.join(ARTIFACTS_DIR, new_id, "result.json")
+    if os.path.exists(src):
+        shutil.copy(src, dst)
+    st.success(f"Duplicated → **{row['name']}**")
 
 
-def load_full_experiment(exp_id):
-    """Build a full experiment dict (DB row + recovered result.json) for
-    handing off to Module 4's 'View Results'."""
-    rows = read_all_experiments()
-    exp = next((e for e in rows if e["exp_id"] == exp_id), None)
-    if not exp:
-        return None
-    result = {
-        "segments_count": int(exp["segments_count"] or 0),
-        "avg_lift": float(exp["avg_lift"] or 0),
-        "max_lift": float(exp["max_lift"] or 0),
-        "coverage_pct": float(exp["coverage_pct"] or 0),
-        "baseline_rate_pct": float(exp["baseline_rate"] or 0),
-        "error_msg": exp["error_msg"],
-        "segments": [], "coverage": [], "stop_reason": None,
-    }
-    art = os.path.join(ARTIFACTS_DIR, exp_id, "result.json")
-    if os.path.exists(art):
-        try:
-            with open(art, "r", encoding="utf-8") as fh:
-                saved = json.load(fh)
-            res = saved.get("result") or {}
-            result["segments"] = res.get("segments") or []
-            result["coverage"] = res.get("coverage") or []
-            result["stop_reason"] = res.get("stop_reason")
-        except Exception:
-            pass
-    return {
-        "exp_id": exp["exp_id"], "name": exp["name"],
-        "created_at": str(exp["created_at"]), "status": exp["status"],
-        "execution_time_sec": float(exp["execution_time_sec"] or 0),
-        "target_col": exp["target_col"], "primary_key": exp["primary_key"] or "",
-        "data_rows": int(exp["data_rows"] or 0),
-        "data_cols": int(exp["data_cols"] or 0),
-        "config": exp["config"], "result": result, "logs": [],
-    }
-
-
-def clone_to_workbench(exp):
-    st.session_state["wb_pending"] = _jsonable(exp["config"])
-    st.switch_page("pages/2_Workbench.py")
+def clone_to_workbench(exp_id):
+    full = load_full_experiment(exp_id)
+    if not full:
+        return
+    cfg = dict(full.get("config") or {})
+    cfg["exp_name"] = f"Clone-{full.get('name', 'exp')}"
+    st.session_state["m2_exp_cfg"] = cfg
+    st.session_state["m2_just_cloned"] = True
+    st.success("Cloned into **Module 2 · Workbench**. Switch there to run it.")
 
 
 def view_results(exp_id):
-    st.session_state["experiment"] = load_full_experiment(exp_id)
-    st.switch_page("pages/4_Results_Dashboard.py")
+    st.session_state["m4_view_exp"] = exp_id
+    st.success("Open **Module 4 · Results Dashboard** → choose 'View a saved run'.")
+
+
+def export_run(exp_id):
+    full = load_full_experiment(exp_id)
+    if not full:
+        return
+    st.download_button(
+        "Download run JSON",
+        data=json.dumps(full, indent=2, default=str),
+        file_name=f"{exp_id}.json",
+        mime="application/json",
+        key=f"exp_{exp_id}",
+    )
 
 
 def param_diff(cfg_a, cfg_b):
-    """Return list of (key, val_a, val_b) for keys whose values differ."""
-    keys = sorted(set((cfg_a or {})) | set((cfg_b or {})))
-    diffs = []
-    for k in keys:
-        a, b = (cfg_a or {}).get(k), (cfg_b or {}).get(k)
-        if a != b:
-            diffs.append((k, a, b))
-    return diffs
+    keys = sorted(set(cfg_a) | set(cfg_b))
+    return [(k, cfg_a.get(k), cfg_b.get(k)) for k in keys if cfg_a.get(k) != cfg_b.get(k)]
 
 
-def most_used_params(rows):
-    """Aggregate config fields across experiments for the summary panel."""
-    agg = {}
-    for r in rows:
-        cfg = r.get("config") or {}
-        for k, v in cfg.items():
-            agg.setdefault(k, {})
-            agg[k][v] = agg[k].get(v, 0) + 1
-    out = {}
-    for k, counts in agg.items():
-        top_val, top_n = max(counts.items(), key=lambda kv: kv[1])
-        out[k] = (top_val, top_n, len(rows))
-    return out
+# ── Summary ───────────────────────────────────────────────────────────────────
+def _summary_cards(rows, sig, best, kpi_label):
+    completed = [r for r in rows if r["status"] == "completed"]
+    n_comp = len(completed)
+    best_lift = max((_f(r.get("avg_lift")) for r in completed), default=0.0)
+    best_cov = max((_f(r.get("coverage_pct")) for r in completed), default=0.0)
+    cols = st.columns(4)
+    cols[0].metric("Experiments", len(rows), help=f"Dataset: {sig}")
+    cols[1].metric("Completed", n_comp)
+    cols[2].metric("Best avg lift", f"{best_lift:.2f}×")
+    cols[3].metric("Best coverage", f"{best_cov:.1f}%")
+    if best:
+        st.success(
+            f"🏆 **Best performer** ({kpi_label}): **{best['name']}** "
+            f"— avg lift {_f(best.get('avg_lift')):.2f}×, "
+            f"max lift {_f(best.get('max_lift')):.2f}×, "
+            f"coverage {_f(best.get('coverage_pct')):.1f}%, "
+            f"{_i(best.get('segments_count'))} segments."
+        )
 
 
-# ── Page rendering ────────────────────────────────────────────────────────────
-def _sparkline(exp):
-    labels = ["Avg Lift", "Max Lift", "Coverage %"]
-    vals = [float(exp["avg_lift"] or 0), float(exp["max_lift"] or 0),
-            float(exp["coverage_pct"] or 0)]
-    fig = go.Figure(go.Bar(x=labels, y=vals,
-                           marker_color=["#58a6ff", "#3fb950", "#d29922"]))
-    fig.update_layout(height=180, margin=dict(l=10, r=10, t=10, b=10),
-                     yaxis_title="value", template="plotly_white")
-    return fig
-
-
-def _summary_cards(rows):
-    total = len(rows)
-    avg_time = (sum(float(r["execution_time_sec"] or 0) for r in rows) / total
-                if total else 0.0)
-    best = max(rows, key=lambda r: float(r["avg_lift"] or 0)) if rows else None
-    used = most_used_params(rows)
-    bm = used.get("binning_method")
-    bm_txt = f"{bm[0]} ({bm[1]}/{bm[2]})" if bm else "—"
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Experiments", total)
-    c2.metric("Avg extraction time", f"{avg_time:.1f}s")
-    c3.metric("Best avg lift",
-              f"{float(best['avg_lift'] or 0):.2f}×" if best else "—",
-              help=(best["name"] if best else ""))
-    c4.metric("Top binning method", bm_txt)
-
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    st.title("5 · Leaderboard — Experiment Tracking")
-    st.caption("Rank, filter and audit every segmentation run. Clone any "
-               "config back to the Workbench, drill into Results, or compare runs.")
+    st.title("🏆 Leaderboard — Best Experiment per Dataset")
+    st.caption(
+        "Rank every experiment run on a dataset by a performance KPI and "
+        "spot the winner. No date filter — every saved run counts."
+    )
 
     rows = read_all_experiments()
-
-    # Sidebar filters
-    with st.sidebar:
-        st.header("Filters")
-        q = st.text_input("Search name", "")
-        status_opts = sorted({r["status"] for r in rows}) if rows else []
-        statuses = st.multiselect("Status", status_opts, default=status_opts)
-        min_lift = st.slider("Min avg lift", 0.0, 5.0, 0.0, 0.1)
-        if rows:
-            dates = [pd.to_datetime(r["created_at"]) for r in rows]
-            dmin, dmax = min(dates).date(), max(dates).date()
-            rng = st.date_input("Date range", (dmin, dmax))
-            f_dmin = pd.to_datetime(rng[0]) if len(rng) == 2 else None
-            f_dmax = pd.to_datetime(rng[1]) if len(rng) == 2 else None
-        else:
-            f_dmin = f_dmax = None
-
-    # Apply filters
-    if rows:
-        filtered = [r for r in rows
-                    if q.lower() in r["name"].lower()
-                    and r["status"] in statuses
-                    and float(r["avg_lift"] or 0) >= min_lift]
-        if f_dmin and f_dmax:
-            filtered = [r for r in filtered
-                        if f_dmin <= pd.to_datetime(r["created_at"]) <= f_dmax]
-        rows_view = filtered
-    else:
-        rows_view = []
+    read_err = st.session_state.get("m5_read_error")
+    if read_err:
+        st.error(f"Could not read the experiment database: `{read_err}`")
+        st.caption(f"DB path: `{SUITE_DB}`")
 
     if not rows:
-        st.info("No experiments yet. Run a segmentation in the Workbench to "
-                "populate the leaderboard.")
-        st.page_link("pages/2_Workbench.py", label="Go to Workbench →",
-                     icon="⚙️")
+        st.info(
+            "No experiments yet. Run a configuration in **Module 3 · Execution "
+            "Console** — it is saved automatically and shows up here."
+        )
         return
 
-    _summary_cards(rows_view)
+    # Group by dataset name (set in Module 1)
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault(_dataset_name(r), []).append(r)
 
-    # Ranked grid
-    st.subheader("Ranked Experiments")
-    grid = pd.DataFrame([{
-        "Rank": i + 1,
-        "Name": r["name"],
-        "Created": str(r["created_at"])[:19],
-        "Rows": int(r["data_rows"] or 0),
-        "Cols": int(r["data_cols"] or 0),
-        "Segments": int(r["segments_count"] or 0),
-        "Avg Lift": round(float(r["avg_lift"] or 0), 3),
-        "Max Lift": round(float(r["max_lift"] or 0), 3),
-        "Coverage %": round(float(r["coverage_pct"] or 0), 2),
-        "Status": r["status"],
-    } for i, r in enumerate(rows_view)])
-    if not grid.empty:
-        st.dataframe(grid, use_container_width=True, hide_index=True)
-    else:
+    ds_list = sorted(groups, key=lambda s: (-len(groups[s]), s))
+    default_idx = 0
+    sel = st.selectbox(
+        "Dataset",
+        options=["All datasets"] + ds_list,
+        index=default_idx,
+        help="Experiments are grouped by the dataset name set in Module 1.",
+    )
+    view_rows = rows if sel == "All datasets" else groups[sel]
+
+    # Ranking control
+    kpi_label = st.radio(
+        "Rank by performance KPI", list(KPI_OPTS.keys()),
+        horizontal=True, index=0,
+    )
+    kpi_key = KPI_OPTS[kpi_label]
+
+    # Light filters (no date picker)
+    col_f, col_s = st.columns([1, 2])
+    with col_f:
+        statuses = sorted({r["status"] for r in view_rows})
+        sel_status = st.multiselect("Status", statuses, default=statuses)
+    with col_s:
+        q = st.text_input("Search by name", placeholder="experiment name…")
+
+    filtered = [
+        r for r in view_rows
+        if r["status"] in sel_status and q.lower() in _s(r["name"]).lower()
+    ]
+
+    if not filtered:
         st.warning("No experiments match the current filters.")
         return
 
-    # Inspect / actions
-    st.subheader("Inspect & Actions")
-    labels = {r["exp_id"]: f"{r['name']}  ({str(r['created_at'])[:19]})"
-              for r in rows_view}
-    sel = st.selectbox("Select experiment", list(labels.keys()),
-                       format_func=lambda x: labels[x])
-    exp = next(r for r in rows_view if r["exp_id"] == sel)
+    # Best = top *completed* run by the chosen KPI
+    completed = [r for r in filtered if r["status"] == "completed"]
+    best = None
+    if completed:
+        best = max(completed, key=lambda r: _f(r.get(kpi_key)) or 0.0)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Avg Lift", f"{float(exp['avg_lift'] or 0):.2f}×")
-    m2.metric("Max Lift", f"{float(exp['max_lift'] or 0):.2f}×")
-    m3.metric("Coverage", f"{float(exp['coverage_pct'] or 0):.1f}%")
-    m4.metric("Segments", int(exp["segments_count"] or 0))
-    m5.metric("Status", exp["status"])
-    st.plotly_chart(_sparkline(exp), use_container_width=True)
+    _summary_cards(filtered, sel, best, kpi_label)
 
-    b1, b2, b3, b4, b5 = st.columns(5)
-    if b1.button("Clone to Workbench", key="m5_clone", use_container_width=True):
-        clone_to_workbench(exp)
-    if b2.button("View Results", key="m5_view", use_container_width=True):
-        view_results(exp["exp_id"])
-    cfg_json = json.dumps(_jsonable(exp["config"]), indent=2)
-    b3.download_button("Export Config", cfg_json,
-                       file_name=f"{exp['exp_id']}_config.json",
-                       mime="application/json", use_container_width=True)
-    if b4.button("Duplicate", key="m5_dup", use_container_width=True):
-        duplicate_experiment(exp)
-        st.rerun()
-    if b5.button("Delete", key="m5_del", use_container_width=True,
-                 type="primary"):
-        delete_experiment(exp["exp_id"])
-        st.success("Experiment deleted.")
-        st.rerun()
+    # Ranked grid (completed first, then by KPI desc)
+    ranked = sorted(
+        filtered,
+        key=lambda r: (r["status"] != "completed", -(_f(r.get(kpi_key)) or 0.0)),
+    )
+    grid = pd.DataFrame([
+        {
+            "#": i,
+            "🏆": "🏆 Best" if best and r["exp_id"] == best["exp_id"] else "",
+            "Experiment": r["name"],
+            "Dataset": _dataset_name(r),
+            "Status": r["status"],
+            "Avg Lift ×": round(_f(r.get("avg_lift")) or 0.0, 3),
+            "Max Lift ×": round(_f(r.get("max_lift")) or 0.0, 3),
+            "Coverage %": round(_f(r.get("coverage_pct")) or 0.0, 1),
+            "Segments": _i(r.get("segments_count")),
+            "Rows": _i(r.get("data_rows")),
+            "Time (s)": round(_f(r.get("execution_time_sec")) or 0.0, 2),
+        }
+        for i, r in enumerate(ranked, 1)
+    ])
+    st.dataframe(grid, width='stretch', hide_index=True)
 
-    # Compare (lightweight face-off; full Arena is Module 6)
-    st.subheader("Compare Two Runs")
-    c_ids = list(labels.keys())
-    ca, cb = st.columns(2)
-    a_id = ca.selectbox("Run A", c_ids, format_func=lambda x: labels[x],
-                        key="m5_a")
-    b_id = cb.selectbox("Run B", c_ids, index=min(1, len(c_ids) - 1),
-                        format_func=lambda x: labels[x], key="m5_b")
-    ea = next(r for r in rows if r["exp_id"] == a_id)
-    eb = next(r for r in rows if r["exp_id"] == b_id)
-    if a_id != b_id:
-        cmp = pd.DataFrame([
-            {"Metric": "Avg Lift", "Run A": round(float(ea["avg_lift"] or 0), 3),
-             "Run B": round(float(eb["avg_lift"] or 0), 3)},
-            {"Metric": "Max Lift", "Run A": round(float(ea["max_lift"] or 0), 3),
-             "Run B": round(float(eb["max_lift"] or 0), 3)},
-            {"Metric": "Coverage %", "Run A": round(float(ea["coverage_pct"] or 0), 2),
-             "Run B": round(float(eb["coverage_pct"] or 0), 2)},
-            {"Metric": "Segments", "Run A": int(ea["segments_count"] or 0),
-             "Run B": int(eb["segments_count"] or 0)},
-            {"Metric": "Rows", "Run A": int(ea["data_rows"] or 0),
-             "Run B": int(eb["data_rows"] or 0)},
-            {"Metric": "Time (s)", "Run A": round(float(ea["execution_time_sec"] or 0), 1),
-             "Run B": round(float(eb["execution_time_sec"] or 0), 1)},
-        ])
-        st.dataframe(cmp, use_container_width=True, hide_index=True)
-        diffs = param_diff(ea["config"], eb["config"])
-        if diffs:
-            st.write("**Parameter differences**")
-            st.dataframe(
-                pd.DataFrame(
-                    [{"Parameter": k, "Run A": str(v), "Run B": str(w)}
-                     for k, v, w in diffs]),
-                use_container_width=True, hide_index=True)
+    # Row-level actions
+    st.divider()
+    st.subheader("Actions")
+    for r in ranked:
+        label = f"{'🏆 ' if best and r['exp_id'] == best['exp_id'] else ''}{r['name']}  ·  {r['status']}"
+        with st.expander(label):
+            if r["status"] != "completed":
+                st.caption(f"⚠️ {_s(r.get('error_msg')) or 'Run did not complete.'}")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            with c1:
+                if st.button("Clone → Workbench", key=f"cl_{r['exp_id']}"):
+                    clone_to_workbench(r["exp_id"])
+            with c2:
+                if st.button("View results", key=f"vw_{r['exp_id']}"):
+                    view_results(r["exp_id"])
+            with c3:
+                export_run(r["exp_id"])
+            with c4:
+                if st.button("Duplicate", key=f"dp_{r['exp_id']}"):
+                    duplicate_experiment(r["exp_id"])
+            with c5:
+                if st.button("🗑 Delete", key=f"dl_{r['exp_id']}", type="primary"):
+                    st.session_state[f"m5_confirm_{r['exp_id']}"] = True
+            if st.session_state.get(f"m5_confirm_{r['exp_id']}"):
+                st.warning(f"Delete **{r['name']}**? This cannot be undone.")
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    if st.button("Yes, delete", key=f"dly_{r['exp_id']}", type="primary"):
+                        delete_experiment(r["exp_id"])
+                        st.session_state.pop(f"m5_confirm_{r['exp_id']}", None)
+                        st.rerun()
+                with cc2:
+                    if st.button("Cancel", key=f"dlc_{r['exp_id']}"):
+                        st.session_state.pop(f"m5_confirm_{r['exp_id']}", None)
+
+    # Compare two runs
+    st.divider()
+    st.subheader("Compare two runs")
+    opts = [(r["exp_id"], r["name"]) for r in ranked]
+    if len(opts) >= 2:
+        a_id = st.selectbox("Run A", opts, format_func=lambda o: o[1], key="cmp_a")
+        b_id = st.selectbox(
+            "Run B", opts, index=min(1, len(opts) - 1),
+            format_func=lambda o: o[1], key="cmp_b",
+        )
+        if a_id != b_id:
+            fa = load_full_experiment(a_id[0])
+            fb = load_full_experiment(b_id[0])
+            if fa and fb:
+                diffs = param_diff(fa.get("config") or {}, fb.get("config") or {})
+                if diffs:
+                    st.dataframe(
+                        pd.DataFrame(
+                            [{"Parameter": k, "Run A": str(v), "Run B": str(w)}
+                             for k, v, w in diffs]),
+                        width='stretch', hide_index=True)
+                else:
+                    st.success("Configs are identical.")
         else:
-            st.success("Configs are identical.")
+            st.info("Pick two different runs to compare.")
     else:
-        st.info("Pick two different runs to compare.")
+        st.info("Need at least two runs to compare.")
 
 
 if __name__ == "__main__":

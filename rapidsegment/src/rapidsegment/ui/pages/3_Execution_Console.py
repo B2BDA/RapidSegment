@@ -44,10 +44,18 @@ import streamlit as st
 from rapidsegment import StrategicSegmentBuilder
 
 # ── Constants & storage ───────────────────────────────────────────────────────
-SUITE_DIR = os.path.join(os.getcwd(), ".rapidsegment_suite")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
+SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
+DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
 SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
+
+
+def active_db():
+    """Read the materialized *modified* dataset if it exists, else the raw load."""
+    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
 
 REFRESH_SECONDS = 2.0  # live-metrics refresh cadence (2–5 s per spec)
 
@@ -74,14 +82,14 @@ def rerun():
 
 
 def db_query(sql, read_only=True):
-    con = duckdb.connect(DB_FILE, read_only=read_only)
+    con = duckdb.connect(active_db(), read_only=read_only)
     result = con.execute(sql).df()
     con.close()
     return result
 
 
 def db_scalar(sql):
-    con = duckdb.connect(DB_FILE, read_only=True)
+    con = duckdb.connect(active_db(), read_only=True)
     result = con.execute(sql).fetchone()[0]
     con.close()
     return result
@@ -398,14 +406,20 @@ def upsert_experiment(exp):
             max_lift DOUBLE,
             coverage_pct DOUBLE,
             baseline_rate DOUBLE,
-            error_msg TEXT
+            error_msg TEXT,
+            dataset_name TEXT
         )
         """
     )
+    # Make sure older databases without the column still work.
+    try:
+        con.execute("ALTER TABLE experiments ADD COLUMN dataset_name TEXT")
+    except Exception:
+        pass
     con.execute(
         """
         INSERT OR REPLACE INTO experiments VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?, ?
         )
         """,
         [
@@ -416,6 +430,7 @@ def upsert_experiment(exp):
             exp["result"]["segments_count"], exp["result"]["avg_lift"],
             exp["result"]["max_lift"], exp["result"]["coverage_pct"],
             exp["result"]["baseline_rate_pct"], exp["result"].get("error_msg"),
+            exp.get("dataset_name", ""),
         ],
     )
     con.close()
@@ -450,11 +465,12 @@ def _build_experiment(run):
         "name": cfg.get("experiment_name", "Experiment"),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "status": run["status"],
-        "execution_time_sec": run["elapsed"],
+        "execution_time_sec": float(run.get("elapsed", 0) or 0),
         "target_col": cfg.get("target_col", ""),
         "primary_key": cfg.get("primary_key", ""),
-        "data_rows": run.get("n_rows", 0),
-        "data_cols": run.get("n_cols", 0),
+        "dataset_name": st.session_state.get("dataset_name", ""),
+        "data_rows": int(run.get("n_rows", 0) or 0),
+        "data_cols": int(run.get("n_cols", 0) or 0),
         "config": _jsonable(cfg),
         "result": _jsonable(result),
         "logs": run.get("logs", []),
@@ -463,6 +479,16 @@ def _build_experiment(run):
 
 def _write_artifacts(run, exp):
     try:
+        # Persist diagnostic internals so Module 4 can show Feature Journey /
+        # no-segments explanations WITHOUT re-running extraction.
+        try:
+            b = run.get("builder")
+            if b is not None:
+                exp["result"]["diagnostics_"] = _jsonable(getattr(b, "diagnostics_", []))
+                exp["result"]["feature_usage_counts"] = _jsonable(
+                    getattr(b, "feature_usage_counts", {}))
+        except Exception:
+            pass
         os.makedirs(run["exp_dir"], exist_ok=True)
         with open(os.path.join(run["exp_dir"], "logs.txt"), "w", encoding="utf-8") as fh:
             fh.write(_logs_txt(run.get("logs") or []))
@@ -518,8 +544,9 @@ def _finalize(run, status):
         st.session_state["last_config"] = _jsonable(run["cfg"])
         try:
             upsert_experiment(exp)
-        except Exception:
-            _ui_log(run, "WARNING", "Could not persist to suite_data.db.")
+        except Exception as exc:
+            _ui_log(run, "WARNING", f"Could not persist to suite_data.db: {exc}")
+            st.session_state["m3_save_error"] = f"Persist failed: {exc}"
         _write_artifacts(run, exp)
     except Exception as exc:
         _ui_log(run, "ERROR", f"Persistence failed: {exc}")
@@ -750,7 +777,7 @@ def _render_console(run, live=False):
                     (s.get("sql_filter") or "").encode("utf-8"),
                     file_name=f"segment_{s['segment_id']}.sql", mime="text/plain",
                     key=f"m3_sql_{run['exp_id']}_{s['segment_id']}",
-                    use_container_width=True,
+                    width='stretch',
                 )
         else:
             st.caption("Waiting for segments…")
@@ -764,7 +791,7 @@ def _render_live(run):
                    f"{run['n_rows']:,} rows × {run['n_cols']} cols")
     with h2:
         if st.button(
-            "⛔ Cancel Extraction", type="primary", use_container_width=True,
+            "⛔ Cancel Extraction", type="primary", width='stretch',
             key=f"m3_cancel_{run['exp_id']}",
         ):
             run["cancel_requested"] = True
@@ -785,17 +812,17 @@ def _render_export_hub(run, exp):
     e1.download_button(
         "⬇️ Logs.txt", logs_txt.encode("utf-8"),
         file_name=f"logs_{exp['exp_id']}.txt", mime="text/plain",
-        key=f"dl_logs_{exp['exp_id']}", use_container_width=True,
+        key=f"dl_logs_{exp['exp_id']}", width='stretch',
     )
     e2.download_button(
         "⬇️ SQL.sql", sql_script.encode("utf-8"),
         file_name=f"segments_{exp['exp_id']}.sql", mime="text/plain",
-        key=f"dl_sql_{exp['exp_id']}", use_container_width=True,
+        key=f"dl_sql_{exp['exp_id']}", width='stretch',
     )
     e3.download_button(
         "⬇️ Config.json", cfg_json.encode("utf-8"),
         file_name=f"config_{exp['exp_id']}.json", mime="application/json",
-        key=f"dl_cfg_{exp['exp_id']}", use_container_width=True,
+        key=f"dl_cfg_{exp['exp_id']}", width='stretch',
     )
 
 
@@ -820,12 +847,12 @@ def _render_results(exp):
         st.markdown("**Segments**")
         st.dataframe(
             seg_df[[c for c in seg_cols if c in seg_df.columns]],
-            height=300, use_container_width=True, hide_index=True,
+            height=300, width='stretch', hide_index=True,
         )
     if coverage:
         st.markdown("**Final coverage (events vs. non-events)**")
         st.dataframe(pd.DataFrame(coverage), height=300,
-                     use_container_width=True, hide_index=True)
+                     width='stretch', hide_index=True)
     else:
         st.caption("No coverage rows — experiment produced no segments.")
 
@@ -870,7 +897,7 @@ def _render_view(exp):
     with c1:
         lc = st.session_state.get("last_config")
         if st.button(
-            "♻️ Re-run last config", use_container_width=True,
+            "♻️ Re-run last config", width='stretch',
             disabled=not lc, key=f"m3_rerun_{exp.get('exp_id', 'view')}",
         ):
             if lc:
@@ -884,11 +911,6 @@ def _render_view(exp):
                          label="Configure new experiment in Workbench (Module 2)", icon="⚙️")
         except Exception:
             st.caption("Configure a new experiment in the Workbench (Module 2).")
-        try:
-            st.page_link("pages/4_Results_Dashboard.py",
-                         label="Open Results Dashboard (Module 4)", icon="📊")
-        except Exception:
-            st.caption("Open the Results Dashboard (Module 4) from the sidebar.")
 
 
 def _render_final(run):
@@ -924,6 +946,13 @@ st.markdown(
 
 st.title("RapidSegment — Module 3: Execution & Artifact Console")
 st.caption("Real-time extraction monitoring, log / SQL console, cancel & export hub.")
+
+if st.session_state.get("m3_save_error"):
+    st.error(f"⚠️ Experiment was not saved to the leaderboard DB: "
+             f"{st.session_state['m3_save_error']}. The run still produced results, "
+             f"but it won't appear in Module 5 until this is fixed (check the DB path / permissions).")
+    if st.button("Dismiss", key="m3_dismiss_save_err"):
+        del st.session_state["m3_save_error"]
 
 # ── Entry modes ──────────────────────────────────────────────────────────────
 pending_run = st.session_state.pop("pending_run", None)

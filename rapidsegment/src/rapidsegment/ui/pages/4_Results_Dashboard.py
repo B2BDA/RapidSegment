@@ -37,10 +37,19 @@ import streamlit as st
 from rapidsegment import StrategicSegmentScore, StrategicSegmentBuilder
 
 # ── Constants & storage ───────────────────────────────────────────────────────
-SUITE_DIR = os.path.join(os.getcwd(), ".rapidsegment_suite")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
+SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
+DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
 SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
+ARTIFACTS_DIR = os.path.join(SUITE_DIR, "artifacts")
+
+
+def active_db():
+    """Read the materialized *modified* dataset if it exists, else the raw load."""
+    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
 
 SEG_COLORS = [
     "#6366f1", "#f59e0b", "#22c55e", "#ef4444", "#3b82f6",
@@ -58,14 +67,14 @@ def rerun():
 
 
 def db_query(sql, read_only=True):
-    con = duckdb.connect(DB_FILE, read_only=read_only)
+    con = duckdb.connect(active_db(), read_only=read_only)
     result = con.execute(sql).df()
     con.close()
     return result
 
 
 def db_scalar(sql):
-    con = duckdb.connect(DB_FILE, read_only=True)
+    con = duckdb.connect(active_db(), read_only=True)
     result = con.execute(sql).fetchone()[0]
     con.close()
     return result
@@ -521,7 +530,7 @@ def render_segments_table(segments, coverage, weights):
     for col in ("rate", "lift", "capture_rate"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width='stretch', hide_index=True)
     with st.expander("Expand a segment for full SQL WHERE clause"):
         for s in segments:
             st.markdown(f"**Segment {s['segment_id']}** - `{s.get('rule_string','')}`")
@@ -535,26 +544,26 @@ def render_visualizations(segments, coverage, scorecard, cfg):
     tabs = st.tabs(["Lift vs Volume", "Distribution", "Rule Complexity", "Decile", "Feature Importance"])
     feature_groups = (cfg.get("config") if isinstance(cfg.get("config"), dict) else cfg).get("feature_groups") or {}
     with tabs[0]:
-        st.plotly_chart(_fig_scatter(segments), use_container_width=True)
+        st.plotly_chart(_fig_scatter(segments), width='stretch')
     with tabs[1]:
-        st.plotly_chart(_fig_distribution(segments, cfg.get("target_col")), use_container_width=True)
+        st.plotly_chart(_fig_distribution(segments, cfg.get("target_col")), width='stretch')
     with tabs[2]:
         st.caption(
             "**Rule complexity** = number of feature conditions AND-ed in a rule. "
             "1-way = single feature, 2-way = two features, 3-way = three. Inner ring groups "
             "segments by complexity; outer ring shows each segment sized by population."
         )
-        st.plotly_chart(_fig_sunburst(segments), use_container_width=True)
+        st.plotly_chart(_fig_sunburst(segments), width='stretch')
     with tabs[3]:
         fig = _fig_decile(scorecard)
         if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.caption("No decile thresholds - run the scorecard to generate them.")
     with tabs[4]:
         fig = _fig_feature_importance(segments, feature_groups)
         if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.caption("No feature usage to display.")
 
@@ -610,18 +619,61 @@ def _normalize_cfg(full):
     return cfg
 
 
-def _build_diag_builder(cfg, df):
-    """Run extraction once to populate diagnostics_; cache the builder on session state
-    so the Feature Journey / no-segments views persist across reruns without re-extracting."""
+def _build_diag_builder(cfg, df, exp_id=None):
+    """Return a builder with populated diagnostics_ for the explain_* methods.
+
+    Preferred path: reuse diagnostics_ persisted by Module 3 into
+    artifacts/<exp_id>/result.json — no re-extraction (fast, and works even
+    without the dataset loaded). Falls back to re-running extract_segments once
+    (cached on session state) only when no persisted diagnostics are available.
+    """
     cached = st.session_state.get("m4_diag_builder")
     if cached is not None:
         return cached
+    full = _normalize_cfg(cfg)
+
+    # 1) Reuse persisted diagnostics (no segmentation re-run)
+    if exp_id:
+        art = os.path.join(ARTIFACTS_DIR, exp_id, "result.json")
+        if os.path.exists(art):
+            try:
+                with open(art, "r", encoding="utf-8") as fh:
+                    saved = json.load(fh)
+                res = saved.get("result") or {}
+                diag = res.get("diagnostics_")
+                if diag:
+                    b = StrategicSegmentBuilder(
+                        target=full.get("target_col") or "",
+                        n_jobs=full.get("n_jobs", -1),
+                        min_sample_size=full.get("min_sample_size", 1000),
+                        min_lift=full.get("min_lift", 1.5),
+                        min_events=full.get("min_events", 100),
+                        top_n_vars=full.get("top_n_vars", 15),
+                        max_segments=full.get("max_segments", 10),
+                        max_feature_reuse=full.get("max_feature_reuse", 1),
+                        enable_diversity=full.get("enable_diversity", False),
+                        enable_1way=full.get("enable_1way", True),
+                        enable_2way=full.get("enable_2way", True),
+                        enable_3way=full.get("enable_3way", True),
+                        selection_metric=full.get("selection_metric", "iv"),
+                        binning_method=full.get("binning_method", "optimal_cart"),
+                        naive_bins=full.get("naive_bins", 5),
+                        max_expansion_hops=full.get("max_expansion_hops", 0),
+                    )
+                    b.diagnostics_ = diag
+                    b.segments = res.get("segments") or []
+                    b.stop_reason = res.get("stop_reason")
+                    b.feature_usage_counts = res.get("feature_usage_counts") or {}
+                    st.session_state["m4_diag_builder"] = b
+                    return b
+            except Exception:
+                pass
+
+    # 2) Fallback: re-extract once (cached)
     if df is None or df.empty:
         return None
-    full = _normalize_cfg(cfg)
-    target = full.get("target_col") or ""
     b = StrategicSegmentBuilder(
-        target=target,
+        target=full.get("target_col") or "",
         n_jobs=full.get("n_jobs", -1),
         min_sample_size=full.get("min_sample_size", 1000),
         min_lift=full.get("min_lift", 1.5),
@@ -644,6 +696,116 @@ def _build_diag_builder(cfg, df):
     return b
 
 
+def generate_feature_health_local(df, features, target, type_overrides=None, naive_bins=5):
+    """Corrected feature health report (replaces the library version).
+
+    Fixes two bugs in StrategicSegmentBuilder.generate_feature_health_report:
+      * UI categorical overrides are respected — a column marked CATEGORICAL
+        is binned by distinct value instead of being NTILE'd as numeric (the
+        library decides numeric/categorical solely from the DuckDB column type,
+        so an overridden-categorical numeric column was wrongly quantile-binned).
+      * Numeric bin labels are made unique via the tile index
+        ('Bin 1: [a, b]'), so adjacent/low-cardinality tiles never appear
+        'repeated' after rounding collapses the [min,max] label.
+    """
+    if not features:
+        return pd.DataFrame()
+    type_overrides = type_overrides or {}
+    con = duckdb.connect(":memory:")
+    con.register("input_data_view", df)
+    con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
+    columns_types = {r[0]: r[1] for r in con.execute("DESCRIBE input_df").fetchall()}
+
+    target_expr = f"""
+    (CASE
+        WHEN TRY_CAST("{target}" AS DOUBLE) IS NOT NULL THEN TRY_CAST("{target}" AS DOUBLE)
+        WHEN LOWER(TRIM(CAST("{target}" AS VARCHAR))) IN ('1','true','yes','y','t') THEN 1.0
+        ELSE 0.0
+    END)
+    """
+    num_types = ("INT", "BIGINT", "DOUBLE", "FLOAT", "DECIMAL", "REAL",
+                 "NUMERIC", "HUGEINT", "TINYINT", "SMALLINT")
+    missing_test = "IN ('','None','nan','NaN','<NA>','null','NULL')"
+
+    rows = []
+    for col in features:
+        if col not in columns_types:
+            continue
+        ov = type_overrides.get(str(col), "AUTO")
+        duckdb_type = columns_types[col].upper()
+        is_num_type = any(t in duckdb_type for t in num_types)
+        treat_categorical = (ov == "CATEGORICAL") or (ov == "AUTO" and not is_num_type)
+
+        if treat_categorical:
+            q = f"""
+            SELECT
+                CASE
+                    WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) {missing_test} THEN 'Missing'
+                    ELSE CAST("{col}" AS VARCHAR)
+                END AS bin,
+                COUNT(*) AS total_count,
+                SUM({target_expr}) AS event_count,
+                (SUM({target_expr}) * 100.0 / COUNT(*)) AS response_rate,
+                CASE
+                    WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) {missing_test} THEN TRUE
+                    ELSE FALSE
+                END AS is_missing
+            FROM input_df
+            GROUP BY 1, 5
+            ORDER BY is_missing ASC, bin ASC
+            """
+        else:
+            nb = max(2, int(naive_bins))
+            q = f"""
+            WITH ranked AS (
+                SELECT
+                    TRY_CAST("{col}" AS DOUBLE) AS val,
+                    {target_expr} AS target_val,
+                    NTILE({nb}) OVER (ORDER BY TRY_CAST("{col}" AS DOUBLE)) AS tile
+                FROM input_df
+                WHERE TRY_CAST("{col}" AS DOUBLE) IS NOT NULL
+            ),
+            num_bins AS (
+                SELECT
+                    tile,
+                    MIN(val) AS bmin, MAX(val) AS bmax,
+                    COUNT(*) AS total_count,
+                    SUM(target_val) AS event_count,
+                    (SUM(target_val) * 100.0 / COUNT(*)) AS response_rate
+                FROM ranked
+                GROUP BY tile
+            )
+            SELECT
+                CASE
+                    WHEN bmin = bmax
+                    THEN 'Bin ' || tile || ': ' || ROUND(bmin, 6)
+                    ELSE 'Bin ' || tile || ': [' || ROUND(bmin, 6) || ', ' || ROUND(bmax, 6) || ']'
+                END AS bin,
+                total_count, event_count, response_rate, FALSE AS is_missing, tile
+            FROM num_bins
+            UNION ALL
+            SELECT 'Missing' AS bin, COUNT(*) AS total_count,
+                   SUM({target_expr}) AS event_count,
+                   (SUM({target_expr}) * 100.0 / NULLIF(COUNT(*), 0)) AS response_rate,
+                   TRUE AS is_missing, NULL AS tile
+            FROM input_df
+            WHERE "{col}" IS NULL
+            HAVING COUNT(*) > 0
+            ORDER BY is_missing ASC, tile ASC
+            """
+        for row in con.execute(q).fetchall():
+            rows.append({
+                "feature": col,
+                "bin": row[0],
+                "total_count": int(row[1]),
+                "event_count": int(row[2] or 0),
+                "response_rate_%": round(float(row[3] or 0.0), 4),
+                "is_missing": bool(row[4]),
+            })
+    con.close()
+    return pd.DataFrame(rows)
+
+
 def render_diagnostics(exp, cfg, df, segments):
     st.subheader("Diagnostic Drilldown")
     res = exp.get("result") or {}
@@ -664,7 +826,7 @@ def render_diagnostics(exp, cfg, df, segments):
                 if df is None or df.empty:
                     st.warning("Dataset not available - load it in Module 1 to enable diagnostics.")
                 else:
-                    b = _build_diag_builder(cfg, df)
+                    b = _build_diag_builder(cfg, df, exp.get("exp_id"))
                     if b is not None:
                         buf = io.StringIO()
                         with contextlib.redirect_stdout(buf):
@@ -683,10 +845,13 @@ def render_diagnostics(exp, cfg, df, segments):
                     st.warning("Dataset not available - load data via Module 1 first.")
                 else:
                     try:
-                        b = StrategicSegmentBuilder(target=cfg.get("target_col", ""))
+                        type_overrides = st.session_state.get("type_overrides") or {}
                         with st.spinner("Profiling features..."):
-                            hr = b.generate_feature_health_report(df, list(sel))
-                        st.dataframe(hr, use_container_width=True, hide_index=True)
+                            hr = generate_feature_health_local(
+                                df, list(sel), cfg.get("target_col", ""),
+                                type_overrides, int(cfg.get("naive_bins", 5)),
+                            )
+                        st.dataframe(hr, width='stretch', hide_index=True)
                         csv = hr.to_csv(index=False).encode("utf-8")
                         st.download_button("Download health report (CSV)", csv,
                                             file_name="feature_health.csv", mime="text/csv")
@@ -699,7 +864,7 @@ def render_diagnostics(exp, cfg, df, segments):
             st.caption("Dataset not available - reload in Module 1 to enable the full diagnostic.")
         else:
             if st.button("Run full diagnostics", key="m4_diag"):
-                b = _build_diag_builder(cfg, df)
+                b = _build_diag_builder(cfg, df, exp.get("exp_id"))
                 if b is not None:
                     st.session_state["m4_noseg"] = b.explain_no_segments()
             if st.session_state.get("m4_noseg"):
@@ -717,20 +882,20 @@ def render_export_hub(exp, segments, coverage, scorecard, cfg):
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.download_button("Segments (CSV)", segs_csv, file_name=f"segments_{exp.get('exp_id','')}.csv",
-                       mime="text/csv", use_container_width=True)
+                       mime="text/csv", width='stretch')
     c2.download_button("Coverage (CSV)", cov_csv, file_name=f"coverage_{exp.get('exp_id','')}.csv",
-                       mime="text/csv", use_container_width=True)
+                       mime="text/csv", width='stretch')
     c3.download_button("Config (JSON)", cfg_json, file_name=f"config_{exp.get('exp_id','')}.json",
-                       mime="application/json", use_container_width=True)
+                       mime="application/json", width='stretch')
     c4.download_button("SQL (deployable)", sql_script, file_name=f"segments_{exp.get('exp_id','')}.sql",
-                       mime="text/plain", use_container_width=True)
+                       mime="text/plain", width='stretch')
     c5.download_button("Report (HTML)", html_report, file_name=f"report_{exp.get('exp_id','')}.html",
-                       mime="text/html", use_container_width=True)
+                       mime="text/html", width='stretch')
 
     if scorecard is not None:
         sc_json = json.dumps(scorecard, indent=2).encode("utf-8")
         st.download_button("Scorecard (JSON)", sc_json, file_name=f"scorecard_{exp.get('exp_id','')}.json",
-                           mime="application/json", use_container_width=True)
+                           mime="application/json", width='stretch')
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -743,7 +908,7 @@ def render_export_hub(exp, segments, coverage, scorecard, cfg):
             zf.writestr("scorecard.json", sc_json.decode("utf-8", "ignore"))
     st.download_button("Download ALL (ZIP)", zip_buf.getvalue(),
                        file_name=f"rapidsegment_{exp.get('exp_id','')}.zip", mime="application/zip",
-                       use_container_width=True)
+                       width='stretch')
 
 
 # ── Page setup ───────────────────────────────────────────────────────────────
@@ -776,7 +941,7 @@ if not isinstance(cfg, dict):
 
 scorecard = None
 if segments and df is not None and not df.empty:
-    if st.button("Generate / refresh scorecard", key="m4_score", use_container_width=False):
+    if st.button("Generate / refresh scorecard", key="m4_score", width='content'):
         with st.spinner("Scoring population (StrategicSegmentScore)..."):
             scorecard = build_scorecard(cfg, df, segments)
     else:

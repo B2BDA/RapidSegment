@@ -11,16 +11,35 @@ from pathlib import Path
 import sys
 import streamlit as st
 
+from rapidsegment.ui._exit import render_exit_button, write_server_pid
+
 
 def run_ui():
     """Launch the RapidSegment Streamlit multipage app."""
-    import streamlit.web.cli as stcli
+    import subprocess
 
     app_path = str(Path(__file__).resolve())
 
-    # Tell Streamlit to run this file (pages/ will be discovered automatically)
-    sys.argv = ["streamlit", "run", app_path, "--global.developmentMode=false"]
-    sys.exit(stcli.main())
+    # Launch Streamlit in a child process so we can record its PID and later
+    # terminate the whole server from the UI's "Exit UI" button.
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", app_path,
+         "--global.developmentMode=false"],
+    )
+    try:
+        write_server_pid(proc.pid)
+    except Exception:
+        pass
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
 
 def _home():
@@ -38,6 +57,8 @@ def _home():
 # label it by the filename, i.e. "app"). Edit the `title=` values to rename.
 if __name__ == "__main__":
     st.set_page_config(page_title="RapidSegment", layout="wide")
+    st.sidebar.divider()
+    render_exit_button()
     pg = st.navigation({
         "Modules": [
             st.Page(_home, title="Home", icon="🏠"),

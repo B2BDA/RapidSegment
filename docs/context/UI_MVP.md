@@ -48,7 +48,7 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 
 ## Project Status (Implementation Tracker)
 
-> The Streamlit multipage app lives in `rapidsegment_ui/` (run `streamlit run app.py`); standalone module files (`Module_*.py`) mirror the pages.
+> The Streamlit multipage app lives in `rapidsegment/src/rapidsegment/ui/` (run `streamlit run app.py`, or `rapidsegment-ui`); standalone module files (`Module_*.py`) may mirror the pages.
 
 | Module | Status | Notes |
 |---|---|---|
@@ -56,7 +56,7 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 | 2 — Workbench | ✅ **Done** | All 23 `StrategicSegmentBuilder` constructor params exposed (incl. 14 `sort_priority` values, `n_jobs`, `expand_log_mode`), presets, feature groups, grid search, templates, validation, latest-results preview |
 | 3 — Execution & Artifact Console | ✅ **Done** | 6-step timeline, live KPIs, log terminal + SQL inspector, cancel-with-partial-save, export hub (Logs.txt / SQL.sql / Config.json), `suite_data.db` persistence |
 | 4 — Results Dashboard & Visualization | ✅ **Done** | Summary cards, segments table (with scorecard weight column), 5 Plotly charts (lift-vs-volume scatter, stacked distribution, **rule-complexity sunburst** — inner ring groups segments by 1/2/3-way complexity, outer ring per segment sized by population, `StrategicSegmentScore` scorecard + JSON preview, diagnostics with **dedicated Feature Journey expander** (audit trail per feature), feature health report, no-segments explanation, export hub (CSV/JSON/SQL/HTML/ZIP) |
-| 5 — Leaderboard | ✅ **Done** | Ranked grid (name/date/size/segments/lift/coverage/status, sortable), sidebar filters (search, status, date range, min avg-lift), summary cards (count, avg time, best lift, top binning method), per-experiment sparkline + row actions (Clone to Workbench, View Results, Export Config, Duplicate, Delete), two-run KPI face-off + parameter-diff |
+| 5 — Leaderboard | ✅ **Done** | Ranked grid grouped/filtered by **Dataset** (via `dataset_name`, dropdown; old `rows×cols` signature proxy removed), sortable, **date picker removed**; ranked by chosen **KPI** (Avg/Max Lift, Coverage %, Segments) with 🏆 best-performer highlight; light filters (status + name search); summary cards; row actions (Clone to Workbench, View Results, Export JSON, Duplicate, Delete-with-confirmation); two-run Compare (`param_diff`) |
 | 6 — Arena (1v1 comparison) | ✅ **Done** | KPI face-off with winners, full parameter diff (differing fields flagged), segment overlap (shared/unique/Jaccard + overlaid lift distribution + shared-segment lift table), SQL diff per segment; wired into `app.py` |
 
 **Known caveats / deviations:**
@@ -68,6 +68,11 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 ### Recently fixed (post-implementation)
 - **M4 diagnostics crash (Feature Journey / no-segment explanation):** `_build_diag_builder` reconstructs `StrategicSegmentBuilder` from the stored experiment config. The constructor's only hard validation is on `binning_method`, which lowercases but does **not** strip spaces, so a stored *label* like `"Optimal (CART)"` (the M2 widget label) ≠ `"optimal_cart"` and raised `ValueError`. A new `_normalize_cfg()` maps labels→canonical values and validates enums before reconstruction, so pre-existing/`duplicate` rows with stale labels now work.
 - **M5 Leaderboard "No experiments match the current filters":** experiments are read DESC, so the default date range was `(newest, oldest)` — an inverted range that filtered out everything. Now uses `min(dates)`/`max(dates)`.
+- **M1 materialized modified dataset + `dataset_name`.** M1 writes a transformed copy (`module1_data_modified.duckdb`, table `udl_data`) via `materialize_modified()` applying type overrides (CATEGORICAL→VARCHAR, NUMERIC→TRY_CAST DOUBLE) and converting the target to 0/1 (multi-class → `<col>__binary`). `active_db()` returns this copy when present, so every downstream read (M1–M4) sees the real changed types. A `Dataset name` text input seeds `st.session_state["dataset_name"]` (default = source filename) persisted on the `experiments` table (auto-migrated `dataset_name TEXT` column).
+- **M4 health-report fix.** `generate_feature_health_local(df, features, target, type_overrides=None, naive_bins=5)` replaces the library `generate_feature_health_report` inside the UI; it respects `type_overrides` (CATEGORICAL → distinct-value bins), labels numeric bins uniquely `Bin N: [min, max]`, casts via `TRY_CAST(col AS DOUBLE)` (correct ordering/min/max for text-stored numerics), and renders degenerate bins as a single value. Sunburst now uses `branchvalues="total"` with summed parent values; rule-complexity rings (1/2/3-way).
+- **M3 save fixes & `dataset_name` persistence.** `upsert_experiment` adds a `dataset_name TEXT` column (auto-migrated in try/except); `_build_experiment` sets it from session. numpy int64/float64 from `df.shape` are coerced to int/float before save; save errors surface via `m3_save_error` (run still completes).
+- **M5 Leaderboard rework.** Experiments grouped/filtered by `dataset_name` (Dataset dropdown, replaced the `rows×cols` signature proxy); grid gains a Dataset column; **date picker removed**; ranking by chosen KPI (Avg/Max Lift, Coverage %, Segments) with 🏆 best-performer highlight; light filters (status + name search); row actions (Clone→Workbench, View results→M4, Export JSON, Duplicate, Delete-with-confirmation); two-run Compare (`param_diff`).
+- **Navigation rename + global `width=` change.** `app.py` uses explicit `st.navigation` + `st.Page`; the entry page is titled **"Home"** (M-pages: Data Loader, Workbench, Execution, Results, Leaderboard, Arena). Across `app.py` and all six pages, every `use_container_width=True/False` was replaced with `width='stretch'` / `width='content'`.
 
 ---
 
@@ -100,6 +105,8 @@ Load data from multiple sources and deliver instant, actionable insights about d
 **Preview Table** (fixed height, scrollable):
 - First 100 rows, sortable columns, filterable
 
+**Dataset name** (text input, default = source filename) — stored in `st.session_state["dataset_name"]` and used to group experiments for the same dataset in the Leaderboard.
+
 **Column Metadata Panel** (right sidebar or collapsible):
 For each column:
 - **Name**, **Type** (inferred or manual override)
@@ -107,6 +114,8 @@ For each column:
 - **Null %** (missing data ratio)
 - **Distribution** (for numeric: min/max/mean; for categorical: top 5 values)
 - **Type warnings** (e.g., "Column X looks numeric but has text")
+- **Type overrides** (CATEGORICAL / NUMERIC / AUTO per column) stored to session state.
+- **Materialized modified dataset**: clicking **"Apply metadata & create modified dataset"** calls `materialize_modified()`, which writes a transformed copy `module1_data_modified.duckdb` (table `udl_data`) applying the overrides (CATEGORICAL → VARCHAR, NUMERIC → TRY_CAST DOUBLE) and converting the target to 0/1 (multi-class → `<col>__binary`). **"Discard modified dataset"** deletes the copy and reverts to raw. Downstream modules read the modified copy automatically via `active_db()`.
 
 #### 1.5 Target Column Selection & Validation
 - **Dropdown** with column list, pre-filtered to binary columns (or multi-class warning)
@@ -259,6 +268,7 @@ Monitor extraction progress and immediately access logs, SQL filters, and genera
 
 #### 3.5 Export Hub (After Completion)
 - **Download buttons**: Logs.txt, SQL.sql, Config.json
+- **Persistence**: at run end, `upsert_experiment` writes the run to `suite_data.db` with a new `dataset_name TEXT` column (auto-migrated in try/except; `_build_experiment` captures `st.session_state["dataset_name"]`). numpy `df.shape` dims are coerced to int/float; save errors surface via `m3_save_error` while the run still completes.
 
 #### 3.6 Module Tech Stack
 - **UI**: Solara split-pane, text areas
@@ -301,9 +311,10 @@ Display extracted segments with rich context, metrics, and actionable export opt
    - Hover for percentage breakdown
 
 3. **Rule Complexity Breakdown (Sunburst)**
-   - Inner: 1-way/2-way/3-way split
+   - Inner: 1-way/2-way/3-way split (rule-complexity rings)
    - Outer: Individual segments
    - Size/color by lift
+   - `branchvalues="total"` with summed parent values (group/root accumulated from segment counts)
 
 4. **Decile Thresholds (Line Chart)**
    - X: Decile (1–10)
@@ -320,9 +331,9 @@ Display extracted segments with rich context, metrics, and actionable export opt
 - Copy-to-clipboard
 
 #### 4.5 Diagnostic Drilldown
-- **Feature Journey**: Audit trail per feature
-- **Feature Health Report**: Bin-level stats (downloadable CSV)
-- **No Segments Explanation**: Why extraction stopped + recommendations
+- **Feature Journey**: Audit trail per feature (`explain_feature_journey` captured via `redirect_stdout` in a dedicated expander)
+- **Feature Health Report**: Bin-level stats via `generate_feature_health_local(df, features, target, type_overrides, naive_bins)` (replaces library `generate_feature_health_report`; respects type overrides, unique `Bin N: [min, max]` labels, TRY_CAST DOUBLE for text-stored numerics, degenerate bins as single value) — downloadable CSV
+- **No Segments Explanation**: Why extraction stopped + recommendations (`explain_no_segments`)
 
 #### 4.6 Export Hub
 - CSV (segments)
@@ -352,9 +363,11 @@ Central hub to track all experiments, rank by metrics, and enable quick cloning 
 ### Design Details
 
 #### 5.1 Ranked Data Grid
-**Columns**: Rank | Name | Date | Data Size | Segments | Avg Lift | Max Lift | Status | Actions
-- Sortable by any column
-- Filterable by date range, status, lift threshold
+**Columns**: 🏆 | Rank | Experiment | Dataset | Status | Avg Lift | Max Lift | Coverage % | Segments | Rows | Time | Actions
+- Sortable, ranked by a chosen KPI (Avg Lift / Max Lift / Coverage % / Segments); top completed run by KPI gets a 🏆 Best highlight.
+- Grouped/filtered by **Dataset** (dropdown of `dataset_name` values); the old `rows×cols` signature proxy is gone.
+- **Date picker removed** — every saved run counts.
+- Light filters: status multiselect + name search.
 
 #### 5.2 Inline Sparklines
 - Segment distribution (mini bar chart)
@@ -362,12 +375,12 @@ Central hub to track all experiments, rank by metrics, and enable quick cloning 
 - Rule complexity split
 
 #### 5.3 Row-Level Actions
-- Clone to Workbench
-- View Results
-- Compare with Another
-- Delete
-- Duplicate
-- Export
+- Clone to Workbench (`clone_to_workbench`)
+- View Results (→ Module 4, loads full experiment)
+- Export JSON (`export_run`)
+- Duplicate (`duplicate_experiment`)
+- Delete (with confirmation)
+- Compare two runs (`param_diff`)
 
 #### 5.4 Summary Stats (Top)
 - Total experiments
@@ -470,7 +483,8 @@ CREATE TABLE experiments (
     max_lift FLOAT,
     coverage_pct FLOAT,
     baseline_rate FLOAT,
-    error_msg TEXT
+    error_msg TEXT,
+    dataset_name TEXT
 );
 ```
 
@@ -646,6 +660,6 @@ By end of Phase 3:
 3. ✅ **Implement Module 2** (Workbench) — `Module_2_workbench.py`
 4. ✅ **Implement Module 3** (Execution & Artifact Console) — `Module_3_execution.py`
 5. ✅ **Implement Module 4** (Results Dashboard) — `Module_4_results.py`
-6. ⬜ **Implement Module 5** (Leaderboard) — reads `suite_data.db` experiments; clone-to-workbench via `apply_config`; sparklines
-7. ⬜ **Implement Module 6** (Arena) — 1v1 KPI face-off, param diff, SQL diff
+6. ✅ **Implement Module 5** (Leaderboard) — reads `suite_data.db` experiments; grouped/filtered by `dataset_name`; clone-to-workbench via `apply_config`; row actions + two-run compare
+7. ✅ **Implement Module 6** (Arena) — 1v1 KPI face-off, param diff, SQL diff
 8. ⬜ **Beta test** with internal users, then iterate

@@ -20,7 +20,7 @@
 - [✨ Features](#-features)
 - [🌳 Decision Trees vs RapidSegment](#-decision-trees-vs-rapidsegment)
 - [⚡ Quick Start](#-quick-start)
-- [🖥️ Web UI](️-web-ui)
+- [🖥️ Web UI](#️-web-ui)
 - [🧩 Components](#-components)
 - [🏗️ System Architecture](#️-system-architecture)
 - [⚙️ How It Works – Step by Step](#️-how-it-works--step-by-step)

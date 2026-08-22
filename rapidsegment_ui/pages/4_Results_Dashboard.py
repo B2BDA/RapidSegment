@@ -570,6 +570,46 @@ def render_scorecard_json(scorecard):
     sc.json(scorecard)
 
 
+def _normalize_cfg(full):
+    """Coerce stored config values to builder-accepted forms. Older runs (or rows
+    duplicated from them) may hold human labels like 'Optimal (CART)' instead of the
+    canonical value 'optimal_cart'; the constructor raises ValueError on those."""
+    cfg = dict(full)
+    bm = cfg.get("binning_method")
+    if bm in ("Optimal (CART)", "Optimal (Quantile)", "Naive"):
+        bm = {"Optimal (CART)": "optimal_cart",
+              "Optimal (Quantile)": "optimal_quantile",
+              "Naive": "naive"}.get(bm)
+    if bm not in ("naive", "optimal_cart", "optimal_quantile", "optimal"):
+        bm = "optimal_cart"
+    cfg["binning_method"] = bm
+
+    sm = cfg.get("selection_metric")
+    if sm in ("IV", "Response Rate"):
+        sm = {"IV": "iv", "Response Rate": "response_rate"}.get(sm)
+    if sm not in ("iv", "response_rate"):
+        sm = "iv"
+    cfg["selection_metric"] = sm
+
+    try:
+        cfg["n_jobs"] = int(cfg.get("n_jobs", -1))
+    except Exception:
+        cfg["n_jobs"] = -1
+
+    valid_sp = {
+        "rate_lift_count", "lift_rate_count", "lift_count_rate", "count_lift_rate",
+        "count_rate_lift", "rate_count_lift", "events_lift_rate", "events_rate_lift",
+        "lift_events_rate", "rate_events_lift", "events_count_rate",
+        "events_rate_count", "count_events_rate", "rate_events_count",
+    }
+    if cfg.get("sort_priority") not in valid_sp:
+        cfg["sort_priority"] = "rate_lift_count"
+
+    if cfg.get("expand_log_mode") not in ("none", "summary", "champion", "full"):
+        cfg["expand_log_mode"] = "none"
+    return cfg
+
+
 def _build_diag_builder(cfg, df):
     """Run extraction once to populate diagnostics_; cache the builder on session state
     so the Feature Journey / no-segments views persist across reruns without re-extracting."""
@@ -578,7 +618,7 @@ def _build_diag_builder(cfg, df):
         return cached
     if df is None or df.empty:
         return None
-    full = dict(cfg)
+    full = _normalize_cfg(cfg)
     target = full.get("target_col") or ""
     b = StrategicSegmentBuilder(
         target=target,

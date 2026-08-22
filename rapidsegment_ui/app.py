@@ -17,3 +17,5 @@ st.page_link("pages/1_Data_Loader.py", label="1 · Data Loader & Profiling", ico
 st.page_link("pages/2_Workbench.py", label="2 · Workbench", icon="⚙️")
 st.page_link("pages/3_Execution_Console.py", label="3 · Execution & Artifacts", icon="🚀")
 st.page_link("pages/4_Results_Dashboard.py", label="4 · Results Dashboard", icon="📊")
+st.page_link("pages/5_Leaderboard.py", label="5 · Leaderboard", icon="🏆")
+st.page_link("pages/6_Arena.py", label="6 · Arena", icon="⚔️")

@@ -56,14 +56,18 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 | 2 — Workbench | ✅ **Done** | All 23 `StrategicSegmentBuilder` constructor params exposed (incl. 14 `sort_priority` values, `n_jobs`, `expand_log_mode`), presets, feature groups, grid search, templates, validation, latest-results preview |
 | 3 — Execution & Artifact Console | ✅ **Done** | 6-step timeline, live KPIs, log terminal + SQL inspector, cancel-with-partial-save, export hub (Logs.txt / SQL.sql / Config.json), `suite_data.db` persistence |
 | 4 — Results Dashboard & Visualization | ✅ **Done** | Summary cards, segments table (with scorecard weight column), 5 Plotly charts (lift-vs-volume scatter, stacked distribution, **rule-complexity sunburst** — inner ring groups segments by 1/2/3-way complexity, outer ring per segment sized by population, `StrategicSegmentScore` scorecard + JSON preview, diagnostics with **dedicated Feature Journey expander** (audit trail per feature), feature health report, no-segments explanation, export hub (CSV/JSON/SQL/HTML/ZIP) |
-| 5 — Leaderboard | ⬜ **Pending** | Reads existing `suite_data.db` experiments table; clone-to-workbench via `apply_config` |
-| 6 — Arena (1v1 comparison) | ⬜ **Pending** | |
+| 5 — Leaderboard | ✅ **Done** | Ranked grid (name/date/size/segments/lift/coverage/status, sortable), sidebar filters (search, status, date range, min avg-lift), summary cards (count, avg time, best lift, top binning method), per-experiment sparkline + row actions (Clone to Workbench, View Results, Export Config, Duplicate, Delete), two-run KPI face-off + parameter-diff |
+| 6 — Arena (1v1 comparison) | ✅ **Done** | KPI face-off with winners, full parameter diff (differing fields flagged), segment overlap (shared/unique/Jaccard + overlaid lift distribution + shared-segment lift table), SQL diff per segment; wired into `app.py` |
 
 **Known caveats / deviations:**
 - ⚠ `builder.evaluate_final_coverage()` hangs in this environment (DuckDB file-lock on shared `db_path`) — never call it; coverage is computed locally (`compute_coverage_local`).
 - Scorecard (`StrategicSegmentScore`) needs ≥10 distinct segments for smooth decile resolution (library warns otherwise) — guide users to `max_segments ≥ 10`.
 - Solara→Streamlit conversion: `st.switch_page` / `st.page_link` for navigation; there is no Jupyter-native mode.
 - `db_path`/`db_temp_dir` are internal-only (per-experiment artifact dirs), not user-facing.
+
+### Recently fixed (post-implementation)
+- **M4 diagnostics crash (Feature Journey / no-segment explanation):** `_build_diag_builder` reconstructs `StrategicSegmentBuilder` from the stored experiment config. The constructor's only hard validation is on `binning_method`, which lowercases but does **not** strip spaces, so a stored *label* like `"Optimal (CART)"` (the M2 widget label) ≠ `"optimal_cart"` and raised `ValueError`. A new `_normalize_cfg()` maps labels→canonical values and validates enums before reconstruction, so pre-existing/`duplicate` rows with stale labels now work.
+- **M5 Leaderboard "No experiments match the current filters":** experiments are read DESC, so the default date range was `(newest, oldest)` — an inverted range that filtered out everything. Now uses `min(dates)`/`max(dates)`.
 
 ---
 

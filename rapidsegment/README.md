@@ -6,6 +6,7 @@
   <img width="300" height="500" alt="adfd9cdf-251f-44e4-af79-20802d4a7a01" src="https://github.com/user-attachments/assets/803790d0-7ebe-4e79-a415-65f1daaea40b" />
 </p>
 
+
 # 🚀 RapidSegment – Strategic Segmentation & Scorecard Engine
 
 [![PyPI version](https://img.shields.io/pypi/v/rapidsegment.svg)](https://pypi.org/project/rapidsegment/)

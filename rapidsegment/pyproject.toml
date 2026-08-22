@@ -49,6 +49,9 @@ prettytable = [
     "prettytable>=3.18.0",
 ]
 
+[project.scripts]
+rapidsegment-ui = "rapidsegment.ui.app:run_ui"
+
 [project.urls]
 Homepage = "https://github.com/B2BDA/RapidSegment"
 Issues = "https://github.com/B2BDA/RapidSegment/issues"

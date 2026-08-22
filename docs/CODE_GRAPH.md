@@ -33,6 +33,16 @@ Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `e45bce0` (m
         ├── py.typed
         ├── builder.py           # StrategicSegmentBuilder (1968 lines)
         ├── scorer.py            # StrategicSegmentScore (246 lines)
+            ├── ui/                  # No-code Streamlit platform (see Sec. 11)
+            │   ├── __init__.py      # exposes run_ui()
+            │   ├── app.py           # st.navigation entrypoint (Home + 6 pages)
+            │   └── pages/
+            │       ├── 1_Data_Loader.py       # Module 1: Data Loader & Profiling
+            │       ├── 2_Workbench.py         # Module 2: Workbench (config)
+            │       ├── 3_Execution_Console.py # Module 3: Execution & Artifacts
+            │       ├── 4_Results_Dashboard.py # Module 4: Results Dashboard
+            │       ├── 5_Leaderboard.py       # Module 5: Leaderboard
+            │       └── 6_Arena.py             # Module 6: Arena (1v1 compare)
         └── utils/
             ├── __init__.py      # exports UniversalDataLoader
             ├── data_loader.py   # UniversalDataLoader (264 lines)
@@ -149,7 +159,7 @@ BigQuery downsampling snippet: keep 100% of `target_y = 1`, deterministic 10% of
 | `evaluate_final_coverage(original_data)` | 1649 | Hierarchical CASE evaluation over original data; returns per-segment KPIs + cumulative capture (SQL window functions) |
 | `explain_feature_journey(feature_name)` | 1717 | Prints per-iteration audit trail of a feature |
 | `explain_no_segments()` | 1756 | Human-readable report why extraction stopped (constraints, funnel, near-miss gaps) |
-| `generate_feature_health_report(original_data, features)` | 1822 | DuckDB-native bin health report: NTILE bins for numerics, categorical/missing bins; returns pandas DataFrame |
+| `generate_feature_health_report(original_data, features)` | 1822 | DuckDB-native bin health report: NTILE bins for numerics, categorical/missing bins; returns pandas DataFrame. **Note:** the Streamlit UI no longer calls this directly ? see §11.6 (`generate_feature_health_local`). |
 
 #### Segment output schema
 
@@ -322,3 +332,164 @@ Sweeps builder configs to maximize event capture. Key findings on bank data:
 - `min_lift=1.05` variant: 84.67% @ 29.8% pop, wlift 2.84 (closest-pop win).
 - `binning_method="naive"` underperforms (68.5% capture). `selection_metric` iv vs response_rate give identical results here.
 - Note: when the DT is also tuned down to `min_lift=1.0`, it reaches 89.5% capture @ 36.6% pop / wlift 2.45 (DT is capture-max by construction, but at lower lift and higher pop).
+
+## 11. Streamlit UI (`rapidsegment/ui/`)
+
+No-code Streamlit front-end that drives the library. Launched via
+`rapidsegment.ui.run_ui()` (`ui/app.py:run_ui`), which shells out to
+`streamlit run app.py`. Consists of an explicit-navigation entrypoint (`app.py`)
+plus six module pages under `ui/pages/`. The UI keeps its own DuckDB state under
+`.rapidsegment_suite/` (a per-project dir resolved from the pages' parent): raw
+load → `module1_data.duckdb`; experiments/artifacts → `suite_data.db` +
+`artifacts/<exp_id>/`.
+
+### 11.1 Navigation & page wiring (`app.py`)
+
+Switched from automatic page discovery to **explicit `st.navigation` +
+`st.Page`** so the entry page can be named. `_home` is registered as
+`st.Page(_home, title="Home", icon="🏠")` and renders `st.page_link`
+tiles to each module. Nav titles / labels:
+
+| Nav title | Icon | File |
+|---|---|---|
+| Home | 🏠 | `app.py` (`_home`) |
+| Data Loader | 📥 | `pages/1_Data_Loader.py` |
+| Workbench | ⚙️ | `pages/2_Workbench.py` |
+| Execution | 🚀 | `pages/3_Execution_Console.py` |
+| Results | 📊 | `pages/4_Results_Dashboard.py` |
+| Leaderboard | 🏆 | `pages/5_Leaderboard.py` |
+| Arena | ⚔️ | `pages/6_Arena.py` |
+
+Each page module also carries its own `Module N: …` docstring title.
+
+### 11.2 Storage model & `active_db()` routing
+
+- **Raw load** — `db_write(arrow_table)` (M1) writes `module1_data.duckdb`
+  (table `udl_data`) via `CREATE TABLE udl_data AS SELECT * FROM arrow_table`.
+  This is the *only* writer of the raw file.
+- **Modified copy** — `materialize_modified(positive_value=None)` (M1) writes
+  `module1_data_modified.duckdb` (also table `udl_data`): a **transformed** copy
+  that applies session `type_overrides`
+  (CATEGORICAL → `CAST(col AS VARCHAR)`, NUMERIC → `TRY_CAST(col AS DOUBLE)`)
+  and converts the target to integer 0/1 (see §11.4).
+- **`active_db()`** — defined independently in pages **1, 2, 3, 4**. Returns
+  `module1_data_modified.duckdb` if it exists, else `module1_data.duckdb`.
+  **All** dataset reads in M1–M4 (and M2) go through `active_db()` via
+  `db_query` / `db_scalar` / `load_dataset`. `db_write` still writes only the
+  raw file.
+- **Stale-copy hygiene** — M1 `reset_dataset()` and `load_and_persist()` both
+  delete any existing `module1_data_modified.duckdb` before re-materializing or
+  after a fresh raw load.
+
+### 11.3 Dataset name (M1 → `experiments`)
+
+- M1 renders a `Dataset name` `st.text_input` bound to
+  `st.session_state["dataset_name"]` (default `""`); on load,
+  `load_and_persist(..., dataset_name=...)` seeds it with the source filename,
+  the BigQuery `project.dataset.table` id, or the sample name — i.e.
+  **default = source filename**.
+- The `experiments` table now carries a `dataset_name TEXT` column. It is
+  auto-migrated on write/read via
+  `ALTER TABLE experiments ADD COLUMN dataset_name TEXT` executed inside a
+  `try/except` (idempotent across repeated runs). M3 `_build_experiment` sets
+  `"dataset_name": st.session_state.get("dataset_name", "")` and
+  `upsert_experiment` persists it.
+
+Authoritative `experiments` schema (written by M3, see §11.5):
+
+```
+exp_id TEXT PRIMARY KEY, name TEXT, created_at TIMESTAMP, data_rows INT,
+data_cols INT, status TEXT, execution_time_sec DOUBLE, target_col TEXT,
+primary_key TEXT, builder_params JSON, segments_count INT, avg_lift DOUBLE,
+max_lift DOUBLE, coverage_pct DOUBLE, baseline_rate DOUBLE, error_msg TEXT,
+dataset_name TEXT
+```
+
+### 11.4 Module 1 — Data Loader & Profiling (`1_Data_Loader.py`)
+
+Key helpers: `active_db`, `db_write`, `db_query`, `db_scalar`, `db_exec`,
+`reset_dataset`, `load_and_persist`, `materialize_modified`, `detect_encoding`,
+`detect_format`, `load_file_udl`, `smart_default_hint`, `find_sample_datasets`,
+`effective_types`, `build_metadata`.
+
+Tabs: **Preview**, **Quality Report**, **Column Metadata**, **Target Selection**,
+plus an **Actions** block.
+
+- **Column Metadata tab**
+  - *Apply type overrides* → stores `st.session_state["type_overrides"]`
+    (dict `col → AUTO | NUMERIC | CATEGORICAL`) from the data editor.
+  - *Apply metadata & create modified dataset* (primary) → calls
+    `materialize_modified()`.
+  - *Discard modified dataset* → deletes `module1_data_modified.duckdb` and
+    reverts to the raw file.
+- **Target Selection tab — multi-class binarization helper**
+  - *Binarize into 0/1 column* → calls `materialize_modified(positive_value=...)`.
+- **`materialize_modified(positive_value=None)`** behaviour:
+  - `positive_value is None` **and** target is a known binary encoding
+    (`is_binary` + `binary_label`) → convert **in place** to 0/1
+    (handles numeric 0/1 and textual `true/yes/y/t`).
+  - `positive_value is None` **and** non-binary / no label → leave target as-is.
+  - `positive_value = val` (multi-class) → keep the original column and add
+    `<col>__binary` = `(CASE WHEN LOWER(TRIM(CAST(col AS VARCHAR)))='<pv>' THEN 1
+    ELSE 0 END)::INT`; `target_col` is switched to `<col>__binary`.
+  - Type overrides are applied to every other column (CATEGORICAL → `VARCHAR`,
+    NUMERIC → `TRY_CAST(... AS DOUBLE)`).
+
+### 11.5 Module 3 — Execution & Artifacts (`3_Execution_Console.py`)
+
+- `active_db()` read routing: `db_query` / `db_scalar` read through
+  `active_db()`; `_start_run` loads `SELECT * FROM udl_data` via `active_db()`.
+- Persistence: `upsert_experiment` CREATE TABLE now includes `dataset_name TEXT`
+  and migrates with `ALTER TABLE experiments ADD COLUMN dataset_name TEXT` inside
+  `try/except`; `_build_experiment` adds
+  `"dataset_name": st.session_state.get("dataset_name", "")`.
+- Note: Module 2's `upsert_experiment` (kept for reference/reuse only —
+  execution moved to M3) still uses the **legacy** schema **without**
+  `dataset_name`; the live write path is M3, which M5's reader migrates on read.
+
+### 11.6 Module 4 — Results Dashboard (`4_Results_Dashboard.py`)
+
+- `active_db()` / `load_dataset()` routing (all dataset reads go through
+  `active_db()`).
+- **`generate_feature_health_local(df, features, target, type_overrides=None,
+  naive_bins=5)`** REPLACES the library
+  `StrategicSegmentBuilder.generate_feature_health_report` inside the UI (see
+  §3.4). It fixes two issues:
+  - respects **`type_overrides`** — a column marked CATEGORICAL is binned by
+    distinct value instead of being NTILE'd as numeric;
+  - numeric bins are labelled **uniquely** `Bin N: [min, max]` and the numeric
+    branch casts via `TRY_CAST(col AS DOUBLE)` so ordering / min / max are
+    correct even for text-stored numerics; **degenerate** bins (bmin = bmax)
+    render as a single value `Bin N: <value>`.
+  - categorical / missing bins are preserved.
+- Used in the **Feature Health Report** expander (reads `type_overrides` from
+  session state).
+
+### 11.7 Module 5 — Leaderboard (`5_Leaderboard.py`)
+
+- `EXP_COLS` now ends with `dataset_name` (17 columns). `read_all_experiments`
+  auto-migrates the column via `ALTER TABLE experiments ADD COLUMN dataset_name
+  TEXT` (inside `try/except`).
+- Experiments are **grouped / filtered by `dataset_name`** through a **Dataset**
+  dropdown (`_dataset_name(r)` returns `dataset_name` or `"(unnamed)"`); the old
+  `rows×cols` signature proxy (`_dataset_sig`) has been removed.
+- The grid has a **Dataset** column. The **date picker was removed**.
+- Ranking is by a chosen **KPI** radio — *Avg Lift × / Max Lift × /
+  Coverage % / Segments* — and the top **completed** run by that KPI receives
+  a 🏆 **Best** highlight (in the summary card and the grid).
+- Row actions: Clone → Workbench, View results, Export, Duplicate, Delete
+  (with confirm); plus a two-run **Compare** diff.
+
+### 11.8 Module 6 — Arena (`6_Arena.py`)
+
+1v1 comparison: KPI face-off, parameter diff, segment-overlap (Jaccard) with
+overlaid lift distribution, and a SQL diff of matching segments. Reads
+`suite_data.db`; its `EXP_COLS` is the 16-column legacy set (**no**
+`dataset_name`) — Arena lists all runs and does not filter by dataset.
+
+### 11.9 Global UI change: `width=` replaces `use_container_width=`
+
+Across `app.py` and **all six pages**, every `use_container_width=True/False`
+was replaced with `width='stretch'` (full-width) or `width='content'`
+(natural width). `use_container_width` no longer appears anywhere under
+`rapidsegment/ui/`.

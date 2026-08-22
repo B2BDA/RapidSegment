@@ -3,10 +3,12 @@
 
 PyPI renders the package README (pyproject: readme = "README.md"), while GitHub
 renders the root README. Keep the ROOT README as the single source of truth and
-run this before building/publishing so the two stay in sync.
+run this before building/publishing so the prose/sections stay in sync.
 
-The hero banner image is intentionally skipped in the PyPI copy (GitHub keeps it).
-Everything else -- including all emojis -- is copied exactly.
+The hero banner is NOT synced: the PyPI README keeps ITS OWN banner image, even
+though the root README has a different one. Everything else -- including all
+emojis -- is copied exactly from the root README, with the package README's
+existing <p align="center"> banner preserved in place.
 
     python sync_readme.py
 """
@@ -24,16 +26,23 @@ if DST.exists() and SRC.resolve() == DST.resolve():
     print("README is already a single file (no copy needed).")
     raise SystemExit(0)
 
-text = SRC.read_text(encoding="utf-8")
+root_text = SRC.read_text(encoding="utf-8")
 
-# Skip the hero banner <p align="center">...</p> block (matched by its unique
-# image URL so only this exact banner is removed, nothing else).
-BANNER_SRC = "f2584720-246b-4bda-b5a2-1b843bbec474"
-banner_re = re.compile(
-    r'<p align="center">.*?' + re.escape(BANNER_SRC) + r'.*?</p>',
-    re.DOTALL,
-)
-text = banner_re.sub("", text)
+banner_re = re.compile(r'<p align="center">.*?</p>', re.DOTALL)
 
-DST.write_text(text, encoding="utf-8")
-print(f"Synced {SRC} -> {DST} (hero banner skipped; emojis preserved)")
+# The package README keeps its own banner; only replace the banner if the
+# package already has one (otherwise fall back to the root banner on first run).
+pkg_banner = ""
+if DST.exists():
+    pkg_text = DST.read_text(encoding="utf-8")
+    m = banner_re.search(pkg_text)
+    if m:
+        pkg_banner = m.group(0)
+
+if pkg_banner:
+    new_text = banner_re.sub(pkg_banner, root_text, count=1)
+else:
+    new_text = root_text
+
+DST.write_text(new_text, encoding="utf-8")
+print(f"Synced {SRC} -> {DST} (package banner preserved; emojis preserved)")

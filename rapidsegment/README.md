@@ -2,6 +2,10 @@
 > **Legal Disclaimer**  
 > This open‑source library (`RapidSegment`) is an independent, community‑driven predictive analytics framework. It is **completely unaffiliated** with any commercial products, SaaS platforms, or enterprise solutions of the same or similar name. Any overlap in nomenclature is purely coincidental.
 
+<p align="center">
+  <img width="1983" height="793" alt="f09fbbc6-17b6-4e86-96e7-5291a4175456" src="https://github.com/user-attachments/assets/f2584720-246b-4bda-b5a2-1b843bbec474" />
+</p>
+
 # 🚀 RapidSegment – Strategic Segmentation & Scorecard Engine
 
 [![PyPI version](https://img.shields.io/pypi/v/rapidsegment.svg)](https://pypi.org/project/rapidsegment/)
@@ -63,6 +67,7 @@ Decision trees and RapidSegment both aim to create interpretable segments, but t
 In short, a decision tree is great when you want a predictive model structure; RapidSegment is better when you want transparent, deployable segments that are easy to understand and operationalize.
 
 ---
+
 
 ## ⚡ Quick Start
 

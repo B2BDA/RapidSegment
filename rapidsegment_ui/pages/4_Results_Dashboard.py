@@ -34,7 +34,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from rapidsegment import StrategicSegmentScore
+from rapidsegment import StrategicSegmentScore, StrategicSegmentBuilder
 
 # ── Constants & storage ───────────────────────────────────────────────────────
 SUITE_DIR = os.path.join(os.getcwd(), ".rapidsegment_suite")
@@ -683,7 +683,6 @@ def render_diagnostics(exp, cfg, df, segments):
                     st.warning("Dataset not available - load data via Module 1 first.")
                 else:
                     try:
-                        from rapidsegment import StrategicSegmentBuilder
                         b = StrategicSegmentBuilder(target=cfg.get("target_col", ""))
                         with st.spinner("Profiling features..."):
                             hr = b.generate_feature_health_report(df, list(sel))

@@ -1,4 +1,4 @@
-> [!IMPORTANT]
+﻿> [!IMPORTANT]
 > **Legal Disclaimer**  
 > This open‑source library (`RapidSegment`) is an independent, community‑driven predictive analytics framework. It is **completely unaffiliated** with any commercial products, SaaS platforms, or enterprise solutions of the same or similar name. Any overlap in nomenclature is purely coincidental.
 
@@ -20,7 +20,7 @@
 - [✨ Features](#-features)
 - [🌳 Decision Trees vs RapidSegment](#-decision-trees-vs-rapidsegment)
 - [⚡ Quick Start](#-quick-start)
-- [🖥️ Web UI](#-web-ui)
+- [🖥️ Web UI](️-web-ui)
 - [🧩 Components](#-components)
 - [🏗️ System Architecture](#️-system-architecture)
 - [⚙️ How It Works – Step by Step](#️-how-it-works--step-by-step)
@@ -520,3 +520,4 @@ Special Thanks to Mr. [Guillermo Navas Palencia](https://github.com/guillermo-na
 
 _Independent, open‑source, and ready for production._
 ```
+

@@ -44,6 +44,7 @@ import duckdb
 import streamlit as st
 
 from rapidsegment import StrategicSegmentBuilder
+from rapidsegment.ui._theme import apply_cyberpunk_theme
 
 # ── Constants & storage ───────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -615,6 +616,7 @@ def run_builder(cfg, df):
 
 # ── Page setup ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="RapidSegment — Workbench", layout="wide")
+apply_cyberpunk_theme()
 
 st.markdown(
     """
@@ -622,16 +624,16 @@ st.markdown(
     [data-testid="stAppViewContainer"] .block-container { padding-bottom: 9rem; }
     [data-testid="stVerticalBlockBorderWrapper"]:last-of-type {
         position: fixed; left: 0; right: 0; bottom: 0; z-index: 99;
-        background: rgba(13, 16, 23, 0.96);
-        border-top: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(3, 21, 14, 0.96);
+        border-top: 1px solid rgba(52, 211, 153, 0.4);
         padding: 0.5rem 1.2rem 0.3rem;
     }
     div.stButton > button[kind="primary"] {
-        background-color: #000000; border-color: #000000; color: #ffffff;
+        background-color: #34D399; border-color: #34D399; color: #001014;
         font-weight: 600;
     }
     div.stButton > button[kind="primary"]:hover {
-        background-color: #26262b; border-color: #26262b; color: #ffffff;
+        background-color: #6EE7B7; border-color: #6EE7B7; color: #001014;
     }
     </style>
     """,

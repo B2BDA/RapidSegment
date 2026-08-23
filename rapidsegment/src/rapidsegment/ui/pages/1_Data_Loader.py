@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from rapidsegment.utils.data_loader import UniversalDataLoader
+from rapidsegment.ui._theme import apply_cyberpunk_theme
 
 # ── Constants & storage ───────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +25,6 @@ SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
 DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
-OAUTH_CACHE = os.path.join(SUITE_DIR, "oauth_cache.json")
 
 
 def active_db():
@@ -265,6 +265,7 @@ def find_sample_datasets():
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="RapidSegment — Data Loader & Profiling", layout="wide")
+apply_cyberpunk_theme()
 st.title("RapidSegment — Module 1: Data Source & Profiling")
 
 st.session_state["dataset_name"] = st.text_input(
@@ -274,8 +275,8 @@ st.session_state["dataset_name"] = st.text_input(
 ).strip()
 
 for key, val in {
-    "loaded": False, "tinfo": None, "bq_client": None,
-    "bq_datasets": None, "bq_preview": None,
+    "loaded": False, "tinfo": None,
+    "bq_datasets": None, "bq_tables": None, "bq_preview": None,
     "type_overrides": {}, "target_col": None,
     "dataset_name": "", "data_modified": False,
 }.items():
@@ -342,58 +343,90 @@ with st.sidebar:
                                     os.unlink(tmp_path)
 
     elif source == "BigQuery":
-        if os.path.exists(OAUTH_CACHE):
-            st.success("✓ OAuth cached (one-time) — skip re-auth")
-        else:
-            st.warning("One-time OAuth: run `gcloud auth application-default login`")
+        st.caption(
+            "Authentication uses your environment credentials "
+            "(`gcloud auth application-default login` or GOOGLE_APPLICATION_CREDENTIALS) "
+            "— no secrets are stored in the app."
+        )
+        table_ref = st.text_input(
+            "BigQuery table",
+            placeholder="project_id.dataset_id.table_id",
+            help="Full table reference. 3 parts = project.dataset.table; "
+                 "2 parts = dataset.table (uses your default GCP project).",
+        ).strip()
 
-        pid = st.text_input("GCP Project ID")
-        if st.button("Connect", disabled=not pid):
-            try:
-                from google.cloud import bigquery  # noqa: F401
-                client = bigquery.Client(project=pid)
-                st.session_state["bq_client"] = client
-                with open(OAUTH_CACHE, "w") as fh:
-                    json.dump({"configured": True, "project": pid}, fh)
-                st.success("Connected — OAuth cached")
-            except ImportError:
-                st.error("Install `google-cloud-bigquery` first: pip install google-cloud-bigquery")
-            except Exception as exc:
-                st.error(f"OAuth / connection failed: {exc}")
+        if st.button("Load table", type="primary", disabled=not table_ref):
+            parts = [p.strip() for p in table_ref.split(".") if p.strip()]
+            if len(parts) not in (2, 3):
+                st.error(
+                    "Enter the table as 'project_id.dataset_id.table_id' "
+                    "(or 'dataset_id.table_id')."
+                )
+            else:
+                pid = parts[0] if len(parts) == 3 else None
+                did = parts[-2]
+                tid = parts[-1]
+                with st.spinner("Loading from BigQuery…"):
+                    try:
+                        progress = st.progress(0, text="Loading from BigQuery…")
+                        data = UniversalDataLoader(
+                            project_id=pid, dataset_id=did, table_id=tid
+                        ).load()
+                        load_and_persist(data, progress, dataset_name=f"{did}.{tid}")
+                        st.success(f"Loaded {pid + '.' if pid else ''}{did}.{tid}")
+                    except ImportError:
+                        st.error(
+                            "google-cloud-bigquery not installed. Run: "
+                            "pip install google-cloud-bigquery"
+                        )
+                    except Exception as exc:
+                        st.error(
+                            f"BigQuery load failed: {exc}\n\n"
+                            "Tip: authenticate with `gcloud auth application-default login` "
+                            "or set GOOGLE_APPLICATION_CREDENTIALS."
+                        )
 
-        client = st.session_state.get("bq_client")
-        if client is not None:
-            try:
-                if st.session_state.get("bq_datasets") is None or st.button("↻ Refresh datasets"):
-                    with st.spinner("Listing datasets…"):
-                        st.session_state["bq_datasets"] = sorted(d.dataset_id for d in client.list_datasets())
-                datasets = st.session_state.get("bq_datasets") or []
-                did = st.selectbox("Dataset (lazy dropdown)", datasets or ["(no datasets)"])
-                if datasets and did != "(no datasets)":
-                    with st.spinner("Listing tables…"):
-                        tables = sorted(t.table_id for t in client.list_tables(f"{pid}.{did}"))
-                    tid = st.selectbox("Table", tables or ["(no tables)"])
-                    if tables and tid != "(no tables)":
-                        full_id = f"{pid}.{did}.{tid}"
-                        with st.spinner("Estimating size…"):
-                            tbl = client.get_table(full_id)
-                        st.caption(f"~{tbl.num_rows:,} rows · {tbl.num_bytes / 1e6:.1f} MB")
-                        if st.button("Streaming preview (first 1000 rows)"):
-                            with st.spinner("Querying preview…"):
-                                st.session_state["bq_preview"] = client.query(
-                                    f"SELECT * FROM `{full_id}` LIMIT 1000"
-                                ).to_dataframe()
-                        if st.button("Load full table", type="primary"):
-                            with st.spinner("Loading full table…"):
-                                try:
-                                    progress = st.progress(0, text="Loading from BigQuery…")
-                                    data = UniversalDataLoader(project_id=pid, dataset_id=did, table_id=tid).load()
-                                    load_and_persist(data, progress, dataset_name=full_id)
-                                    st.success("Loaded from BigQuery")
-                                except Exception as exc:
-                                    st.error(str(exc))
-            except Exception as exc:
-                st.error(str(exc))
+        with st.expander("Browse BigQuery (optional discovery)"):
+            st.caption("Lists datasets/tables using your environment credentials.")
+            bpid = st.text_input("GCP Project ID (for browsing)", key="bq_browse_pid")
+            if st.button("List datasets", disabled=not bpid):
+                try:
+                    from google.cloud import bigquery
+
+                    client = bigquery.Client(project=bpid)
+                    st.session_state["bq_datasets"] = sorted(
+                        d.dataset_id for d in client.list_datasets()
+                    )
+                except ImportError:
+                    st.error("google-cloud-bigquery not installed: pip install google-cloud-bigquery")
+                except Exception as exc:
+                    st.error(f"Browse failed: {exc}")
+            datasets = st.session_state.get("bq_datasets") or []
+            if datasets:
+                did = st.selectbox("Dataset", datasets, key="bq_browse_did")
+                if st.button("List tables"):
+                    try:
+                        from google.cloud import bigquery
+
+                        client = bigquery.Client(project=bpid)
+                        st.session_state["bq_tables"] = sorted(
+                            t.table_id for t in client.list_tables(f"{bpid}.{did}")
+                        )
+                    except Exception as exc:
+                        st.error(f"Browse failed: {exc}")
+                tables = st.session_state.get("bq_tables") or []
+                if tables:
+                    tid = st.selectbox("Table", tables, key="bq_browse_tid")
+                    if st.button("Preview (first 1000 rows)"):
+                        try:
+                            from google.cloud import bigquery
+
+                            client = bigquery.Client(project=bpid)
+                            st.session_state["bq_preview"] = client.query(
+                                f"SELECT * FROM `{bpid}.{did}.{tid}` LIMIT 1000"
+                            ).to_dataframe()
+                        except Exception as exc:
+                            st.error(f"Preview failed: {exc}")
 
         preview = st.session_state.get("bq_preview")
         if preview is not None:

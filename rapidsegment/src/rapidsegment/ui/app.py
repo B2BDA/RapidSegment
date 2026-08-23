@@ -12,6 +12,7 @@ import sys
 import streamlit as st
 
 from rapidsegment.ui._exit import render_exit_button, write_server_pid
+from rapidsegment.ui._theme import apply_cyberpunk_theme
 
 
 def run_ui():
@@ -57,6 +58,7 @@ def _home():
 # label it by the filename, i.e. "app"). Edit the `title=` values to rename.
 if __name__ == "__main__":
     st.set_page_config(page_title="RapidSegment", layout="wide")
+    apply_cyberpunk_theme()
     st.sidebar.divider()
     render_exit_button()
     pg = st.navigation({

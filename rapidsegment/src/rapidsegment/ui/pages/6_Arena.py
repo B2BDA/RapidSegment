@@ -16,6 +16,7 @@ import duckdb
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from rapidsegment.ui._theme import apply_cyberpunk_theme
 
 # ── Paths (must match modules 1–5) ──────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,9 +29,11 @@ ARTIFACTS_DIR = os.path.join(SUITE_DIR, "artifacts")
 EXP_COLS = [
     "exp_id", "name", "created_at", "data_rows", "data_cols", "status",
     "execution_time_sec", "target_col", "primary_key", "builder_params",
-    "segments_count", "avg_lift", "max_lift", "coverage_pct",
+    "segments_count", "avg_lift", "max_lift", "coverage_pct", "cumulative_event_capture",
     "baseline_rate", "error_msg",
 ]
+
+apply_cyberpunk_theme()
 
 
 def _jsonable(v):
@@ -47,7 +50,11 @@ def read_all_experiments():
     if not os.path.exists(SUITE_DB):
         return []
     try:
-        con = duckdb.connect(SUITE_DB, read_only=True)
+        con = duckdb.connect(SUITE_DB, read_only=False)
+        try:
+            con.execute("ALTER TABLE experiments ADD COLUMN cumulative_event_capture DOUBLE")
+        except Exception:
+            pass
         has = con.execute(
             "SELECT 1 FROM information_schema.tables WHERE table_name='experiments'"
         ).fetchone()
@@ -130,6 +137,8 @@ def _kpi_faceoff(ea, eb):
         ("Max Lift", float(ea["max_lift"] or 0), float(eb["max_lift"] or 0), True),
         ("Coverage %", float(ea["coverage_pct"] or 0), float(eb["coverage_pct"] or 0), True),
         ("Segments", int(ea["segments_count"] or 0), int(eb["segments_count"] or 0), True),
+        ("Cumulative Event Capture %", float(ea.get("cumulative_event_capture") or 0),
+         float(eb.get("cumulative_event_capture") or 0), True),
         ("Data Rows", int(ea["data_rows"] or 0), int(eb["data_rows"] or 0), True),
         ("Exec Time (s)", float(ea["execution_time_sec"] or 0),
          float(eb["execution_time_sec"] or 0), False),

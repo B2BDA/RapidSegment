@@ -20,6 +20,7 @@ from datetime import datetime
 import duckdb
 import pandas as pd
 import streamlit as st
+from rapidsegment.ui._theme import apply_cyberpunk_theme
 
 # ── Paths (must match modules 1–4) ──────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +33,7 @@ ARTIFACTS_DIR = os.path.join(SUITE_DIR, "artifacts")
 EXP_COLS = [
     "exp_id", "name", "created_at", "data_rows", "data_cols", "status",
     "execution_time_sec", "target_col", "primary_key", "builder_params",
-    "segments_count", "avg_lift", "max_lift", "coverage_pct",
+    "segments_count", "avg_lift", "max_lift", "coverage_pct", "cumulative_event_capture",
     "baseline_rate", "error_msg", "dataset_name",
 ]
 
@@ -42,7 +43,10 @@ KPI_OPTS = {
     "Max Lift ×": "max_lift",
     "Coverage %": "coverage_pct",
     "Segments": "segments_count",
+    "Cumulative Event Capture %": "cumulative_event_capture",
 }
+
+apply_cyberpunk_theme()
 
 
 # ── Column coercion helpers (DB gives Decimal/None) ──────────────────────────
@@ -83,6 +87,10 @@ def read_all_experiments():
         con = duckdb.connect(SUITE_DB, read_only=False)
         try:
             con.execute("ALTER TABLE experiments ADD COLUMN dataset_name TEXT")
+        except Exception:
+            pass
+        try:
+            con.execute("ALTER TABLE experiments ADD COLUMN cumulative_event_capture DOUBLE")
         except Exception:
             pass
         rows = con.execute(

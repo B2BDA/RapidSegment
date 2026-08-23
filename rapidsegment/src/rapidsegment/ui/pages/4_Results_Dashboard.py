@@ -35,6 +35,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from rapidsegment import StrategicSegmentScore, StrategicSegmentBuilder
+from rapidsegment.ui._theme import apply_cyberpunk_theme
 
 # ── Constants & storage ───────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -913,6 +914,7 @@ def render_export_hub(exp, segments, coverage, scorecard, cfg):
 
 # ── Page setup ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="RapidSegment — Results Dashboard", layout="wide")
+apply_cyberpunk_theme()
 st.title("RapidSegment — Module 4: Results Dashboard & Visualization")
 st.caption("Extracted segments, visualizations, deployable scorecard, and diagnostics.")
 

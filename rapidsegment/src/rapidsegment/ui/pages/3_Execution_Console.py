@@ -42,6 +42,7 @@ import pandas as pd
 import streamlit as st
 
 from rapidsegment import StrategicSegmentBuilder
+from rapidsegment.ui._theme import apply_cyberpunk_theme
 
 # ── Constants & storage ───────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -406,6 +407,7 @@ def upsert_experiment(exp):
             max_lift DOUBLE,
             coverage_pct DOUBLE,
             baseline_rate DOUBLE,
+            cumulative_event_capture DOUBLE,
             error_msg TEXT,
             dataset_name TEXT
         )
@@ -416,10 +418,14 @@ def upsert_experiment(exp):
         con.execute("ALTER TABLE experiments ADD COLUMN dataset_name TEXT")
     except Exception:
         pass
+    try:
+        con.execute("ALTER TABLE experiments ADD COLUMN cumulative_event_capture DOUBLE")
+    except Exception:
+        pass
     con.execute(
         """
         INSERT OR REPLACE INTO experiments VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         [
@@ -429,7 +435,8 @@ def upsert_experiment(exp):
             json.dumps(exp["config"]),
             exp["result"]["segments_count"], exp["result"]["avg_lift"],
             exp["result"]["max_lift"], exp["result"]["coverage_pct"],
-            exp["result"]["baseline_rate_pct"], exp["result"].get("error_msg"),
+            exp["result"]["baseline_rate_pct"], exp["result"]["cumulative_event_capture"],
+            exp["result"].get("error_msg"),
             exp.get("dataset_name", ""),
         ],
     )
@@ -440,6 +447,10 @@ def _build_experiment(run):
     cfg = run["cfg"]
     segments = run.get("segments") or []
     coverage = run.get("coverage") or []
+    cec = max(
+        (float(r.get("cumulative_event_capture") or 0) for r in coverage if r.get("segment") != 0),
+        default=0.0,
+    )
     lifts = [float(s.get("lift") or 0) for s in segments if s.get("lift") is not None]
     cov_pct = sum(
         float(r.get("capture_rate") or 0) for r in coverage if r.get("segment") != 0
@@ -455,6 +466,7 @@ def _build_experiment(run):
         "avg_lift": round(sum(lifts) / len(lifts), 4) if lifts else 0.0,
         "max_lift": round(max(lifts), 4) if lifts else 0.0,
         "coverage_pct": round(cov_pct, 3),
+        "cumulative_event_capture": round(cec, 3),
         "baseline_rate_pct": round(baseline, 3),
         "step_reached": run.get("step", 1),
     }
@@ -928,16 +940,17 @@ def _render_final(run):
 
 # ── Page setup ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="RapidSegment — Execution Console", layout="wide")
+apply_cyberpunk_theme()
 
 st.markdown(
     """
     <style>
     div.stButton > button[kind="primary"] {
-        background-color: #d92d20; border-color: #d92d20; color: #ffffff;
+        background-color: #34D399; border-color: #34D399; color: #001014;
         font-weight: 600;
     }
     div.stButton > button[kind="primary"]:hover {
-        background-color: #b42318; border-color: #b42318; color: #ffffff;
+        background-color: #6EE7B7; border-color: #6EE7B7; color: #001014;
     }
     </style>
     """,

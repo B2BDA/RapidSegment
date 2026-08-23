@@ -2126,7 +2126,7 @@ wheels = [
 
 [[package]]
 name = "rapidsegment"
-version = "1.2.5"
+version = "1.2.6.post1"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },

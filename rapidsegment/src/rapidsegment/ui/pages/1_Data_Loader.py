@@ -8,8 +8,10 @@ Run with:  streamlit run Module_1_data_loader.py
 """
 import json
 import os
+import shutil
 import tempfile
 
+import pyarrow.csv as pa_csv
 import duckdb
 import pandas as pd
 import plotly.graph_objects as go
@@ -35,7 +37,7 @@ def active_db():
     goes through this so DuckDB sees the actual changed types, not just the UI.
     """
     return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
-MAX_UPLOAD_MB = 500
+MAX_UPLOAD_MB = 2000
 SAMPLE_NAMES = ["bank-full.csv", "train.csv"]
 
 NUMERIC = {"INTEGER", "BIGINT", "DOUBLE", "FLOAT", "DECIMAL", "REAL",
@@ -197,7 +199,9 @@ def detect_format(name):
 def load_file_udl(path, encoding="Auto-detect"):
     ext = os.path.splitext(path)[1].lower()
     if encoding != "Auto-detect" and ext == ".csv":
-        return UniversalDataLoader().load(fallback_data=pd.read_csv(path, encoding=encoding))
+        enc = {"UTF-8": "utf8", "Latin-1": "latin1"}.get(encoding, "utf8")
+        table = pa_csv.read_csv(path, read_options=pa_csv.ReadOptions(encoding=enc))
+        return UniversalDataLoader().load(fallback_data=table)
     try:
         return UniversalDataLoader(file_path=path).load()
     except Exception:
@@ -205,7 +209,8 @@ def load_file_udl(path, encoding="Auto-detect"):
             last = None
             for enc in ("utf-8", "latin-1"):
                 try:
-                    return UniversalDataLoader().load(fallback_data=pd.read_csv(path, encoding=enc))
+                    table = pa_csv.read_csv(path, read_options=pa_csv.ReadOptions(encoding=enc))
+                    return UniversalDataLoader().load(fallback_data=table)
                 except Exception as exc:
                     last = exc
             if last is not None:
@@ -330,7 +335,7 @@ with st.sidebar:
                             tmp_path = None
                             try:
                                 with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                                    tmp.write(uploaded.getvalue())
+                                    shutil.copyfileobj(uploaded, tmp)
                                     tmp_path = tmp.name
                                 progress = st.progress(0, text="Loading…")
                                 data = load_file_udl(tmp_path, encoding)

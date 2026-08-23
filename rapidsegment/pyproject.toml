@@ -87,3 +87,8 @@ dev = ["pytest>=8"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# Third-party DeprecationWarning emitted at import time by protobuf's C
+# extension (google._upb._message) via streamlit; harmless and outside our code.
+filterwarnings = [
+    "ignore:.*google._upb._message.*:DeprecationWarning",
+]

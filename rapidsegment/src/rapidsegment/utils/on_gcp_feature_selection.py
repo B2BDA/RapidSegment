@@ -11,7 +11,6 @@ import logging
 from typing import List, Optional, Tuple
 
 import duckdb
-from google.cloud import bigquery
 
 # -----------------------------------------------------------------------------
 # Module-level configuration
@@ -60,8 +59,10 @@ class BigQueryFeatureSelector:
         bins: int = 10,
         batch_size: int = 15,
         binary_columns: Optional[List[str]] = None,
-        bq_client: Optional[bigquery.Client] = None,
+        bq_client: "Optional[bigquery.Client]" = None,
     ):
+        from google.cloud import bigquery
+
         self.project_id = project_id
         self.dataset_id = dataset_id
         self.table_id = table_id

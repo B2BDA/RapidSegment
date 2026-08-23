@@ -56,8 +56,8 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 | 2 — Workbench | ✅ **Done** | All 23 `StrategicSegmentBuilder` constructor params exposed (incl. 14 `sort_priority` values, `n_jobs`, `expand_log_mode`), presets, feature groups, grid search, templates, validation, latest-results preview |
 | 3 — Execution & Artifact Console | ✅ **Done** | 6-step timeline, live KPIs, log terminal + SQL inspector, cancel-with-partial-save, export hub (Logs.txt / SQL.sql / Config.json), `suite_data.db` persistence |
 | 4 — Results Dashboard & Visualization | ✅ **Done** | Summary cards, segments table (with scorecard weight column), 5 Plotly charts (lift-vs-volume scatter, stacked distribution, **rule-complexity sunburst** — inner ring groups segments by 1/2/3-way complexity, outer ring per segment sized by population, `StrategicSegmentScore` scorecard + JSON preview, diagnostics with **dedicated Feature Journey expander** (audit trail per feature), feature health report, no-segments explanation, export hub (CSV/JSON/SQL/HTML/ZIP) |
-| 5 — Leaderboard | ✅ **Done** | Ranked grid grouped/filtered by **Dataset** (via `dataset_name`, dropdown; old `rows×cols` signature proxy removed), sortable, **date picker removed**; ranked by chosen **KPI** (Avg/Max Lift, Coverage %, Segments) with 🏆 best-performer highlight; light filters (status + name search); summary cards; row actions (Clone to Workbench, View Results, Export JSON, Duplicate, Delete-with-confirmation); two-run Compare (`param_diff`) |
-| 6 — Arena (1v1 comparison) | ✅ **Done** | KPI face-off with winners, full parameter diff (differing fields flagged), segment overlap (shared/unique/Jaccard + overlaid lift distribution + shared-segment lift table), SQL diff per segment; wired into `app.py` |
+| 5 — Leaderboard | ✅ **Done** | Ranked grid grouped/filtered by **Dataset** (via `dataset_name`, dropdown; old `rows×cols` signature proxy removed), sortable, **date picker removed**; ranked by chosen **KPI** (Avg/Max Lift, Coverage %, Segments, **Cumulative Event Capture %**) with 🏆 best-performer highlight; light filters (status + name search); summary cards; row actions (Clone to Workbench, View Results, Export JSON, Duplicate, Delete-with-confirmation); two-run Compare (`param_diff`) |
+| 6 — Arena (1v1 comparison) | ✅ **Done** | KPI face-off (incl. **Cumulative Event Capture %**) with winners, full parameter diff (differing fields flagged), segment overlap (shared/unique/Jaccard + overlaid lift distribution + shared-segment lift table), SQL diff per segment; wired into `app.py` |
 
 **Known caveats / deviations:**
 - ⚠ `builder.evaluate_final_coverage()` hangs in this environment (DuckDB file-lock on shared `db_path`) — never call it; coverage is computed locally (`compute_coverage_local`).
@@ -73,6 +73,7 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 - **M3 save fixes & `dataset_name` persistence.** `upsert_experiment` adds a `dataset_name TEXT` column (auto-migrated in try/except); `_build_experiment` sets it from session. numpy int64/float64 from `df.shape` are coerced to int/float before save; save errors surface via `m3_save_error` (run still completes).
 - **M5 Leaderboard rework.** Experiments grouped/filtered by `dataset_name` (Dataset dropdown, replaced the `rows×cols` signature proxy); grid gains a Dataset column; **date picker removed**; ranking by chosen KPI (Avg/Max Lift, Coverage %, Segments) with 🏆 best-performer highlight; light filters (status + name search); row actions (Clone→Workbench, View results→M4, Export JSON, Duplicate, Delete-with-confirmation); two-run Compare (`param_diff`).
 - **Navigation rename + global `width=` change.** `app.py` uses explicit `st.navigation` + `st.Page`; the entry page is titled **"Home"** (M-pages: Data Loader, Workbench, Execution, Results, Leaderboard, Arena). Across `app.py` and all six pages, every `use_container_width=True/False` was replaced with `width='stretch'` / `width='content'`.
+- **Cyberpunk / AMOLED theme + `cumulative_event_capture` KPI.** Added `rapidsegment/src/rapidsegment/ui/_theme.py` (`apply_cyberpunk_theme()`) and `.streamlit/config.toml` (emerald hacker-terminal: AMOLED black `#000000` + primary `#34D399`, text `#6EE7B7`, cyan/amber/red alert accents, JetBrains Mono); injected into `app.py` and all six pages (Module 3's primary buttons recolored to emerald). Leaderboard ranking gains a **Cumulative Event Capture %** KPI and Arena KPI face-off gains the same metric; `cumulative_event_capture` is computed by `compute_coverage_local` during a run and persisted to the `experiments` table (auto-migrated `cumulative_event_capture DOUBLE`, with read-side migration in both `read_all_experiments`). KPIs stay read from stored artifacts — no live recomputation.
 
 ---
 
@@ -364,7 +365,7 @@ Central hub to track all experiments, rank by metrics, and enable quick cloning 
 
 #### 5.1 Ranked Data Grid
 **Columns**: 🏆 | Rank | Experiment | Dataset | Status | Avg Lift | Max Lift | Coverage % | Segments | Rows | Time | Actions
-- Sortable, ranked by a chosen KPI (Avg Lift / Max Lift / Coverage % / Segments); top completed run by KPI gets a 🏆 Best highlight.
+- Sortable, ranked by a chosen KPI (Avg Lift / Max Lift / Coverage % / Segments / **Cumulative Event Capture %**); top completed run by KPI gets a 🏆 Best highlight.
 - Grouped/filtered by **Dataset** (dropdown of `dataset_name` values); the old `rows×cols` signature proxy is gone.
 - **Date picker removed** — every saved run counts.
 - Light filters: status multiselect + name search.
@@ -415,6 +416,7 @@ Avg Lift          |     2.1       | ← → |     1.8
 Max Lift          |     3.2       | ← → |     2.9
 # Segments        |      5        | ← → |      8
 Coverage %        |    42.1%      | ← → |    51.3%
+Cumulative Event Capture % |  38.4%  | ← → |  44.7%
 Execution Time    |    3m 42s     | ← → |    5m 21s
 ```
 - Delta bar chart for visual representation

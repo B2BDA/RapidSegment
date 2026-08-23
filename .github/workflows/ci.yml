@@ -1,0 +1,50 @@
+# RapidSegment CI
+# Purpose: automated safety net that runs on every push/PR. It proves the locked
+# dependencies install (`uv sync --all-extras`) and the test suite passes
+# (`uv run pytest`) on both supported Pythons (3.11, 3.12) and at the declared
+# lower bounds (the `lowest` job). A green CI means an upgrade/build is safe to merge.
+# How to use: it runs automatically on push/PR. To run manually, go to the repo's
+# Actions tab -> CI -> "Run workflow" (enabled by `workflow_dispatch` below).
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (locked versions)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Sync dependencies (core + dev + extras)
+        working-directory: rapidsegment
+        run: uv sync --all-extras
+      - name: Run smoke tests
+        working-directory: rapidsegment
+        run: uv run pytest
+
+  lowest:
+    name: Test (lowest supported versions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: Sync with lowest-resolution policy
+        working-directory: rapidsegment
+        run: uv sync --resolution lowest
+      - name: Run smoke tests
+        working-directory: rapidsegment
+        run: uv run pytest

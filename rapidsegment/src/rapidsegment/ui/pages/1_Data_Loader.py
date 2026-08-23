@@ -167,7 +167,7 @@ def materialize_modified(positive_value=None):
         st.session_state["target_col"] = new_target
         st.session_state["tinfo"] = None
     st.session_state["data_modified"] = True
-    st.success("✅ Modified dataset written to `module1_data_modified.duckdb` and is now active.")
+    st.success("☑️ Modified dataset written to `module1_data_modified.duckdb` and is now active.")
     rerun()
 
 
@@ -578,7 +578,7 @@ with tab_quality:
                .sort_values("null_pct", ascending=False)
                .rename(columns={"column_name": "Column", "null_pct": "Null %"}))
     if null_df.empty:
-        st.success("✅ No missing values — data ready for segmentation ✓")
+        st.success("☑️ No missing values — data ready for segmentation ✓")
     else:
         st.warning(f"⚠️ {len(null_df)} column(s) have missing values (worst offenders first)")
         null_df["Null %"] = null_df["Null %"].apply(lambda x: f"{x:.1f}%")
@@ -587,7 +587,7 @@ with tab_quality:
     warns = build_metadata(summ)
     warns = warns[warns["Warning"] != "✓"]
     if warns.empty:
-        st.success("✅ No type warnings — data ready for segmentation ✓")
+        st.success("☑️ No type warnings — data ready for segmentation ✓")
     else:
         st.warning(f"⚠️ {len(warns)} column(s) flagged with type/cardinality warnings")
 
@@ -629,7 +629,7 @@ with tab_meta:
     if st.button("Apply metadata & create modified dataset", type="primary"):
         materialize_modified()
     if os.path.exists(DB_FILE_MOD):
-        st.success("✅ Modified dataset is active.")
+        st.success("☑️ Modified dataset is active.")
         if st.button("Discard modified dataset (revert to raw)"):
             try:
                 os.remove(DB_FILE_MOD)
@@ -709,7 +709,7 @@ with tab_target:
     if info:
         st.divider()
         if info["is_binary"]:
-            st.success(f"✅ Binary column — encoding: **{info['binary_label']}**")
+            st.success(f"☑️ Binary column — encoding: **{info['binary_label']}**")
             er = info["event_rate"]
             if er is not None:
                 bad = er < 0.01 or er > 0.99
@@ -718,7 +718,7 @@ with tab_target:
                 if bad:
                     col_b.warning("⚠️ Severe class imbalance — outside 1%–99%")
                 else:
-                    col_b.success("✅ Event rate in healthy range")
+                    col_b.success("☑️ Event rate in healthy range")
         else:
             st.warning(f"⚠️ Multi-class — {info['n_distinct']} distinct values. Use the binarization helper below.")
 

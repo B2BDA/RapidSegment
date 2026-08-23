@@ -53,6 +53,12 @@ streamlit run <path-to-site-packages>/rapidsegment/ui/app.py
 
 Use the **Exit UI** button in the sidebar — it is available on every page and terminates the Streamlit **server process** (not just the current page), so the app fully closes.
 
+## Theme
+
+The UI uses a custom **emerald "hacker-terminal"** look: black background, emerald primary `#34D399`, light-emerald text `#6EE7B7`, JetBrains Mono font, and a subtle grid / CRT-scanline background with glassmorphism on the sidebar and header. It is applied on every page via `apply_cyberpunk_theme()` (`rapidsegment/ui/_theme.py`) on top of the base palette declared in `.streamlit/config.toml`.
+
+One notable detail: the **Leaderboard 🏆 Best performer** card is rendered as a bright-emerald `st.success` box with black text for high contrast (targeted via `[data-testid="stAlertContentSuccess"]` in `_theme.py`).
+
 ## Pages & Modules
 
 ### Home
@@ -60,6 +66,7 @@ Navigation hub that links to every module.
 
 ### M1 · Data Loader & Profiling
 - Load data from a local file, BigQuery, or built-in samples.
+- **BigQuery**: enter a table directly as `project_id.dataset_id.table_id` (or `dataset_id.table_id` to use your default GCP project) and click **Load table**. Authentication uses your **environment** credentials — `gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS` — so no secrets are stored in the app. The `google-cloud-bigquery` client is optional (install via the `gcp` extra); if it is missing, the panel tells you how to install it. An optional **Browse BigQuery** expander lists datasets/tables and previews the first 1,000 rows using the same environment credentials.
 - Automatic column profiling, a data-quality report, and CSV / JSON download.
 - **Column Metadata**: set type overrides (Categorical / Numeric / etc.). Applying them writes a *transformed* copy, `module1_data_modified.duckdb` (real DuckDB column types plus target encoded as `0/1`), which every downstream module reads automatically via `active_db()`.
 - **Dataset name**: a label stored with each experiment so the Leaderboard can group runs by dataset.
@@ -81,11 +88,11 @@ Navigation hub that links to every module.
 - No-segments explanation and an export hub (CSV / JSON / SQL / HTML / ZIP).
 
 ### M5 · Leaderboard
-- Best experiment **per dataset**, ranked by a chosen KPI (avg lift, max lift, coverage %, segment count) with a **best-performer** highlight.
+- Best experiment **per dataset**, ranked by a chosen KPI (avg lift, max lift, coverage %, segment count, or **Cumulative Event Capture %**) with a **best-performer** highlight (the emerald 🏆 card).
 - Light filters (status + name search), summary cards, row actions (clone to Workbench, view results, export JSON, duplicate, delete), and a two-run **Compare** view.
 
 ### M6 · Arena
-- 1v1 experiment comparison: KPI face-off with winners, a full parameter diff (differing fields highlighted), segment-overlap analysis with overlaid lift distributions, and a SQL diff of matching segments.
+- 1v1 experiment comparison: KPI face-off with winners (avg lift, max lift, coverage %, segments, **Cumulative Event Capture %**, data rows, exec time), a full parameter diff (differing fields highlighted), segment-overlap analysis with overlaid lift distributions, and a SQL diff of matching segments.
 
 ## Tutorial Video
 

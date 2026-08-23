@@ -73,7 +73,7 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 - **M3 save fixes & `dataset_name` persistence.** `upsert_experiment` adds a `dataset_name TEXT` column (auto-migrated in try/except); `_build_experiment` sets it from session. numpy int64/float64 from `df.shape` are coerced to int/float before save; save errors surface via `m3_save_error` (run still completes).
 - **M5 Leaderboard rework.** Experiments grouped/filtered by `dataset_name` (Dataset dropdown, replaced the `rows×cols` signature proxy); grid gains a Dataset column; **date picker removed**; ranking by chosen KPI (Avg/Max Lift, Coverage %, Segments) with 🏆 best-performer highlight; light filters (status + name search); row actions (Clone→Workbench, View results→M4, Export JSON, Duplicate, Delete-with-confirmation); two-run Compare (`param_diff`).
 - **Navigation rename + global `width=` change.** `app.py` uses explicit `st.navigation` + `st.Page`; the entry page is titled **"Home"** (M-pages: Data Loader, Workbench, Execution, Results, Leaderboard, Arena). Across `app.py` and all six pages, every `use_container_width=True/False` was replaced with `width='stretch'` / `width='content'`.
-- **Cyberpunk / AMOLED theme + `cumulative_event_capture` KPI.** Added `rapidsegment/src/rapidsegment/ui/_theme.py` (`apply_cyberpunk_theme()`) and `.streamlit/config.toml` (emerald hacker-terminal: AMOLED black `#000000` + primary `#34D399`, text `#6EE7B7`, cyan/amber/red alert accents, JetBrains Mono); injected into `app.py` and all six pages (Module 3's primary buttons recolored to emerald). Leaderboard ranking gains a **Cumulative Event Capture %** KPI and Arena KPI face-off gains the same metric; `cumulative_event_capture` is computed by `compute_coverage_local` during a run and persisted to the `experiments` table (auto-migrated `cumulative_event_capture DOUBLE`, with read-side migration in both `read_all_experiments`). KPIs stay read from stored artifacts — no live recomputation.
+- **Cyberpunk / AMOLED theme + `cumulative_event_capture` KPI.** Added `rapidsegment/src/rapidsegment/ui/_theme.py` (`apply_cyberpunk_theme()`); the emerald theme comes from `_theme.py` CSS, while `.streamlit/config.toml` only lifts Streamlit's upload/message gate (`[server] maxUploadSize/maxMessageSize = 2000`). Injected into `app.py` and all six pages (Module 3's primary buttons recolored to emerald). Leaderboard ranking gains a **Cumulative Event Capture %** KPI and Arena KPI face-off gains the same metric; `cumulative_event_capture` is computed by `compute_coverage_local` during a run and persisted to the `experiments` table (auto-migrated `cumulative_event_capture DOUBLE`, with read-side migration in both `read_all_experiments`). KPIs stay read from stored artifacts — no live recomputation.
 
 ---
 
@@ -90,9 +90,9 @@ Load data from multiple sources and deliver instant, actionable insights about d
 - **Sample datasets**: Quick-start with RapidSegment example datasets (bank-full.csv, train.csv)
 
 #### 1.2 File Upload & Parsing
-- **Drag-and-drop zone** with file size limits
+- **Drag-and-drop zone** with a 2000 MB upload gate (set in `.streamlit/config.toml` via `server.maxUploadSize`); files are streamed chunked (`shutil.copyfileobj`) to match the disk/BigQuery load path
 - **Format detection**: Auto-infer CSV vs. Parquet vs. Excel vs. Arrow
-- **Encoding support**: UTF-8, Latin-1, auto-detect
+- **Encoding support**: UTF-8, Latin-1, auto-detect — CSV encoding read through PyArrow `ReadOptions(encoding=…)`, always producing a PyArrow table with float64 numerics (no pandas fallback)
 - **Progress indicator**: File load, profiling progress
 
 #### 1.3 BigQuery Integration

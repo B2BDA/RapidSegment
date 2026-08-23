@@ -55,7 +55,7 @@ Use the **Exit UI** button in the sidebar — it is available on every page and 
 
 ## Theme
 
-The UI uses a custom **emerald "hacker-terminal"** look: black background, emerald primary `#34D399`, light-emerald text `#6EE7B7`, JetBrains Mono font, and a subtle grid / CRT-scanline background with glassmorphism on the sidebar and header. It is applied on every page via `apply_cyberpunk_theme()` (`rapidsegment/ui/_theme.py`) on top of the base palette declared in `.streamlit/config.toml`.
+The UI uses a custom **emerald "hacker-terminal"** look: black background, emerald primary `#34D399`, light-emerald text `#6EE7B7`, JetBrains Mono font, and a subtle grid / CRT-scanline background with glassmorphism on the sidebar and header. It is applied on every page via `apply_cyberpunk_theme()` (`rapidsegment/ui/_theme.py`). `.streamlit/config.toml` exists solely to raise Streamlit's upload/message limit (`[server] maxUploadSize/maxMessageSize = 2000`); the theme palette is injected by `_theme.py`, not declared in config.toml.
 
 One notable detail: the **Leaderboard 🏆 Best performer** card is rendered as a bright-emerald `st.success` box with black text for high contrast (targeted via `[data-testid="stAlertContentSuccess"]` in `_theme.py`).
 

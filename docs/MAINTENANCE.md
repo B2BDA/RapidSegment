@@ -46,18 +46,26 @@ GitHub every time you push code or open a pull request, and its job is to prove 
 1. the **locked dependencies still install** (`uv sync --all-extras`), and
 2. the **test suite still passes** (`uv run pytest`)
 
-— on **every supported Python version** and at the **declared lower bounds**.
+— on **every supported Python version** (3.11 and 3.12), **including** the
+`ui`/`excel`/`gcp`/`prettytable` extras.
 
 In short: it catches a broken dependency upgrade (or a code change that breaks the
 build) *before* it reaches `main`, so the main branch is always green and installable.
 A green CI on your PR is the signal that an upgrade is safe to merge.
 
-### What it does — two jobs
+> **Why there is no `--resolution lowest` job:** optbinning (a transitive dependency)
+> declares `matplotlib`, `pandas`, `scikit-learn`, and `ropwr` with **no lower bound**.
+> Under `--resolution lowest`, uv therefore resolves those to ancient Python‑2‑era
+> releases (e.g. `matplotlib==0.86`) that fail to build on Python 3.11. The lockfile
+> already pins a known‑good set, so the locked `test` job is the meaningful check.
+> You can still run a lowest-resolution check *locally* as an advisory (see §8), but
+> it is not part of CI.
+
+### What it does — one job
 
 | Job | What it does | Local equivalent (run in `rapidsegment/`) |
 |-----|--------------|-------------------------------------------|
 | **test** | Matrix `python-version: ["3.11", "3.12"]`. For each: `uv sync --all-extras` then `uv run pytest`. Proves the locked deps install and the engine works on both supported Pythons, **including** the `ui`/`excel`/`gcp`/`prettytable` extras. | `uv sync --python 3.11 --all-extras && uv run pytest`  (repeat for 3.12) |
-| **lowest** | `python-version: 3.11`, `uv sync --resolution lowest` then `uv run pytest`. Validates the declared **lower bounds** (recommended for published libraries). | `uv sync --resolution lowest && uv run pytest` |
 
 ### How to use it
 
@@ -70,10 +78,10 @@ A green CI on your PR is the signal that an upgrade is safe to merge.
 - **Manual run (optional):** the workflow declares `workflow_dispatch`, so you can also
   trigger it any time from the repo's **Actions → CI → Run workflow** button, without
   making a push.
-- **Reproduce a job locally:** use the "Local equivalent" commands in the table above.
+- **Reproduce a job locally:** use the "Local equivalent" command in the table above.
   If a CI job is red, run the matching command locally to see the failure before
   pushing a fix.
-- **Reading the results:** on the PR, or in the repo's **Actions** tab, each job shows
+- **Reading the results:** on the PR, or in the repo's **Actions** tab, the job shows
   green ✓ (pass) or red ✗ (fail) with full logs. Click a failed job to see which
   Python version / dependency broke.
 - **If a job fails:** do **not** merge. Reproduce locally, fix the code or the pin,
@@ -227,7 +235,7 @@ Run everything from `rapidsegment/`.
 | Verify lock is consistent | `uv lock --check` |
 | Install env (incl. extras) | `uv sync --all-extras` |
 | Run tests | `uv run pytest` |
-| Validate lower bounds (the `lowest` CI job) | `uv sync --resolution lowest && uv run pytest` |
+| Validate lower bounds (local advisory only — not a CI job) | `uv sync --resolution lowest && uv run pytest` |
 | Add runtime / dev / extra dep | `uv add [--group dev \| --optional X] <pkg>` |
 | Remove a dependency | `uv remove <pkg>` |
 | Dry-run a major bump | raise bound → `uv lock --upgrade-package <pkg>==ver` → test → `git checkout` |

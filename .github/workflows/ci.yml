@@ -1,10 +1,13 @@
 # RapidSegment CI
 # Purpose: automated safety net that runs on every push/PR. It proves the locked
 # dependencies install (`uv sync --all-extras`) and the test suite passes
-# (`uv run pytest`) on both supported Pythons (3.11, 3.12) and at the declared
-# lower bounds (the `lowest` job). A green CI means an upgrade/build is safe to merge.
+# (`uv run pytest`) on both supported Pythons (3.11, 3.12), including the
+# ui/excel/gcp/prettytable extras. A green CI means an upgrade/build is safe to merge.
 # How to use: it runs automatically on push/PR. To run manually, go to the repo's
 # Actions tab -> CI -> "Run workflow" (enabled by `workflow_dispatch` below).
+# Note: we intentionally do NOT run a `--resolution lowest` job — optbinning
+# declares matplotlib/pandas/scikit-learn/ropwr with no lower bound, so lowest
+# resolution pulls ancient releases that fail to build on Python 3.11.
 
 name: CI
 
@@ -26,25 +29,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
+          activate-environment: false
       - name: Sync dependencies (core + dev + extras)
         working-directory: rapidsegment
         run: uv sync --all-extras
-      - name: Run smoke tests
-        working-directory: rapidsegment
-        run: uv run pytest
-
-  lowest:
-    name: Test (lowest supported versions)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.11"
-      - name: Sync with lowest-resolution policy
-        working-directory: rapidsegment
-        run: uv sync --resolution lowest
       - name: Run smoke tests
         working-directory: rapidsegment
         run: uv run pytest

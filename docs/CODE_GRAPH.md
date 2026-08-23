@@ -1,6 +1,6 @@
 # RapidSegment — Code Graph
 
-Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `e45bce0` (main, `rapidsegment` v1.2.2.post1).
+Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `78653d4` (main, `rapidsegment` v1.2.4).
 
 ---
 
@@ -23,7 +23,7 @@ Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `e45bce0` (m
 │   ├── train.csv                # Churn training set
 │   └── test.csv                 # Churn test set
 └── rapidsegment/                # Installable Python package (src layout)
-    ├── pyproject.toml           # uv_build backend, v1.2.2.post1
+    ├── pyproject.toml           # uv_build backend, v1.2.4
     ├── uv.lock
     ├── LICENSE
     ├── .python-version
@@ -274,7 +274,7 @@ BigQueryFeatureSelector.screen_features() → DuckDB relation (feature, stddev, 
 
 ## 8. Dependencies & Constraints
 
-- Python ≥ 3.9; build backend `uv_build`; version `1.2.2.post1`.
+- Python ≥ 3.9; build backend `uv_build`; version `1.2.4`.
 - Runtime: `duckdb>=1.5.4`, `joblib>=1.5.3`, `numpy>=2.5.1`, `optbinning>=0.21.0`, `pandas>=2.2.0`, `psutil>=7.2.2`, `pyarrow>=25.0.0`.
 - Optional extras: `excel` (openpyxl), `gcp` (google-cloud-bigquery), `prettytable`.
 - Packaging: src layout; package name `rapidsegment`; module `rapidsegment` inside `rapidsegment/src/rapidsegment`.

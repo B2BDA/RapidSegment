@@ -3,12 +3,12 @@
 Handoff document. Read this first when resuming work so we can jump straight back in.
 
 ## What this project is
-A Streamlit no-code UI on top of the **RapidSegment** PyPI library (`rapidsegment==1.2.2.post1`, class `StrategicSegmentBuilder`). Spec lives in `UI_MVP.md` (converted from Solara → Streamlit). 6 modules; all 1–6 done.
+A Streamlit no-code UI on top of the **RapidSegment** PyPI library (`rapidsegment==1.2.4`, class `StrategicSegmentBuilder`). Spec lives in `UI_MVP.md` (converted from Solara → Streamlit). 6 modules; all 1–6 done.
 
 ## File map
-- `C:\Users\Bishwarup\RapidSegment\docs\UI_MVP.md` — spec + Project Status tracker (module-by-module ✅/⬜)
-- `C:\Users\Bishwarup\RapidSegment\` — **canonical git repo**. App = `rapidsegment/src/rapidsegment/ui/app.py` + `pages/1_Data_Loader.py` … `pages/6_Arena.py`. Run with `streamlit run app.py` from `rapidsegment/src/rapidsegment/ui/`, or `rapidsegment-ui`, or `python -c "from rapidsegment.ui import run_ui; run_ui()"`.
-- `C:\Users\Bishwarup\RapidSegment\docs\memory.md` / `CODE_GRAPH.md` — working-reference docs kept in sync with the code.
+- `C:\Users\Bishwarup\OneDrive\Documents\RapidSegment\docs\UI_MVP.md` — spec + Project Status tracker (module-by-module ✅/⬜)
+- `C:\Users\Bishwarup\OneDrive\Documents\RapidSegment\` — **canonical git repo**. App = `rapidsegment/src/rapidsegment/ui/app.py` + `pages/1_Data_Loader.py` … `pages/6_Arena.py`. Run with `streamlit run app.py` from `rapidsegment/src/rapidsegment/ui/`, or `rapidsegment-ui`, or `python -c "from rapidsegment.ui import run_ui; run_ui()"`.
+- `C:\Users\Bishwarup\OneDrive\Documents\RapidSegment\docs\memory.md` / `CODE_GRAPH.md` — working-reference docs kept in sync with the code.
 - ⚠ **SYNC RULE** (if standalone `Module_*.py` copies are maintained): the standalone file and the page copy of each module must stay byte-identical (keep them in sync via `Copy-Item` after any edit — verify with `python -m py_compile` + hash/size check).
 
 ## Storage conventions
@@ -74,4 +74,4 @@ wb_experiment_name, wb_description, wb_data_table, wb_target_col, wb_primary_key
 - Compile check: `python -m py_compile <files...>`
 - Sync copies: `Copy-Item -Force Module_2_workbench.py rapidsegment\src\rapidsegment\ui\pages\2_Workbench.py` (same for M1/M3/M4/M5/M6)
 - Library source (read-only reference): `C:\Users\Bishwarup\AppData\Local\Temp\opencode\rs_wheel\unzipped\rapidsegment\builder.py`
-- Wheel URL: `https://files.pythonhosted.org/packages/df/0e/ccd2e5982c7d8fd09c7d7dfa6ad1eb5d641de5ea14726f11cff006d6c8cd/rapidsegment-1.2.2.post1-py3-none-any.whl`
+  - PyPI: https://pypi.org/project/rapidsegment/

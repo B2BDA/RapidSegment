@@ -1,36 +1,51 @@
-*.db
-__pycache__
-*.db.wal
-*.parquet
-.venv
-
-# Build and Distribution Artifacts
-dist/
-build/
-*.egg-info/
-
-# Virtual Environments (Local testing)
-.venv/
-venv/
-ENV/
-
-# Python Cache (Compiled bytecode)
+# Python cache / compiled bytecode
 __pycache__/
-experiments/
-.rapidsegment_suite
 *.pyc
 *.pyo
 *.pyd
 
-# Package Manager Locks & Temporary DBs (like your file-backed DuckDB storage)
-.uv/
-*.db
-*.duckdb
+# Build & distribution artifacts
+build/
+dist/
+*.egg-info/
 
-# Files
-*.log
+# Virtual environments
+.venv/
+venv/
+ENV/
+.uv/
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+.cache/
+.ipynb_checkpoints/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Databases / data files (runtime + sample data)
+*.db
+*.db.wal
+*.duckdb
 *.parquet
+*.csv
+*.ipynb
+
+# Generated / runtime artifacts
 *.json
 *.png
+*.log
 
-
+# Runtime suites / experiments
+experiments/
+.rapidsegment_suite/

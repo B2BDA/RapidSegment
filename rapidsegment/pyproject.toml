@@ -59,3 +59,25 @@ Issues = "https://github.com/B2BDA/RapidSegment/issues"
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13"]
 build-backend = "uv_build"
+
+# Keep the published package to the core library only. `docs/`, `Examples/`,
+# `Banner.png`, and `sync_readme.py` stay tracked in git (for contributors) but
+# are excluded from both the sdist and the wheel. uv_build does NOT read
+# .gitignore, so runtime artifacts under src/ must be excluded explicitly here.
+[tool.uv.build-backend]
+source-exclude = [
+    "docs",
+    "Examples",
+    "Banner.png",
+    "sync_readme.py",
+    # Runtime state that must never ship in the package
+    ".rapidsegment_suite",
+    "experiments",
+    "*.duckdb",
+    "*.db",
+    "*.db.wal",
+    "*.parquet",
+    "*.json",
+    "*.log",
+    "__pycache__",
+]

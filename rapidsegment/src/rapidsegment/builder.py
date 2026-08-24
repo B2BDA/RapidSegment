@@ -102,6 +102,7 @@ class StrategicSegmentBuilder:
         expand_log_mode: str = "none",
         db_path: Optional[str] = None,
         db_temp_dir: Optional[str] = None,
+        persist_db: bool = False,
     ) -> None:
         """
         Args:
@@ -162,7 +163,7 @@ class StrategicSegmentBuilder:
         self.sort_priority = sort_priority
         self.diagnostics_: List[Dict[str, Any]] = []
         self.stop_reason: Optional[str] = None
-        self.binning_method = binning_method  
+        self.binning_method = binning_method
         # Normalize aliases
         _bm = (binning_method or "optimal_cart").lower().strip()
         if _bm == "optimal":
@@ -182,6 +183,37 @@ class StrategicSegmentBuilder:
         # Set up disk-backed DuckDB automatically if not provided
         self.db_path = db_path
         self.db_temp_dir = db_temp_dir
+        # When True the auto-created DuckDB file + temp dir are kept alive across
+        # extract -> evaluate -> health calls (single shared artifact) and must be
+        # released via close() / context manager. When False (default) the legacy
+        # behaviour of deleting the temp DB in finally is preserved.
+        self.persist_db = persist_db
+
+    # -------------------------------------------------------------------------
+    # Lifecycle helpers for the opt-in persistent connection. When `persist_db`
+    # is True the auto-created DuckDB file + temp dir are reused across method
+    # calls; call `close()` (or use the context manager) to release them.
+    # -------------------------------------------------------------------------
+    def close(self) -> None:
+        """Releases the auto-created persistent DuckDB artifact, if any."""
+        if self.db_path and os.path.exists(self.db_path):
+            try:
+                os.remove(self.db_path)
+            except Exception as e:
+                logger.debug(f"Cleanup failed for {self.db_path}: {e}")
+        if self.db_temp_dir and os.path.exists(self.db_temp_dir):
+            try:
+                shutil.rmtree(self.db_temp_dir)
+            except Exception as e:
+                logger.debug(f"Cleanup failed for {self.db_temp_dir}: {e}")
+        self.db_path = None
+        self.db_temp_dir = None
+
+    def __enter__(self) -> "StrategicSegmentBuilder":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -289,10 +321,20 @@ class StrategicSegmentBuilder:
     ) -> Tuple[List[Dict[str, Union[str, float]]], Dict[str, np.ndarray]]:
         """
         Computes Information Value (IV) and pre-computed bins using SQL-native DuckDB execution.
+
+        Memory note: the per-feature bin-label arrays (length = residual rows) are only
+        materialised for the ``top_n_vars`` features that are actually used downstream.
+        Every eligible feature is still *fit* (so the IV ranking is complete), but the
+        full-length numpy pulls are bounded to ``top_n_vars`` instead of all columns.
         """
         logger.info(f"🔍 Computing IV and bins for {len(eligible_cols)} features...")
 
-        def _worker(col: str) -> Tuple[str, float, float, Optional[np.ndarray]]:
+        # ------------------------------------------------------------------
+        # Phase 1 — fit + rank. Produces the IV/response-rate ranking and keeps
+        # only the lightweight objects needed to transform later (bin edges or the
+        # fitted OptBinning model). No full-length bin arrays are retained here.
+        # ------------------------------------------------------------------
+        def _fit_worker(col: str) -> Tuple[str, float, float, Optional[Dict[str, Any]]]:
             thread_con = con.cursor()
             try:
                 dtype = self._resolve_optb_dtype(columns_types[col])
@@ -398,16 +440,12 @@ class StrategicSegmentBuilder:
                             pct_non_events = max(non_evt / total_non_events, 1e-6)
                             iv_val += (pct_non_events - pct_events) * np.log(pct_non_events / pct_events)
 
-                    # Transform bins array in DuckDB
-                    transformed_bins = thread_con.execute(
-                        f"""
-                        SELECT
-                            "__rs_row_id",
-                            {case_expr} AS bin_label
-                        FROM current_df
-                        ORDER BY "__rs_row_id"
-                        """
-                    ).fetchnumpy()["bin_label"].astype(str)
+                    # Keep only the case expression so Phase 2 can materialise the
+                    # bin-label array lazily (and only for the top features).
+                    return col, float(iv_val), float(max_rr), {
+                        "method": "naive",
+                        "case_expr": case_expr,
+                    }
 
                 else:
                     # Optimal binning fallback
@@ -468,49 +506,12 @@ class StrategicSegmentBuilder:
                         name=col,
                         dtype=dtype,
                         prebinning_method=prebinning_method,
+                        random_state=42,
                     )
                     optb.fit(col_fit, target_fit)
 
                     bin_table = optb.binning_table.build()
                     iv_val = float(bin_table["IV"].values[-1])
-
-                    # Under newer pandas versions, metric="bins" can stringify categorical
-                    # bin labels in a verbose way. Rebuild clean labels from the binning
-                    # table and map via metric="indices" instead.
-                    if dtype == "categorical":
-                        raw_cells = bin_table["Bin"].tolist()
-                        # Build a complete index->label map (do not drop Special/Missing)
-                        clean_labels = {
-                            i: self._sanitize_bin_label(cell)
-                            for i, cell in enumerate(raw_cells)
-                        }
-                        # indices may be masked/array-like; coerce safely to ints
-                        idx = optb.transform(col_arr, metric="indices")
-                        try:
-                            idx_arr = np.asarray(idx)
-                        except Exception:
-                            idx_arr = np.array(list(idx))
-
-                        idx_int = []
-                        for v in idx_arr:
-                            try:
-                                # handle masked or nan-like values
-                                if hasattr(v, 'item'):
-                                    v_val = v.item()
-                                else:
-                                    v_val = v
-                                idx_int.append(int(v_val))
-                            except Exception:
-                                idx_int.append(-1)
-
-                        transformed_bins = np.array(
-                            [clean_labels.get(i, "Missing") for i in idx_int], dtype=str
-                        )
-                        logger.debug(f"{col}: optimal categorical bins unique={np.unique(transformed_bins).tolist()[:20]}")
-                    else:
-                        transformed_bins = np.asarray(
-                            optb.transform(col_arr, metric="bins"), dtype=str
-                        )
 
                     valid_bins = bin_table[
                         (bin_table["Count"] >= self.min_sample_size) & 
@@ -518,7 +519,13 @@ class StrategicSegmentBuilder:
                     ]
                     max_rr = float(valid_bins["Event rate"].max()) if not valid_bins.empty else 0.0
 
-                return col, float(iv_val), float(max_rr), transformed_bins
+                    # Keep only the fitted model + dtype so Phase 2 can transform
+                    # lazily (and only for the top features).
+                    return col, float(iv_val), float(max_rr), {
+                        "method": "optimal",
+                        "dtype": dtype,
+                        "optb": optb,
+                    }
 
             except Exception as e:
                 logger.debug(f"Computation failed for {col}: {e}")
@@ -529,22 +536,117 @@ class StrategicSegmentBuilder:
                 except Exception:
                     pass
 
-        results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
-            delayed(_worker)(col) for col in eligible_cols
+        fit_results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
+            delayed(_fit_worker)(col) for col in eligible_cols
         )
 
         ranking = []
-        precomputed_bins = {}
-        for col, iv, rr, bins in results:
+        fit_cache: Dict[str, Dict[str, Any]] = {}
+        for col, iv, rr, info in fit_results:
             ranking.append({"variable": col, "iv": iv, "max_rr": rr})
-            if bins is not None:
-                precomputed_bins[col] = bins
+            if info is not None:
+                fit_cache[col] = info
         # Stable sort: primary metric descending, variable name ascending on ties
         # so top_n_vars is identical across runs when scores collide.
         if self.selection_metric == "response_rate":
             ranking.sort(key=lambda x: (-x["max_rr"], x["variable"]))
         else:
             ranking.sort(key=lambda x: (-x["iv"], x["variable"]))
+
+        # ------------------------------------------------------------------
+        # Phase 2 — transform. Materialise the bin-label arrays for *only* the
+        # top_n_vars features that downstream candidate generation consumes. This
+        # bounds peak memory to top_n_vars full-length arrays instead of one per
+        # eligible feature.
+        # ------------------------------------------------------------------
+        top_n_variable_names = [r["variable"] for r in ranking[: self.top_n_vars]]
+        precomputed_bins: Dict[str, np.ndarray] = {}
+
+        def _transform_worker(col: str) -> Tuple[str, Optional[np.ndarray]]:
+            info = fit_cache[col]
+            thread_con = con.cursor()
+            try:
+                if info["method"] == "naive":
+                    transformed_bins = thread_con.execute(
+                        f"""
+                        SELECT {info['case_expr']} AS bin_label
+                        FROM current_df
+                        ORDER BY "__rs_row_id"
+                        """
+                    ).fetchnumpy()["bin_label"].astype(str)
+                    return col, transformed_bins
+
+                # Optimal path: re-pull the (original-order) column and transform
+                # with the already-fitted model so labels stay aligned to __rs_row_id.
+                data_dict = thread_con.execute(
+                    f'''
+                    SELECT
+                        "__rs_row_id",
+                        "{col}",
+                        "{self.target}"
+                    FROM current_df
+                    ORDER BY "__rs_row_id"
+                    '''
+                ).fetchnumpy()
+
+                col_arr_raw = data_dict[col]
+                target_arr_raw = data_dict[self.target]
+                col_arr = col_arr_raw.filled(np.nan if np.issubdtype(col_arr_raw.dtype, np.number) else None) if isinstance(col_arr_raw, np.ma.MaskedArray) else col_arr_raw
+                target_arr = target_arr_raw.filled(0) if isinstance(target_arr_raw, np.ma.MaskedArray) else target_arr_raw
+                col_arr = np.asarray(col_arr)
+                target_arr = np.asarray(target_arr)
+                optb = info["optb"]
+
+                if info["dtype"] == "categorical":
+                    bin_table = optb.binning_table.build()
+                    raw_cells = bin_table["Bin"].tolist()
+                    clean_labels = {
+                        i: self._sanitize_bin_label(cell)
+                        for i, cell in enumerate(raw_cells)
+                    }
+                    idx = optb.transform(col_arr, metric="indices")
+                    try:
+                        idx_arr = np.asarray(idx)
+                    except Exception:
+                        idx_arr = np.array(list(idx))
+
+                    idx_int = []
+                    for v in idx_arr:
+                        try:
+                            if hasattr(v, "item"):
+                                v_val = v.item()
+                            else:
+                                v_val = v
+                            idx_int.append(int(v_val))
+                        except Exception:
+                            idx_int.append(-1)
+
+                    transformed_bins = np.array(
+                        [clean_labels.get(i, "Missing") for i in idx_int], dtype=str
+                    )
+                    logger.debug(f"{col}: optimal categorical bins unique={np.unique(transformed_bins).tolist()[:20]}")
+                else:
+                    transformed_bins = np.asarray(
+                        optb.transform(col_arr, metric="bins"), dtype=str
+                    )
+                return col, transformed_bins
+
+            except Exception as e:
+                logger.debug(f"Transform failed for {col}: {e}")
+                return col, None
+            finally:
+                try:
+                    thread_con.close()
+                except Exception:
+                    pass
+
+        if top_n_variable_names:
+            transform_results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
+                delayed(_transform_worker)(col) for col in top_n_variable_names
+            )
+            for col, bins in transform_results:
+                if bins is not None:
+                    precomputed_bins[col] = bins
 
         return ranking, precomputed_bins
 
@@ -1132,6 +1234,12 @@ class StrategicSegmentBuilder:
         if db_path is None or db_temp_dir is None:
             db_path, db_temp_dir = setup_disk_backed_db("experiments")
             auto_created_db = True
+            # When persistence is requested, remember the path so later calls
+            # (evaluate_final_coverage / generate_feature_health_report) reuse the
+            # same single artifact instead of rebuilding it from scratch.
+            if self.persist_db:
+                self.db_path = db_path
+                self.db_temp_dir = db_temp_dir
             logger.info(f"📂 Created temporary disk-backed DB at: {db_path}")
 
         con = duckdb.connect(db_path)
@@ -1169,7 +1277,7 @@ class StrategicSegmentBuilder:
                 )
             con.execute(
                 f'''
-                CREATE OR REPLACE TABLE current_df AS
+                CREATE OR REPLACE TABLE current_df_base AS
                 SELECT
                     ROW_NUMBER() OVER () AS "__rs_row_id",
                     * REPLACE (
@@ -1178,6 +1286,23 @@ class StrategicSegmentBuilder:
                 FROM input_data_view
                 '''
             )
+            # Track excluded rows with a single mutable flag instead of rewriting the
+            # whole residual table on every iteration. `current_df` is a filtered view
+            # over the base so all downstream reads see only the live residual.
+            con.execute(
+                'ALTER TABLE current_df_base ADD COLUMN "__rs_excluded" BOOLEAN DEFAULT FALSE'
+            )
+            con.execute(
+                'CREATE OR REPLACE VIEW current_df AS '
+                'SELECT * FROM current_df_base WHERE "__rs_excluded" IS NOT TRUE'
+            )
+
+            # In persistent mode, materialise the original dataset once so the later
+            # evaluate/health steps can reuse it instead of re-copying the source.
+            if self.persist_db:
+                con.execute(
+                    "CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view"
+                )
 
             cols_info = con.execute("DESCRIBE current_df").fetchall()
             columns_types = {row[0]: row[1] for row in cols_info}
@@ -1187,7 +1312,9 @@ class StrategicSegmentBuilder:
                 for col_name, dtype in columns_types.items()
                 if self._resolve_optb_dtype(dtype) == "categorical"
             }
-            all_cols = list(columns_types.keys())
+            # Drop internal bookkeeping columns so they never leak into feature logic.
+            internal_cols = {"__rs_row_id", "__rs_excluded"}
+            all_cols = [c for c in columns_types.keys() if c not in internal_cols]
 
             if self.enable_diversity:
                 self._validate_feature_groups(all_cols)
@@ -1198,6 +1325,7 @@ class StrategicSegmentBuilder:
                 if (
                     c != self.target
                     and c != "__rs_row_id"
+                    and c != "__rs_excluded"
                     and c not in self.ignore_features
                 )
 )
@@ -1612,21 +1740,23 @@ class StrategicSegmentBuilder:
                     "count": int(selected_candidate["actual_count"]),
                 }
 
+                # Mark matched rows as excluded in place. NULL rows evaluate
+                # `(sql) IS TRUE` to NULL/false and therefore stay in the residual,
+                # preserving the original NULL handling. A view (`current_df`) keeps
+                # all reads pointed at the live residual without rewriting the table.
                 con.execute(
                     f"""
-                    CREATE TABLE temp_residual AS
-                    SELECT * FROM current_df
-                    WHERE NOT ({best_raw_sql}) OR ({best_raw_sql}) IS NULL
+                    UPDATE current_df_base
+                    SET "__rs_excluded" = TRUE
+                    WHERE ({best_raw_sql}) IS TRUE
                 """
                 )
-                con.execute("DROP TABLE current_df")
-                con.execute("ALTER TABLE temp_residual RENAME TO current_df")
         finally:
             try:
                 con.close()
             except Exception:
                 pass
-            if auto_created_db:
+            if auto_created_db and not self.persist_db:
                 if os.path.exists(db_path):
                     try:
                         os.remove(db_path)
@@ -1658,8 +1788,18 @@ class StrategicSegmentBuilder:
         con = duckdb.connect(target_db)
         if self.db_temp_dir and os.path.exists(self.db_temp_dir):
             con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
-        con.register("input_data_view", original_data)
-        con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view")
+
+        # Reuse the single materialised original dataset when present (persistent
+        # mode), otherwise register the caller's data and materialise it here.
+        try:
+            con.execute("SELECT 1 FROM original_df LIMIT 1")
+            reused_original = True
+        except Exception:
+            reused_original = False
+
+        if not reused_original:
+            con.register("input_data_view", original_data)
+            con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view")
 
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
@@ -1840,8 +1980,20 @@ class StrategicSegmentBuilder:
         con = duckdb.connect(target_db)
         if self.db_temp_dir and os.path.exists(self.db_temp_dir):
             con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
-        con.register("input_data_view", original_data)
-        con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
+
+        # Reuse the single materialised original dataset when present (persistent
+        # mode), otherwise register the caller's data and materialise it here.
+        try:
+            con.execute("SELECT 1 FROM original_df LIMIT 1")
+            # View (not a table) so we don't duplicate the full dataset again.
+            con.execute("CREATE OR REPLACE VIEW input_df AS SELECT * FROM original_df")
+            reused_original = True
+        except Exception:
+            reused_original = False
+
+        if not reused_original:
+            con.register("input_data_view", original_data)
+            con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
 
         cols_info = con.execute("DESCRIBE input_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}

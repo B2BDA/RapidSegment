@@ -11,8 +11,10 @@ Python Version: 3.9+
 import json
 import logging
 import os
+import tempfile
+import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 import duckdb
 import numpy as np
 
@@ -57,6 +59,7 @@ class StrategicSegmentScore:
         self,
         data: Any,
         export_path: str = f"scored_experiment_{timestamp}.json",
+        db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Calculates harmonic weights and derives decile boundaries via vectorised execution.
@@ -64,16 +67,28 @@ class StrategicSegmentScore:
         Args:
             data: Input data (will be loaded into DuckDB).
             export_path: File path to save the model artifact JSON.
+            db_path: Optional path to a persistent DuckDB file/connection to reuse as the
+                single data artifact (e.g. the builder's ``db_path``). When omitted, a
+                temporary file-backed DB is created under the system temp dir and removed
+                after the run, avoiding CWD pollution.
 
         Returns:
             Dictionary containing model metadata, segment weights, and decile thresholds.
         """
         logger.info("🚀 Initialising out‑of‑core DuckDB scorecard engine...")
 
-        # Use file‑backed storage for large datasets
-        if os.path.exists(f"score_experiment_{timestamp}.db"):
-            os.remove(f"score_experiment_{timestamp}.db")
-        ctx = duckdb.connect(f"score_experiment_{timestamp}.db")
+        # Use file‑backed storage for large datasets. Reuse a caller-supplied DB when
+        # provided; otherwise create a unique temp file and clean it up afterwards so we
+        # never leak a `score_experiment_*.db` into the current working directory.
+        own_db = db_path is None
+        if own_db:
+            unique_id = uuid.uuid4().hex[:8]
+            db_path = os.path.join(
+                tempfile.gettempdir(), f"rapidsegment_score_{unique_id}.duckdb"
+            )
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        ctx = duckdb.connect(db_path)
         ctx.execute("CREATE OR REPLACE TABLE df AS SELECT * FROM data")
 
         # ---------------------------------------------------------------------
@@ -243,4 +258,9 @@ class StrategicSegmentScore:
 
         logger.info(f"✅ Scorecard exported to: {export_path}")
         ctx.close()
+        if own_db and os.path.exists(db_path):
+            try:
+                os.remove(db_path)
+            except Exception as e:
+                logger.debug(f"Scorecard temp DB cleanup failed for {db_path}: {e}")
         return self.model_artifact

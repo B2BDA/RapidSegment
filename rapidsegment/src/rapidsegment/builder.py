@@ -1822,8 +1822,18 @@ class StrategicSegmentBuilder:
             reused_original = False
 
         if not reused_original:
-            con.register("input_data_view", original_data)
-            con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view")
+            if isinstance(original_data, str):
+                # Zero-copy path: `original_data` is a DuckDB database file path.
+                # Attach it read-only and materialise `original_df` from its table
+                # so the full dataset is never pulled into a Python object.
+                src_path = original_data.replace("\\", "/")
+                con.execute(f"ATTACH '{src_path}' AS __rs_src (READ_ONLY)")
+                con.execute(
+                    "CREATE OR REPLACE TABLE original_df AS SELECT * FROM __rs_src.udl_data"
+                )
+            else:
+                con.register("input_data_view", original_data)
+                con.execute("CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view")
 
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
@@ -2016,8 +2026,19 @@ class StrategicSegmentBuilder:
             reused_original = False
 
         if not reused_original:
-            con.register("input_data_view", original_data)
-            con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
+            if isinstance(original_data, str):
+                # Zero-copy path: `original_data` is a DuckDB database file path.
+                # Attach it read-only and materialise `original_df` from its table,
+                # then expose it as `input_df` (view) so the data stays on disk.
+                src_path = original_data.replace("\\", "/")
+                con.execute(f"ATTACH '{src_path}' AS __rs_src (READ_ONLY)")
+                con.execute(
+                    "CREATE OR REPLACE TABLE original_df AS SELECT * FROM __rs_src.udl_data"
+                )
+                con.execute("CREATE OR REPLACE VIEW input_df AS SELECT * FROM original_df")
+            else:
+                con.register("input_data_view", original_data)
+                con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
 
         cols_info = con.execute("DESCRIBE input_df").fetchall()
         columns_types = {row[0]: row[1] for row in cols_info}

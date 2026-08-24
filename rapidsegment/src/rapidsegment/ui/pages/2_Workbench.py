@@ -1298,7 +1298,7 @@ with right:
 
     with card():
 
-        st.markdown("⚙�? **Constraints**")
+        st.markdown("⚙ **Constraints**")
 
         st.caption(
 
@@ -1386,7 +1386,7 @@ with right:
 
         (
 
-            "Grid search time estimate",
+            "⏱️ Grid search time estimate",
 
             False,
 

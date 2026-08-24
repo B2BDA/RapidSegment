@@ -38,7 +38,7 @@ Thumbs.db
 *.db.wal
 *.duckdb
 *.parquet
-*.csv
+# *.csv
 *.ipynb
 
 # Generated / runtime artifacts

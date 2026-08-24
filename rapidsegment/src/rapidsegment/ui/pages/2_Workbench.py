@@ -1402,7 +1402,7 @@ with right:
 
     for label, ok, note in items:
 
-        mark = "✅" if ok else "⚠�?"
+        mark = "✅" if ok else "⚠️"
 
         st.markdown(f"{mark} **{label}**")
 

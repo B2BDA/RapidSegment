@@ -89,7 +89,15 @@ class StrategicSegmentScore:
         if os.path.exists(db_path):
             os.remove(db_path)
         ctx = duckdb.connect(db_path)
-        ctx.execute("CREATE OR REPLACE TABLE df AS SELECT * FROM data")
+        if isinstance(data, str):
+            # Zero-copy path: `data` is a path to a DuckDB database file that
+            # already contains the working table `df` (dataset + segment flags).
+            # Attach it read-only instead of materialising it into Python.
+            src_path = data.replace("\\", "/")
+            ctx.execute(f"ATTACH '{src_path}' AS __rs_src (READ_ONLY)")
+            ctx.execute("CREATE OR REPLACE TABLE df AS SELECT * FROM __rs_src.df")
+        else:
+            ctx.execute("CREATE OR REPLACE TABLE df AS SELECT * FROM data")
 
         # ---------------------------------------------------------------------
         # Step 1: Baseline metrics + vectorised multi‑segment aggregation

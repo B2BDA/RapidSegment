@@ -9,7 +9,7 @@
 # 🚀 RapidSegment – Strategic Segmentation & Scorecard Engine
 
 [![PyPI version](https://img.shields.io/pypi/v/rapidsegment.svg)](https://pypi.org/project/rapidsegment/)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **RapidSegment** is an industrial‑grade, combinatorial heuristic engine for discovering high‑lift predictive segments and compiling them into transparent, production‑ready scorecards. It bridges the gap between black‑box ML and legacy SQL rules engines.
@@ -463,6 +463,7 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `selection_metric` | `str` | `"iv"` | Rank features by `"iv"` or `"response_rate"`. |
 | `expand_log_mode` | `str` | `"none"` | Expansion logging: `"none"` \| `"summary"` \| `"champion"` \| `"full"`. |
 | `db_path` / `db_temp_dir` | `str` | `None` | Optional explicit DuckDB file + temp dir (auto-created otherwise). |
+| `persist_db` | `bool` | `False` | Opt-in single-artifact mode. Keeps the auto-created DuckDB file alive after `extract_segments` returns (exposed as `builder.db_path` / `builder.db_temp_dir`) so `evaluate_final_coverage` / `generate_feature_health_report` — and the scorer via `db_path=` — reuse the **same** materialised dataset instead of re-copying the full source 3+ times. Requires `close()` or a `with` block to clean up. |
 
 **Output** – list of dicts with keys: `segment_id`, `rule_string`, `sql_filter`, `count`, `rate`, `lift`, `meta_applied_sample_size`, `meta_applied_min_lift`.
 
@@ -473,8 +474,44 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `target_col` | `str` | Binary target column. |
 | `primary_key` | `str` | Unique row identifier. |
 | `segment_cols` | `list` | List of binary segment flag columns. |
+| `db_path` | `str` | `None` | Optional path to a shared DuckDB file (e.g. the builder's `db_path`) so the scorer reuses the single artifact. If omitted, a unique temp DB is created under the system temp dir and deleted after export — no `score_experiment_*.db` is left in the working directory. |
 
 **Export** – JSON artifact with `model_metadata`, `segment_weights`, and `decile_min_thresholds`.
+
+---
+
+## 🔋 Single Data Artifact & Memory Efficiency
+
+By default RapidSegment materialises the dataset into a DuckDB table during `extract_segments` and cleans it up automatically. If you chain `extract_segments → evaluate_final_coverage → generate_feature_health_report → StrategicSegmentScore`, the engine can instead keep **one** DuckDB artifact and reuse it — avoiding several full re-copies of your data in memory/disk.
+
+**Why:** each of those steps previously re-materialised the full source from scratch. With `persist_db=True` the builder stores the dataset once and the later steps read from it; the scorer can share the same file via `db_path`. The residual inside extraction is also tracked with an in-place exclusion flag (a filtered view), so no full-table rewrite happens on every iteration.
+
+**How to use** — prefer the context manager so cleanup is automatic:
+
+```python
+from rapidsegment import StrategicSegmentBuilder, StrategicSegmentScore
+
+with StrategicSegmentBuilder(target="default_flag", persist_db=True) as b:
+    segments = b.extract_segments(data)
+    coverage = b.evaluate_final_coverage(data)          # reuses the same artifact
+    health   = b.generate_feature_health_report(data, ["age", "balance"])  # reuses
+
+    # build seg_N flag columns, then score reusing the builder's DB:
+    scorer = StrategicSegmentScore("default_flag", "cust_id", segment_cols)
+    scorer.calculate_and_export_weights(scored_df, "model.json", db_path=b.db_path)
+# b.close() runs here -> temp DuckDB file + temp dir removed
+```
+
+Or manage it manually — but you **must** call `b.close()`:
+
+```python
+b = StrategicSegmentBuilder(target="default_flag", persist_db=True)
+segments = b.extract_segments(data)
+# ... evaluate / health / score ...
+b.close()   # required, otherwise the file lingers
+```
+
+Leave `persist_db=False` (the default) if you only call `extract_segments` — there is no benefit and you avoid having to clean up.
 
 ---
 

@@ -178,18 +178,21 @@ def _segment_comparison(segs_a, segs_b):
     c3.metric("Unique to B", len(uniq_b))
     c4.metric("Jaccard overlap", f"{jac:.2f}")
 
-    # Overlaid lift distribution
+    # Overlaid lift distribution (x = 1-based segment id; segment 0 means "no
+    # segment", so the axis must start at 1, not 0)
     fig = go.Figure()
     if segs_a:
         fig.add_trace(go.Scatter(
+            x=[int(s.get("segment_id") or (i + 1)) for i, s in enumerate(segs_a)],
             y=[float(s.get("lift") or 0) for s in segs_a],
             mode="markers", name="Run A", marker=dict(color="#58a6ff")))
     if segs_b:
         fig.add_trace(go.Scatter(
+            x=[int(s.get("segment_id") or (i + 1)) for i, s in enumerate(segs_b)],
             y=[float(s.get("lift") or 0) for s in segs_b],
             mode="markers", name="Run B", marker=dict(color="#3fb950")))
     fig.update_layout(title="Segment Lift Distribution",
-                      yaxis_title="lift", xaxis_title="segment index",
+                      yaxis_title="lift", xaxis_title="segment id",
                       height=360, template="plotly_white")
     st.plotly_chart(fig, width='stretch')
 

@@ -183,12 +183,12 @@ def load_segments_from_artifacts(exp):
 
 
 def load_dataset():
-    if not os.path.exists(DB_FILE):
-        return None
-    try:
-        return db_query("SELECT * FROM udl_data")
-    except Exception:
-        return None
+    """Deprecated: returns the on-disk dataset path instead of a full dataframe.
+
+    Kept only as a thin shim; callers should use ``active_db()`` directly so the
+    full dataset is never materialised into Python (pandas) memory.
+    """
+    return active_db()
 
 
 # ── Rule parsing helpers ──────────────────────────────────────────────────────
@@ -205,38 +205,54 @@ def segment_complexity(rule_string):
 
 
 # ── Scorecard (StrategicSegmentScore) ─────────────────────────────────────────
-def build_scorecard(cfg, df, segments):
-    """Create per-segment flag columns, score the population, return artifact dict."""
-    if not segments or df is None or df.empty:
+def build_scorecard(cfg, data_path, segments):
+    """Create per-segment flag columns, score the population, return artifact dict.
+
+    Zero-copy: flag columns and the scorecard are computed entirely inside
+    DuckDB on the persisted dataset — no full pandas materialisation of the data.
+    """
+    if not segments or not data_path or not os.path.exists(data_path):
         return None
     target = cfg.get("target_col")
-    if not target or target not in df.columns:
+    if not target:
         return None
     seg_cols = [f"seg_{s['segment_id']}" for s in segments]
     case_exprs = ", ".join(
         f"CASE WHEN {s['sql_filter']} THEN 1 ELSE 0 END AS seg_{s['segment_id']}"
         for s in segments
     )
-    con = duckdb.connect()
+    exp_id = st.session_state.get("experiment", {}).get("exp_id") or "m4"
+    art_dir = os.path.join(SUITE_DIR, "artifacts", exp_id)
+    os.makedirs(art_dir, exist_ok=True)
+
+    # Build the flagged table in DuckDB (attach source read-only; add a stable
+    # row id so the scorer has a primary key). No pandas involved.
+    flags_db = os.path.join(art_dir, "scored.duckdb")
+    if os.path.exists(flags_db):
+        os.remove(flags_db)
+    src = data_path.replace("\\", "/")
+    # Only keep what the scorer needs (row id, target, segment flags) — NOT a
+    # full copy of all 70 columns. Saves ~2 full-dataset copies of disk/IO.
+    con = duckdb.connect(flags_db)
     try:
-        con.register("udl", df)
-        flags = con.execute(f"SELECT {case_exprs} FROM udl").df()
+        con.execute(f"ATTACH '{src}' AS src (READ_ONLY)")
+        con.execute(
+            f"CREATE TABLE df AS SELECT ROW_NUMBER() OVER () AS rs_row_id, "
+            f'"{target}" AS "{target}", {case_exprs} FROM src.udl_data'
+        )
     finally:
         con.close()
-    scored = pd.concat([df.reset_index(drop=True), flags.reset_index(drop=True)], axis=1)
-
-    pk = cfg.get("primary_key") or ""
-    if pk not in scored.columns:
-        pk = "rs_row_id"
-        scored[pk] = range(len(scored))
 
     try:
-        scorer = StrategicSegmentScore(target_col=target, primary_key=pk, segment_cols=seg_cols)
-        exp_id = st.session_state.get("experiment", {}).get("exp_id") or "m4"
-        art_dir = os.path.join(SUITE_DIR, "artifacts", exp_id)
-        os.makedirs(art_dir, exist_ok=True)
+        scorer = StrategicSegmentScore(
+            target_col=target, primary_key="rs_row_id", segment_cols=seg_cols)
         export_path = os.path.join(art_dir, "scorecard.json")
-        artifact = scorer.calculate_and_export_weights(scored, export_path=export_path)
+        score_db = os.path.join(art_dir, "score_work.duckdb")
+        if os.path.exists(score_db):
+            os.remove(score_db)
+        # Pass the DuckDB file path (zero-copy); the scorer attaches and reads `df`.
+        artifact = scorer.calculate_and_export_weights(
+            flags_db, export_path=export_path, db_path=score_db)
         return _jsonable(artifact)
     except Exception as exc:
         st.warning(f"Scorecard computation failed: {exc}")
@@ -620,7 +636,7 @@ def _normalize_cfg(full):
     return cfg
 
 
-def _build_diag_builder(cfg, df, exp_id=None):
+def _build_diag_builder(cfg, data_path, exp_id=None):
     """Return a builder with populated diagnostics_ for the explain_* methods.
 
     Preferred path: reuse diagnostics_ persisted by Module 3 into
@@ -671,7 +687,7 @@ def _build_diag_builder(cfg, df, exp_id=None):
                 pass
 
     # 2) Fallback: re-extract once (cached)
-    if df is None or df.empty:
+    if not data_path or not os.path.exists(data_path):
         return None
     b = StrategicSegmentBuilder(
         target=full.get("target_col") or "",
@@ -692,12 +708,12 @@ def _build_diag_builder(cfg, df, exp_id=None):
         max_expansion_hops=full.get("max_expansion_hops", 0),
     )
     with st.spinner("Running extraction to collect diagnostics..."):
-        b.extract_segments(df)
+        b.extract_segments(data_path)
     st.session_state["m4_diag_builder"] = b
     return b
 
 
-def generate_feature_health_local(df, features, target, type_overrides=None, naive_bins=5):
+def generate_feature_health_local(data_path, features, target, type_overrides=None, naive_bins=5):
     """Corrected feature health report (replaces the library version).
 
     Fixes two bugs in StrategicSegmentBuilder.generate_feature_health_report:
@@ -708,13 +724,17 @@ def generate_feature_health_local(df, features, target, type_overrides=None, nai
       * Numeric bin labels are made unique via the tile index
         ('Bin 1: [a, b]'), so adjacent/low-cardinality tiles never appear
         'repeated' after rounding collapses the [min,max] label.
+
+    Reads the persisted dataset directly from ``data_path`` (a DuckDB file) via a
+    lazy view — no full pandas / in-memory materialisation of the data.
     """
-    if not features:
+    if not features or not data_path or not os.path.exists(data_path):
         return pd.DataFrame()
     type_overrides = type_overrides or {}
     con = duckdb.connect(":memory:")
-    con.register("input_data_view", df)
-    con.execute("CREATE TABLE input_df AS SELECT * FROM input_data_view")
+    src = data_path.replace("\\", "/")
+    con.execute(f"ATTACH '{src}' AS src (READ_ONLY)")
+    con.execute("CREATE VIEW input_df AS SELECT * FROM src.udl_data")
     columns_types = {r[0]: r[1] for r in con.execute("DESCRIBE input_df").fetchall()}
 
     target_expr = f"""
@@ -807,7 +827,7 @@ def generate_feature_health_local(df, features, target, type_overrides=None, nai
     return pd.DataFrame(rows)
 
 
-def render_diagnostics(exp, cfg, df, segments):
+def render_diagnostics(exp, cfg, data_path, segments):
     st.subheader("Diagnostic Drilldown")
     res = exp.get("result") or {}
     stop = res.get("stop_reason")
@@ -824,10 +844,10 @@ def render_diagnostics(exp, cfg, df, segments):
         else:
             fj = st.selectbox("Choose a feature to trace", feats, key="m4_fj")
             if st.button("Show feature journey", key="m4_fj_btn"):
-                if df is None or df.empty:
+                if not data_path or not os.path.exists(data_path):
                     st.warning("Dataset not available - load it in Module 1 to enable diagnostics.")
                 else:
-                    b = _build_diag_builder(cfg, df, exp.get("exp_id"))
+                    b = _build_diag_builder(cfg, data_path, exp.get("exp_id"))
                     if b is not None:
                         buf = io.StringIO()
                         with contextlib.redirect_stdout(buf):
@@ -842,14 +862,14 @@ def render_diagnostics(exp, cfg, df, segments):
         else:
             sel = st.multiselect("Features to profile", feats, default=feats[:5], key="m4_health_sel")
             if st.button("Generate health report", key="m4_health"):
-                if df is None or df.empty:
+                if not data_path or not os.path.exists(data_path):
                     st.warning("Dataset not available - load data via Module 1 first.")
                 else:
                     try:
                         type_overrides = st.session_state.get("type_overrides") or {}
                         with st.spinner("Profiling features..."):
                             hr = generate_feature_health_local(
-                                df, list(sel), cfg.get("target_col", ""),
+                                data_path, list(sel), cfg.get("target_col", ""),
                                 type_overrides, int(cfg.get("naive_bins", 5)),
                             )
                         st.dataframe(hr, width='stretch', hide_index=True)
@@ -861,11 +881,11 @@ def render_diagnostics(exp, cfg, df, segments):
 
     # 3) Why did it stop? (no-segments explanation)
     with st.expander("Why did it stop? (no-segments explanation)"):
-        if df is None or df.empty:
+        if not data_path or not os.path.exists(data_path):
             st.caption("Dataset not available - reload in Module 1 to enable the full diagnostic.")
         else:
             if st.button("Run full diagnostics", key="m4_diag"):
-                b = _build_diag_builder(cfg, df, exp.get("exp_id"))
+                b = _build_diag_builder(cfg, data_path, exp.get("exp_id"))
                 if b is not None:
                     st.session_state["m4_noseg"] = b.explain_no_segments()
             if st.session_state.get("m4_noseg"):
@@ -936,16 +956,16 @@ if not segments:
     segments = exp.get("result", {}).get("segments") or []
     coverage = exp.get("result", {}).get("coverage") or []
 
-df = load_dataset()
+data_path = active_db()
 cfg = exp.get("config") or {}
 if not isinstance(cfg, dict):
     cfg = {}
 
 scorecard = None
-if segments and df is not None and not df.empty:
+if segments and data_path and os.path.exists(data_path):
     if st.button("Generate / refresh scorecard", key="m4_score", width='content'):
         with st.spinner("Scoring population (StrategicSegmentScore)..."):
-            scorecard = build_scorecard(cfg, df, segments)
+            scorecard = build_scorecard(cfg, data_path, segments)
     else:
         # Try to load a previously saved scorecard artifact
         sp = os.path.join(SUITE_DIR, "artifacts", exp.get("exp_id", ""), "scorecard.json")
@@ -956,9 +976,9 @@ if segments and df is not None and not df.empty:
             except Exception:
                 scorecard = None
 else:
-    if segments and (df is None or df.empty):
+    if segments and (not data_path or not os.path.exists(data_path)):
         st.info("Dataset (`module1_data.duckdb`) not found - scorecard and feature health "
-                "report require the original data. Reload it in Module 1 to enable them.")
+                 "report require the original data. Reload it in Module 1 to enable them.")
 
 weights = map_weights(scorecard, segments)
 
@@ -974,7 +994,7 @@ render_visualizations(segments, coverage, scorecard, cfg)
 st.subheader("Scorecard")
 render_scorecard_json(scorecard)
 
-render_diagnostics(exp, cfg, df, segments)
+render_diagnostics(exp, cfg, data_path, segments)
 
 st.divider()
 render_export_hub(exp, segments, coverage, scorecard, cfg)

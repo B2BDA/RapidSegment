@@ -1,5 +1,5 @@
-"""
-RapidSegment — Module 2: The Workbench (Enhanced)
+﻿"""
+RapidSegment â€” Module 2: The Workbench (Enhanced)
 =================================================
 Streamlit workbench for configuring all StrategicSegmentBuilder parameters
 with smart defaults, interactive validation, parameter presets, grid search
@@ -10,7 +10,7 @@ Consumes Module 1 (data loader) output:
     - st.session_state["target_col"]    str       validated target column
     - st.session_state["tinfo"]         dict      profiling info incl. event_rate
 
-Hands off to Module 3 (execution console) — the Run button no longer
+Hands off to Module 3 (execution console) â€” the Run button no longer
 executes inline; it validates the config, then:
     - st.session_state["pending_run"]    dict      validated config consumed by
                                                   pages/3_Execution_Console.py
@@ -21,8 +21,12 @@ executes inline; it validates the config, then:
                                                   config (builder params JSON),
                                                   result (segments + coverage summary)}
     - st.session_state["last_config"]   dict      last experiment config (clone support)
-`run_builder`, `compute_coverage_local` and `upsert_experiment` are kept for
-reference / reuse — execution now happens in Module 3.
+`upsert_experiment` is kept for reference / reuse â€” segment extraction is now
+run by Module 3 (Execution Console) against the persisted dataset path (zero-copy),
+and coverage is computed by the library's `evaluate_final_coverage`. The old
+in-memory `run_builder` / `compute_coverage_local` helpers (which pulled the full
+dataset into a pandas frame) were removed to avoid an out-of-memory crash on large
+data.
 
 Files touched:
     read  .rapidsegment_suite/module1_data.duckdb   (udl_data)
@@ -46,7 +50,7 @@ import streamlit as st
 from rapidsegment import StrategicSegmentBuilder
 from rapidsegment.ui._theme import apply_cyberpunk_theme
 
-# ── Constants & storage ───────────────────────────────────────────────────────
+# â”€â”€ Constants & storage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
 SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
@@ -73,26 +77,26 @@ METRIC_MAP = {"IV": "iv", "Response Rate": "response_rate"}
 METRIC_RMAP = {v: k for k, v in METRIC_MAP.items()}
 
 SORT_PRIORITY_OPTIONS = [
-    ("rate_lift_count", "Rate → Lift → Count (default)"),
-    ("lift_rate_count", "Lift → Rate → Count"),
-    ("lift_count_rate", "Lift → Count → Rate"),
-    ("count_lift_rate", "Count → Lift → Rate"),
-    ("count_rate_lift", "Count → Rate → Lift"),
-    ("rate_count_lift", "Rate → Count → Lift"),
-    ("events_lift_rate", "Events → Lift → Rate"),
-    ("events_rate_lift", "Events → Rate → Lift"),
-    ("lift_events_rate", "Lift → Events → Rate"),
-    ("rate_events_lift", "Rate → Events → Lift"),
-    ("events_count_rate", "Events → Count → Rate"),
-    ("events_rate_count", "Events → Rate → Count"),
-    ("count_events_rate", "Count → Events → Rate"),
-    ("rate_events_count", "Rate → Events → Count"),
+    ("rate_lift_count", "Rate â†’ Lift â†’ Count (default)"),
+    ("lift_rate_count", "Lift â†’ Rate â†’ Count"),
+    ("lift_count_rate", "Lift â†’ Count â†’ Rate"),
+    ("count_lift_rate", "Count â†’ Lift â†’ Rate"),
+    ("count_rate_lift", "Count â†’ Rate â†’ Lift"),
+    ("rate_count_lift", "Rate â†’ Count â†’ Lift"),
+    ("events_lift_rate", "Events â†’ Lift â†’ Rate"),
+    ("events_rate_lift", "Events â†’ Rate â†’ Lift"),
+    ("lift_events_rate", "Lift â†’ Events â†’ Rate"),
+    ("rate_events_lift", "Rate â†’ Events â†’ Lift"),
+    ("events_count_rate", "Events â†’ Count â†’ Rate"),
+    ("events_rate_count", "Events â†’ Rate â†’ Count"),
+    ("count_events_rate", "Count â†’ Events â†’ Rate"),
+    ("rate_events_count", "Rate â†’ Events â†’ Count"),
 ]
 SORT_PRIORITY_MAP = dict(SORT_PRIORITY_OPTIONS)
 SORT_PRIORITY_RMAP = {v: k for k, v in SORT_PRIORITY_OPTIONS}
 SORT_PRIORITY_HELP = (
-    "Ranking strategy for champion selection — sorted descending, so the first "
-    "dimension dominates. E.g. 'Rate → Lift → Count' prefers the highest response "
+    "Ranking strategy for champion selection â€” sorted descending, so the first "
+    "dimension dominates. E.g. 'Rate â†’ Lift â†’ Count' prefers the highest response "
     "rate, then lift, then volume. All 14 combinations of rate / lift / count / "
     "events are supported by the library."
 )
@@ -156,7 +160,7 @@ CONSERVATIVE = {
 }
 
 
-# ── Small helpers ─────────────────────────────────────────────────────────────
+# â”€â”€ Small helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def rerun():
     try:
         st.rerun()
@@ -225,7 +229,7 @@ def grid_combos(cfg):
     return max(1, sizes) * max(1, lifts)
 
 
-# ── Config build / validation / estimation ───────────────────────────────────
+# â”€â”€ Config build / validation / estimation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def build_params():
     bm = BIN_MAP.get(st.session_state["wb_binning_method"], "optimal_cart")
     sm = METRIC_MAP.get(st.session_state["wb_selection_metric"], "iv")
@@ -283,7 +287,7 @@ def validate_params(cfg, all_cols):
     if cfg["min_events"] > cfg["min_sample_size"]:
         issues.append(
             f"min_events ({cfg['min_events']}) exceeds min_sample_size "
-            f"({cfg['min_sample_size']}) — no rule could ever pass."
+            f"({cfg['min_sample_size']}) â€” no rule could ever pass."
         )
     if cfg["target_col"] in cfg["ignore_features"]:
         issues.append("Target column cannot be listed under ignore features.")
@@ -315,7 +319,7 @@ def estimate_seconds(cfg, n_rows):
     return max(15.0, base * combos)
 
 
-# ── Templates / leaderboard persistence ──────────────────────────────────────
+# â”€â”€ Templates / leaderboard persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def load_templates():
     if not os.path.exists(TEMPLATES_FILE):
         return {}
@@ -471,151 +475,10 @@ def apply_config(cfg):
         st.session_state["wb_enable_grid"] = False
 
 
-# ── Experiment runner (threaded, live phase + elapsed time) ───────────────────
-def compute_coverage_local(segments, df, target):
-    """Replicates StrategicSegmentBuilder.evaluate_final_coverage with a fresh,
-    locally-tuned DuckDB connection (used as timeout fallback)."""
-    con = duckdb.connect()
-    try:
-        con.execute("SET threads = 4;")
-        con.register("input_data_view", df)
-        case_sql = "\n".join(
-            f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}" for seg in segments
-        )
-        query = f"""
-        WITH PER_SEG_KPIS AS (
-            SELECT CASE {case_sql} ELSE 0 END AS segment,
-                   COUNT(*) AS total_count,
-                   SUM(CAST("{target}" AS DOUBLE)) AS target_events,
-                   (SUM(CAST("{target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
-            FROM input_data_view
-            GROUP BY 1
-        ),
-        BASE_KPIS AS (
-            SELECT *, SUM(total_count) OVER() AS total_population,
-                     SUM(target_events) OVER() AS total_target_events,
-                     (SUM(target_events) OVER() * 1.0 / SUM(total_count) OVER()) * 100 AS base_response_rate
-            FROM PER_SEG_KPIS
-        ),
-        CUMULATIVE_KPIS AS (
-            SELECT *, SUM(total_count) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_count,
-                     SUM(target_events) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_events
-            FROM BASE_KPIS
-        )
-        SELECT segment, total_count, target_events, response_rate, base_response_rate,
-               (total_count * 100.0 / total_population) AS capture_rate,
-               (response_rate / NULLIF(base_response_rate, 0)) AS lift,
-               (cum_count * 100.0 / NULLIF(total_population, 0)) AS cumulative_sample_capture,
-               (cum_events * 100.0 / NULLIF(total_target_events, 0)) AS cumulative_event_capture
-        FROM CUMULATIVE_KPIS
-        ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
-        """
-        return con.execute(query).df().to_dict(orient="records")
-    finally:
-        con.close()
 
 
-def run_builder(cfg, df):
-    ignore = list(cfg["ignore_features"])
-    if cfg["primary_key"] and cfg["primary_key"] not in ignore:
-        ignore.append(cfg["primary_key"])
-    exp_id = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    exp_dir = os.path.join(SUITE_DIR, "artifacts", exp_id)
-    os.makedirs(exp_dir, exist_ok=True)
-    builder = StrategicSegmentBuilder(
-        target=cfg["target_col"],
-        n_jobs=cfg.get("n_jobs", -1),
-        min_sample_size=cfg["min_sample_size"],
-        min_lift=cfg["min_lift"],
-        min_events=cfg["min_events"],
-        top_n_vars=cfg["top_n_vars"],
-        max_segments=cfg["max_segments"],
-        max_feature_reuse=cfg["max_feature_reuse"],
-        param_grid=cfg["param_grid"],
-        enable_diversity=cfg["enable_diversity"],
-        enable_1way=cfg["enable_1way"],
-        enable_2way=cfg["enable_2way"],
-        enable_3way=cfg["enable_3way"],
-        feature_groups=cfg["feature_groups"],
-        ignore_features=ignore,
-        sort_priority=cfg.get("sort_priority", "rate_lift_count"),
-        binning_method=cfg["binning_method"],
-        naive_bins=cfg["naive_bins"],
-        max_expansion_hops=cfg["max_expansion_hops"],
-        selection_metric=cfg["selection_metric"],
-        expand_log_mode=cfg.get("expand_log_mode", "none"),
-        db_path=os.path.join(exp_dir, "workbench.duckdb"),
-        db_temp_dir=os.path.join(exp_dir, "tmp"),
-    )
-    out = queue.Queue()
-
-    def _extract():
-        try:
-            out.put(("phase", "Extracting segments…"))
-            segments = builder.extract_segments(df)
-            out.put(("extracted", segments, builder.stop_reason))
-        except Exception as exc:
-            out.put(("error", str(exc)))
-
-    def _coverage(segments):
-        try:
-            out.put(("done", compute_coverage_local(segments, df, cfg["target_col"])))
-        except Exception as exc:
-            out.put(("error", str(exc)))
-
-    threading.Thread(target=_extract, daemon=True).start()
-    t0 = time.time()
-    segments, coverage, stop_reason, err = [], [], None, None
-    phase_text = "Running experiment…"
-    try:
-        with st.status("Running experiment…", expanded=True) as status:
-            while True:
-                try:
-                    msg = out.get(timeout=0.5)
-                except queue.Empty:
-                    status.update(
-                        label=f"{phase_text} — elapsed {fmt_duration(time.time() - t0)}"
-                    )
-                    continue
-                kind = msg[0]
-                if kind == "phase":
-                    phase_text = msg[1]
-                    status.update(label=f"{phase_text} — elapsed {fmt_duration(time.time() - t0)}")
-                elif kind == "extracted":
-                    segments, stop_reason = msg[1], msg[2]
-                    if not segments:
-                        break
-                    phase_text = "Extraction done — computing final coverage…"
-                    threading.Thread(target=_coverage, args=(segments,), daemon=True).start()
-                elif kind == "done":
-                    coverage = msg[1]
-                    break
-                elif kind == "error":
-                    err = msg[1]
-                    break
-            if err:
-                status.update(label="Extraction failed", state="error", expanded=True)
-            else:
-                status.update(
-                    label=(
-                        f"Extraction complete — {len(segments)} segment(s)"
-                        + (" · coverage computed locally" if segments else "")
-                    ),
-                    state="complete",
-                    expanded=False,
-                )
-    except AttributeError:
-        with st.spinner("Running experiment…"):
-            segments = builder.extract_segments(df)
-            coverage = compute_coverage_local(segments, df, cfg["target_col"]) if segments else []
-            stop_reason = builder.stop_reason
-    if err:
-        return None, [], None, time.time() - t0, err, exp_id
-    return segments, coverage, stop_reason, time.time() - t0, None, exp_id
-
-
-# ── Page setup ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="RapidSegment — Workbench", layout="wide")
+# â”€â”€ Page setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+st.set_page_config(page_title="RapidSegment â€” Workbench", layout="wide")
 apply_cyberpunk_theme()
 
 st.markdown(
@@ -640,7 +503,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Session init & deferred actions ──────────────────────────────────────────
+# â”€â”€ Session init & deferred actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if "wb_groups" not in st.session_state:
     st.session_state["wb_groups"] = []
 
@@ -649,7 +512,7 @@ if isinstance(pending, dict):
     apply_config(pending)
     rerun()
 
-# ── Guard: data must be loaded by Module 1 ───────────────────────────────────
+# â”€â”€ Guard: data must be loaded by Module 1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if not st.session_state.get("loaded"):
     if os.path.exists(DB_FILE):
         try:
@@ -719,13 +582,13 @@ st.session_state["wb_grid_sizes"] = valid_sizes or [500, 1000, 2000]
 valid_lifts = [v for v in st.session_state["wb_grid_lifts"] if v in GRID_LIFT_OPTIONS]
 st.session_state["wb_grid_lifts"] = valid_lifts or [1.5, 2.0, 3.0]
 
-st.title("RapidSegment — Module 2: The Workbench")
+st.title("RapidSegment â€” Module 2: The Workbench")
 st.caption(
-    f"Dataset: **{st.session_state['wb_data_table']}** · "
-    f"{n_rows:,} rows · {n_cols} columns"
+    f"Dataset: **{st.session_state['wb_data_table']}** Â· "
+    f"{n_rows:,} rows Â· {n_cols} columns"
 )
 
-# ── Two-column layout (right column first so presets can re-fill widgets) ─────
+# â”€â”€ Two-column layout (right column first so presets can re-fill widgets) â”€â”€â”€â”€â”€
 left, right = st.columns([3, 1.55], gap="medium")
 
 with right:
@@ -759,41 +622,41 @@ with right:
     st.markdown("#### Real-Time Summary")
     cfg_now = build_params()
     with card():
-        st.markdown("📊 **Segment Discovery**")
+        st.markdown("ðŸ“Š **Segment Discovery**")
         st.caption(
-            f"top_n_vars={cfg_now['top_n_vars']} · "
-            f"max_segments={cfg_now['max_segments']} · "
+            f"top_n_vars={cfg_now['top_n_vars']} Â· "
+            f"max_segments={cfg_now['max_segments']} Â· "
             f"max_feature_reuse={cfg_now['max_feature_reuse']}"
         )
         st.caption(
-            f"diversity={'on' if cfg_now['enable_diversity'] else 'off'} · "
-            f"{len(cfg_now['feature_groups'])} group(s) · "
+            f"diversity={'on' if cfg_now['enable_diversity'] else 'off'} Â· "
+            f"{len(cfg_now['feature_groups'])} group(s) Â· "
             f"{len(cfg_now['ignore_features'])} ignored"
         )
     with card():
-        st.markdown("🔢 **Rule Complexity**")
+        st.markdown("ðŸ”¢ **Rule Complexity**")
         bin_label = BIN_RMAP.get(cfg_now["binning_method"], cfg_now["binning_method"])
         bin_extra = (
-            f" · {cfg_now['naive_bins']} bins" if cfg_now["binning_method"] == "naive" else ""
+            f" Â· {cfg_now['naive_bins']} bins" if cfg_now["binning_method"] == "naive" else ""
         )
         st.caption(f"binning={bin_label}{bin_extra}")
         st.caption(
-            f"hops={cfg_now['max_expansion_hops']} · "
-            f"1-way={'on' if cfg_now['enable_1way'] else 'off'} · "
-            f"2-way={'on' if cfg_now['enable_2way'] else 'off'} · "
-            f"3-way={'on' if cfg_now['enable_3way'] else 'off'} · "
+            f"hops={cfg_now['max_expansion_hops']} Â· "
+            f"1-way={'on' if cfg_now['enable_1way'] else 'off'} Â· "
+            f"2-way={'on' if cfg_now['enable_2way'] else 'off'} Â· "
+            f"3-way={'on' if cfg_now['enable_3way'] else 'off'} Â· "
             f"metric={cfg_now['selection_metric']}"
         )
     with card():
-        st.markdown("⚙️ **Constraints**")
+        st.markdown("âš™ï¸ **Constraints**")
         st.caption(
-            f"min_sample_size={cfg_now['min_sample_size']:,} · "
-            f"min_lift={cfg_now['min_lift']} · "
+            f"min_sample_size={cfg_now['min_sample_size']:,} Â· "
+            f"min_lift={cfg_now['min_lift']} Â· "
             f"min_events={cfg_now['min_events']}"
         )
         if cfg_now["param_grid"]:
             st.caption(
-                f"Grid: {len(cfg_now['param_grid']['min_sample_size'])} sizes × "
+                f"Grid: {len(cfg_now['param_grid']['min_sample_size'])} sizes Ã— "
                 f"{len(cfg_now['param_grid']['min_lift'])} lifts = "
                 f"{grid_combos(cfg_now)} combinations"
             )
@@ -811,12 +674,12 @@ with right:
         (
             "Target column selected",
             target_ok,
-            f"`{sel_target}` — " + ("validated as binary in Module 1" if target_ok else "not validated as binary"),
+            f"`{sel_target}` â€” " + ("validated as binary in Module 1" if target_ok else "not validated as binary"),
         ),
         (
             "Data loaded",
             True,
-            f"{n_rows:,} rows · {n_cols} columns",
+            f"{n_rows:,} rows Â· {n_cols} columns",
         ),
         (
             "Class imbalance detected",
@@ -837,7 +700,7 @@ with right:
         ),
     ]
     for label, ok, note in items:
-        mark = "✅" if ok else "⚠️"
+        mark = "âœ…" if ok else "âš ï¸"
         st.markdown(f"{mark} **{label}**")
         st.caption(note)
 
@@ -965,7 +828,7 @@ with left:
         h2.number_input(
             "min_lift", min_value=0.5, max_value=20.0, step=0.1, format="%.2f",
             key="wb_min_lift",
-            help="Values below 1.0 are accepted — a rule with lift < 1 sits below "
+            help="Values below 1.0 are accepted â€” a rule with lift < 1 sits below "
             "the base response rate and will only rank if later dimensions dominate.",
         )
         h3.number_input(
@@ -992,9 +855,9 @@ with left:
             combos = max(1, len(sizes)) * max(1, len(lifts))
             st.caption(f"Evaluating **{combos}** combination(s).")
         else:
-            st.caption("Grid search disabled — single (min_sample_size, min_lift) pair will be used.")
+            st.caption("Grid search disabled â€” single (min_sample_size, min_lift) pair will be used.")
 
-# ── Sticky action bar ─────────────────────────────────────────────────────────
+# â”€â”€ Sticky action bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 try:
     footer = st.container(border=True)
 except TypeError:
@@ -1022,16 +885,16 @@ with footer:
                 ["(no experiments yet)"],
                 disabled=True,
             )
-            st.caption("No `suite_data.db` with an experiments table found — run an experiment first.")
+            st.caption("No `suite_data.db` with an experiments table found â€” run an experiment first.")
         elif not leaderboard:
             st.selectbox(
                 "Clone from Leaderboard",
                 ["(no experiments yet)"],
                 disabled=True,
             )
-            st.caption("Leaderboard is empty — run an experiment first.")
+            st.caption("Leaderboard is empty â€” run an experiment first.")
         else:
-            lb_names = [f"{row[1]} · {str(row[2])[:16]}" for row in leaderboard]
+            lb_names = [f"{row[1]} Â· {str(row[2])[:16]}" for row in leaderboard]
             if st.session_state.get("wb_lb_exp") not in lb_names:
                 st.session_state["wb_lb_exp"] = lb_names[0]
             st.selectbox("Clone from Leaderboard", lb_names, key="wb_lb_exp")
@@ -1049,7 +912,7 @@ with footer:
         if st.button("Run Experiment", type="primary", width='stretch'):
             issues = validate_params(cfg_now, all_cols)
             if issues:
-                notice.error("Validation failed:\n" + "\n".join(f"• {item}" for item in issues))
+                notice.error("Validation failed:\n" + "\n".join(f"â€¢ {item}" for item in issues))
             else:
                 st.session_state["pending_run"] = _jsonable(cfg_now)
                 try:
@@ -1058,22 +921,22 @@ with footer:
                     st.experimental_switch_page("pages/3_Execution_Console.py")
                 except Exception:
                     notice.success(
-                        "Configuration saved — open Module 3 (Execution Console) to run it."
+                        "Configuration saved â€” open Module 3 (Execution Console) to run it."
                     )
         estimated = estimate_seconds(cfg_now, n_rows)
         st.caption(f"Estimated time: **{fmt_duration(estimated)}**")
 
-# ── Latest experiment results (preview for Module 3) ─────────────────────────
+# â”€â”€ Latest experiment results (preview for Module 3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 exp = st.session_state.get("experiment")
 if exp:
     st.divider()
     st.subheader("Latest Experiment Results")
     res = exp.get("result") or {}
     st.caption(
-        f"`{exp['name']}` · {exp.get('created_at', '')} · "
-        f"{exp['execution_time_sec']:.1f}s · "
-        f"target=`{exp['target_col']}` · "
-        f"stop_reason={res.get('stop_reason') or '—'}"
+        f"`{exp['name']}` Â· {exp.get('created_at', '')} Â· "
+        f"{exp['execution_time_sec']:.1f}s Â· "
+        f"target=`{exp['target_col']}` Â· "
+        f"stop_reason={res.get('stop_reason') or 'â€”'}"
     )
 
     segments = res.get("segments") or []
@@ -1092,4 +955,4 @@ if exp:
         st.markdown("**Final coverage (events vs. non-events)**")
         st.dataframe(cov_df, height=300, width='stretch', hide_index=True)
     else:
-        st.caption("No coverage rows — experiment produced no segments.")
+        st.caption("No coverage rows â€” experiment produced no segments.")

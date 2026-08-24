@@ -100,6 +100,8 @@ class StrategicSegmentBuilder:
         max_expansion_hops: int = 0,
         selection_metric: str = "iv",
         expand_log_mode: str = "none",
+        memory_limit_gb: Optional[float] = None,
+        engine_threads: Optional[int] = None,
         db_path: Optional[str] = None,
         db_temp_dir: Optional[str] = None,
         persist_db: bool = False,
@@ -135,8 +137,16 @@ class StrategicSegmentBuilder:
                 - "summary": Show summary statistics of adjacent-bin expansions.
                 - "champion": Display champion segment with contenders in a formatted table.
                 - "full": Display summary plus detailed top expanded rules.
+            memory_limit_gb: Hard cap on DuckDB's RAM buffer pool (GB). None => default
+                utilises the host: int(80% of total RAM). On a 32 GB machine this is
+                ~25 GB. Pass a lower value (e.g. 4) on memory-constrained hardware.
+            engine_threads: Max DuckDB execution threads. None => default utilises the
+                host: all-but-two cores (or all cores if <=4). Pass a lower value on
+                CPU-constrained hardware.
         """
         self.target = target
+        self.memory_limit_gb = memory_limit_gb
+        self.engine_threads = engine_threads
         cpu_count = os.cpu_count() or 1
         self.n_jobs = n_jobs if n_jobs != -1 else max(1, cpu_count - 1)
         self.min_sample_size = min_sample_size
@@ -1245,9 +1255,18 @@ class StrategicSegmentBuilder:
         con = duckdb.connect(db_path)
 
         total_cores = os.cpu_count() or 1
-        target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
+        if self.engine_threads is not None:
+            target_threads = max(1, int(self.engine_threads))
+        else:
+            target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
         total_mem_gb = psutil.virtual_memory().total / (1024**3)
-        target_memory_gb = max(1, int(total_mem_gb * 0.8)) 
+        if self.memory_limit_gb is not None:
+            target_memory_gb = max(1, int(self.memory_limit_gb))
+        else:
+            # Default: utilise the host. On a 32 GB / 16-core box this yields
+            # ~25 GB buffer and ~14 threads. Override via memory_limit_gb /
+            # engine_threads on memory-constrained hardware.
+            target_memory_gb = max(1, int(total_mem_gb * 0.8))
 
         con.execute(f"SET threads = {target_threads};")
         con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
@@ -1265,7 +1284,19 @@ class StrategicSegmentBuilder:
             + (f" (naive_bins={self.naive_bins})" if self.binning_method == "naive" else "")
         )
         try:
-            con.register("input_data_view", data)
+            if isinstance(data, str):
+                # Zero-copy path: `data` is a path to a DuckDB database file.
+                # Attach it read-only and expose its `udl_data` table as the input
+                # view so the dataset is never materialised into Python (pandas/arrow).
+                src_path = data.replace("\\", "/")
+                con.execute(f"ATTACH '{src_path}' AS __rs_src (READ_ONLY)")
+                # Lazy VIEW (not a materialised copy) so the dataset is never
+                # duplicated on disk when we already have it as a file.
+                con.execute(
+                    "CREATE OR REPLACE VIEW input_data_view AS SELECT * FROM __rs_src.udl_data"
+                )
+            else:
+                con.register("input_data_view", data)
             # Cast the target to DOUBLE up front so boolean targets work with AVG,
             # and fail early with a clear message if the target column is missing.
             cols_info_probe = con.execute("DESCRIBE input_data_view").fetchall()
@@ -1296,13 +1327,6 @@ class StrategicSegmentBuilder:
                 'CREATE OR REPLACE VIEW current_df AS '
                 'SELECT * FROM current_df_base WHERE "__rs_excluded" IS NOT TRUE'
             )
-
-            # In persistent mode, materialise the original dataset once so the later
-            # evaluate/health steps can reuse it instead of re-copying the source.
-            if self.persist_db:
-                con.execute(
-                    "CREATE OR REPLACE TABLE original_df AS SELECT * FROM input_data_view"
-                )
 
             cols_info = con.execute("DESCRIBE current_df").fetchall()
             columns_types = {row[0]: row[1] for row in cols_info}

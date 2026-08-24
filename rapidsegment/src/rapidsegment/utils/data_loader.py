@@ -12,6 +12,7 @@ import logging
 import os
 from typing import Any, Optional, Union
 
+import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv as pa_csv
@@ -262,3 +263,58 @@ class UniversalDataLoader:
             # Return a string that DuckDB can interpret as a table reference
             # (assuming the extension is loaded)
             return f"bigquery_scan('{self.project_id or 'default'}', '{self.dataset_id}', '{self.table_id}')"
+
+    def stream_to_duckdb(self, db_path: str, path: str, encoding: Optional[str] = None) -> None:
+        """Stream a local file straight into a DuckDB table `udl_data` at ``db_path``.
+
+        Avoids materialising a full in-RAM PyArrow table (unlike the arrow-based
+        load path) so multi-GB files stay memory-light — DuckDB reads directly
+        from disk. Numeric columns are cast to DOUBLE on-disk to match the
+        loader's float64 convention.
+
+        Supported: .csv/.tsv (read_csv_auto), .parquet/.pq (read_parquet),
+        .arrow/.feather (read_ipc).
+        """
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".csv", ".tsv", ".parquet", ".pq", ".arrow", ".feather"):
+            raise ValueError(
+                f"stream_to_duckdb does not support '{ext}' (use the arrow/Excel path)."
+            )
+        con = duckdb.connect(db_path)
+        try:
+            con.execute("DROP TABLE IF EXISTS udl_data")
+            if ext in (".csv", ".tsv"):
+                opts = "header=true, sample_size=-1"
+                if encoding == "Latin-1":
+                    opts += ", encoding='LATIN-1'"
+                con.execute(
+                    f"CREATE TABLE udl_data AS SELECT * FROM read_csv_auto(?, {opts})",
+                    [path],
+                )
+            elif ext in (".parquet", ".pq"):
+                con.execute(
+                    "CREATE TABLE udl_data AS SELECT * FROM read_parquet(?)", [path]
+                )
+            else:  # .arrow / .feather
+                con.execute(
+                    "CREATE TABLE udl_data AS SELECT * FROM read_ipc(?)", [path]
+                )
+            # float64 convention, memory-light (on-disk ALTER per numeric column)
+            cols = con.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name='udl_data'"
+            ).fetchall()
+            for name, dtype in cols:
+                up = dtype.upper()
+                if (
+                    any(
+                        k in up
+                        for k in ("INT", "FLOAT", "DECIMAL", "REAL", "DOUBLE", "NUMERIC")
+                    )
+                    and "DOUBLE" not in up
+                ):
+                    con.execute(
+                        f'ALTER TABLE udl_data ALTER COLUMN "{name}" TYPE DOUBLE'
+                    )
+        finally:
+            con.close()

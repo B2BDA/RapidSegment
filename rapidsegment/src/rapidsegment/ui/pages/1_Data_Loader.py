@@ -27,6 +27,7 @@ SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
 os.makedirs(SUITE_DIR, exist_ok=True)
 DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
 DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
+PROFILING_JSON = os.path.join(SUITE_DIR, "module1_profiling.json")
 
 
 def active_db():
@@ -37,7 +38,7 @@ def active_db():
     goes through this so DuckDB sees the actual changed types, not just the UI.
     """
     return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
-MAX_UPLOAD_MB = 2000
+MAX_UPLOAD_MB = 8000
 SAMPLE_NAMES = ["bank-full.csv", "train.csv"]
 
 NUMERIC = {"INTEGER", "BIGINT", "DOUBLE", "FLOAT", "DECIMAL", "REAL",
@@ -95,6 +96,11 @@ def reset_dataset():
             os.remove(DB_FILE_MOD)
     except Exception:
         pass
+    try:
+        if os.path.exists(PROFILING_JSON):
+            os.remove(PROFILING_JSON)
+    except Exception:
+        pass
     st.session_state["loaded"] = False
     st.session_state["tinfo"] = None
     st.session_state["data_modified"] = False
@@ -115,12 +121,15 @@ def materialize_modified(positive_value=None):
     if not os.path.exists(DB_FILE):
         st.error("Load a dataset first.")
         return
-    con_raw = duckdb.connect(DB_FILE, read_only=True)
-    try:
-        raw = con_raw.execute("SELECT * FROM udl_data").df()
-    finally:
-        con_raw.close()
-    if raw.empty:
+
+    # Lightweight column list only — never pull the full table into Python.
+    cols = [
+        r[0] for r in duckdb.connect(DB_FILE, read_only=True).execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='udl_data' ORDER BY ordinal_position"
+        ).fetchall()
+    ]
+    if not cols:
         st.error("No data to materialize.")
         return
 
@@ -130,7 +139,7 @@ def materialize_modified(positive_value=None):
 
     select_parts = []
     new_target = target_col
-    for col in raw.columns:
+    for col in cols:
         if col == target_col and target_col:
             if positive_value is not None:
                 pv = str(positive_value).replace("'", "''")
@@ -159,10 +168,12 @@ def materialize_modified(positive_value=None):
                 select_parts.append(f'"{col}"')
 
     select_sql = ", ".join(select_parts)
+    # Pure DuckDB transform on the persisted raw copy — no pandas/arrow staging.
     con = duckdb.connect(DB_FILE_MOD)
-    con.register("raw_df", raw)
+    src = DB_FILE.replace("\\", "/")
+    con.execute(f"ATTACH '{src}' AS raw (READ_ONLY)")
     con.execute("DROP TABLE IF EXISTS udl_data")
-    con.execute(f"CREATE TABLE udl_data AS SELECT {select_sql} FROM raw_df")
+    con.execute(f"CREATE TABLE udl_data AS SELECT {select_sql} FROM raw.udl_data")
     con.close()
 
     if new_target != target_col:
@@ -239,6 +250,40 @@ def load_and_persist(arrow_table, progress=None, dataset_name=None):
         progress.progress(1.0, text="Done")
 
 
+def persist_file_direct(path, encoding=None, dataset_name=None, progress=None):
+    """Stream a local file into the raw DuckDB table WITHOUT a full in-RAM copy.
+
+    CSV/TSV/Parquet/Arrow are read straight from disk by DuckDB (memory-light);
+    Excel falls back to the PyArrow-based loader. Replaces the old
+    ``load_file_udl`` + ``load_and_persist`` (arrow) path that held the whole
+    table in RAM — important for multi-GB files.
+    """
+    ext = os.path.splitext(path)[-1].lower()
+    # A fresh raw load invalidates any previously materialized modified copy.
+    try:
+        if os.path.exists(DB_FILE_MOD):
+            os.remove(DB_FILE_MOD)
+    except Exception:
+        pass
+    if ext in (".csv", ".tsv", ".parquet", ".pq", ".arrow", ".feather"):
+        if progress:
+            progress.progress(0.2, text="Streaming into DuckDB (on-disk)…")
+        UniversalDataLoader().stream_to_duckdb(DB_FILE, path, encoding)
+    else:
+        # Excel / unknown -> arrow path
+        data = load_file_udl(path, encoding)
+        if progress:
+            progress.progress(0.2, text="Persisting to DuckDB…")
+        db_write(data)
+    if progress:
+        progress.progress(1.0, text="Done")
+    st.session_state["loaded"] = True
+    st.session_state["tinfo"] = None
+    st.session_state["data_modified"] = False
+    if dataset_name:
+        st.session_state["dataset_name"] = dataset_name
+
+
 def smart_default_hint():
     hints = []
     for base in (os.path.join(os.getcwd(), "data"), os.path.expanduser("~/Downloads")):
@@ -311,8 +356,7 @@ with st.sidebar:
                     with st.spinner("Reading file…"):
                         try:
                             progress = st.progress(0, text="Loading…")
-                            data = load_file_udl(fp, encoding)
-                            load_and_persist(data, progress, dataset_name=os.path.basename(fp))
+                            persist_file_direct(fp, encoding, dataset_name=os.path.basename(fp), progress=progress)
                             st.success(f"Loaded: {os.path.basename(fp)}")
                         except Exception as exc:
                             st.error(str(exc))
@@ -325,11 +369,14 @@ with st.sidebar:
             if uploaded is not None:
                 size_mb = uploaded.size / 1e6
                 if size_mb > MAX_UPLOAD_MB:
-                    st.error(f"File too large: {size_mb:.1f} MB (limit {MAX_UPLOAD_MB} MB)")
-                else:
-                    encoding = st.selectbox("Encoding", ["Auto-detect", "UTF-8", "Latin-1"], key="up_enc")
-                    st.caption(f"Detected format: **{detect_format(uploaded.name)}** · {size_mb:.1f} MB")
-                    if st.button("Load Uploaded File", type="primary"):
+                    st.warning(
+                        f"File is {size_mb:.1f} MB — large browser uploads are slow and "
+                        f"memory-heavy. For multi-GB files use the **File path** method "
+                        f"instead (no upload limit, streams straight from disk)."
+                    )
+                encoding = st.selectbox("Encoding", ["Auto-detect", "UTF-8", "Latin-1"], key="up_enc")
+                st.caption(f"Detected format: **{detect_format(uploaded.name)}** · {size_mb:.1f} MB")
+                if st.button("Load Uploaded File", type="primary"):
                         with st.spinner(f"Loading '{uploaded.name}'…"):
                             ext = os.path.splitext(uploaded.name)[1].lower()
                             tmp_path = None
@@ -338,8 +385,7 @@ with st.sidebar:
                                     shutil.copyfileobj(uploaded, tmp)
                                     tmp_path = tmp.name
                                 progress = st.progress(0, text="Loading…")
-                                data = load_file_udl(tmp_path, encoding)
-                                load_and_persist(data, progress, dataset_name=uploaded.name)
+                                persist_file_direct(tmp_path, encoding, dataset_name=uploaded.name, progress=progress)
                                 st.success(f"Loaded '{uploaded.name}'")
                             except Exception as exc:
                                 st.error(str(exc))
@@ -448,8 +494,7 @@ with st.sidebar:
                 with st.spinner("Loading sample…"):
                     try:
                         progress = st.progress(0, text="Loading…")
-                        data = UniversalDataLoader(file_path=fp).load()
-                        load_and_persist(data, progress, dataset_name=name)
+                        persist_file_direct(fp, dataset_name=name, progress=progress)
                         st.success(f"Loaded sample: {name}")
                     except Exception as exc:
                         st.error(str(exc))
@@ -460,8 +505,7 @@ with st.sidebar:
                 with st.spinner("Loading…"):
                     try:
                         progress = st.progress(0, text="Loading…")
-                        data = UniversalDataLoader(file_path=manual).load()
-                        load_and_persist(data, progress, dataset_name=os.path.basename(manual))
+                        persist_file_direct(manual, dataset_name=os.path.basename(manual), progress=progress)
                         st.success("Loaded")
                     except Exception as exc:
                         st.error(str(exc))
@@ -550,6 +594,39 @@ def build_metadata(summ):
     return pd.DataFrame(rows)
 
 
+def _profiling_stamp():
+    return {
+        "db_mtime": os.path.getmtime(active_db()),
+        "target": st.session_state.get("target_col"),
+        "overrides": st.session_state.get("type_overrides") or {},
+    }
+
+
+def get_profiling(summ):
+    """Return the column-quality summary, reusing a persisted JSON artifact.
+
+    The summary is an aggregated (one row per column) DuckDB result, not the raw
+    dataset, so it is safe to hold. It is cached to ``module1_profiling.json`` and
+    only recomputed when the source file or metadata changes.
+    """
+    stamp = _profiling_stamp()
+    if os.path.exists(PROFILING_JSON):
+        try:
+            with open(PROFILING_JSON, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+            if blob.get("stamp") == stamp:
+                return pd.DataFrame(blob["rows"])
+        except Exception:
+            pass
+    df = build_metadata(summ)
+    try:
+        with open(PROFILING_JSON, "w", encoding="utf-8") as f:
+            json.dump({"stamp": stamp, "rows": df.to_dict(orient="records")}, f)
+    except Exception:
+        pass
+    return df
+
+
 # ── Tab 2: Quality Report ─────────────────────────────────────────────────────
 with tab_quality:
     st.subheader("Data Quality Report")
@@ -561,19 +638,15 @@ with tab_quality:
     )
     summ = db_query("SUMMARIZE udl_data")
     eff = effective_types(summ)
-    db_mb = os.path.getsize(DB_FILE) / 1024 / 1024
+    db_mb = os.path.getsize(active_db()) / 1024 / 1024
     n_num = sum(1 for t in eff.values() if t == "NUMERIC")
     n_cat = len(eff) - n_num
-
-    with st.spinner("Computing memory footprint…"):
-        full = db_query("SELECT * FROM udl_data")
-    mem_mb = full.memory_usage(deep=True).sum() / 1e6
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows", f"{n_rows:,}")
     c2.metric("Columns", f"{len(eff)}")
     c3.metric("Numeric / Categorical", f"{n_num} / {n_cat}")
-    c4.metric("Memory footprint", f"{mem_mb:.1f} MB")
+    c4.metric("On-disk size (DuckDB)", f"{db_mb:.1f} MB")
 
     st.divider()
 
@@ -589,7 +662,7 @@ with tab_quality:
         null_df["Null %"] = null_df["Null %"].apply(lambda x: f"{x:.1f}%")
         st.dataframe(null_df[["Column", "Null %"]].reset_index(drop=True), width='stretch')
 
-    warns = build_metadata(summ)
+    warns = get_profiling(summ)
     warns = warns[warns["Warning"] != "✓"]
     if warns.empty:
         st.success("☑️ No type warnings — data ready for segmentation ✓")
@@ -643,7 +716,7 @@ with tab_meta:
             st.session_state["data_modified"] = False
             rerun()
 
-    meta = build_metadata(summ)
+    meta = get_profiling(summ)
     st.dataframe(meta, height=420, width='stretch', hide_index=True)
 
 
@@ -778,7 +851,7 @@ with c2:
         reset_dataset()
 with c3:
     summ = db_query("SUMMARIZE udl_data")
-    report_df = build_metadata(summ)
+    report_df = get_profiling(summ)
     st.download_button(
         "Download Profiling Report (CSV)",
         report_df.to_csv(index=False).encode("utf-8"),

@@ -1,6 +1,6 @@
 # RapidSegment — Code Graph
 
-Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `78653d4` (main, `rapidsegment` v1.2.4).
+Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `78653d4` (main); the data-handling layer was refactored to hold a **single shared DuckDB artifact** — `current_df_base` + an in-place flag + a filtered `current_df` view, two-phase binning, and opt-in `persist_db`/`close()` so later steps reuse one materialised dataset.
 
 ---
 
@@ -128,6 +128,7 @@ BigQuery downsampling snippet: keep 100% of `target_y = 1`, deterministic 10% of
 | `selection_metric` | `"iv"` | Feature ranking metric: `"iv"` or `"response_rate"` |
 | `expand_log_mode` | `"none"` | `"none"` \| `"summary"` \| `"champion"` \| `"full"` |
 | `db_path` / `db_temp_dir` | None | Optional explicit DuckDB file + temp dir; auto-created if missing |
+| `persist_db` | False | Opt-in single-artifact mode. Keeps the auto-created DuckDB + temp dir alive after `extract_segments` (stored in `self.db_path`/`self.db_temp_dir`); reused by `evaluate_final_coverage`/`generate_feature_health_report` via the materialised `original_df`. Exposes `close()` + context-manager (`with StrategicSegmentBuilder(...) as b:`); auto-cleanup still happens in `finally` when `persist_db=False` |
 
 #### Key attributes (state)
 
@@ -148,7 +149,7 @@ BigQuery downsampling snippet: keep 100% of `target_y = 1`, deterministic 10% of
 | `get_group(var)` | 222 | Group of feature, or feature name itself |
 | `is_diverse(combo)` | 228 | True if all groups distinct (no-op when `enable_diversity=False`) |
 | `_get_sort_key(rule)` | 237 | Returns tuple per `sort_priority` + rule-string tie-breaker (14 orderings: permutations of lift/count/rate/events triples) |
-| `compute_iv_ranking_and_bin(con, eligible_cols, columns_types)` | 284 | Parallel IV + bins via joblib threads. **Naive path**: QUANTILE_CONT edges, forced `-inf`/`inf`, half-open bins, `Missing` bin, IV in SQL. **Optimal path**: masked-array handling, lexsort for deterministic CART fit, `OptimalBinning(name, dtype, prebinning_method)` fit, IV from bin table, `metric="indices"` for categoricals + `_sanitize_bin_label`. Returns `(ranking, precomputed_bins)` sorted stable by `-metric` then variable name |
+| `compute_iv_ranking_and_bin(con, eligible_cols, columns_types)` | 284 | **Two-phase** IV + bins via joblib threads. Phase 1 fits + ranks *all* eligible features (returns `(ranking, precomputed_bins)` sorted stable by `-metric` then variable name). Phase 2 (in `extract_segments`) transforms bin labels for only `top_n_vars` surviving features, so peak memory holds `top_n_vars` full-length arrays instead of one per eligible feature. **Naive path**: QUANTILE_CONT edges, forced `-inf`/`inf`, half-open bins, `Missing` bin, IV in SQL. **Optimal path**: masked-array handling, lexsort for deterministic CART fit (seeded `random_state=42` to remove run-to-run variance), `OptimalBinning(name, dtype, prebinning_method)` fit, IV from bin table, `metric="indices"` for categoricals + `_sanitize_bin_label` |
 | `_bin_sort_key(label)` (static) | 551 | Numeric-aware sort key for bin labels (`[lo, hi)` → float) |
 | `_expand_adjacent_bins(con, combo, base_rate, base_results, seen_rules)` | 568 | Merges adjacent bins per variable (Python groupby, no pandas). Uses cumulative sums for sliding windows; merged label `[{sorted labels}]`; skips `Missing`; dedupes via `seen_rules` |
 | `_candidate_windows(idx, n, max_hops)` (static) | 715 | Yields `(lo, hi)` windows around `idx`; excludes windows spanning the whole domain (degenerate rule guard) |
@@ -156,7 +157,7 @@ BigQuery downsampling snippet: keep 100% of `target_y = 1`, deterministic 10% of
 | `_agg_combinations(con, combo_list, base_rate)` | 754 | Builds one SQL GROUP BY query per combo, chunks by 100 (`UNION ALL`), falls back to individual execution on batch failure. Returns rule dicts `{rule, count, rate, lift, events, combo_vars}`; rate/lift expressed as percentages (`events/count*100`). For `binning_method == "naive"` triggers `_expand_adjacent_bins` per combo and emits expansion logs per `expand_log_mode` |
 | `parse_rule_to_sql(rule_str)` | 897 | Rule grammar → SQL WHERE predicate (detailed in §5) |
 | `extract_segments(data)` | 1112 | Main pipeline (detailed in §4) |
-| `evaluate_final_coverage(original_data)` | 1649 | Hierarchical CASE evaluation over original data; returns per-segment KPIs + cumulative capture (SQL window functions) |
+| `evaluate_final_coverage(original_data)` | 1649 | Hierarchical CASE evaluation over original data; returns per-segment KPIs + cumulative capture (SQL window functions). When `persist_db=True` it reuses the single materialised `original_df` (created once during `extract_segments`) instead of re-copying the source |
 | `explain_feature_journey(feature_name)` | 1717 | Prints per-iteration audit trail of a feature |
 | `explain_no_segments()` | 1756 | Human-readable report why extraction stopped (constraints, funnel, near-miss gaps) |
 | `generate_feature_health_report(original_data, features)` | 1822 | DuckDB-native bin health report: NTILE bins for numerics, categorical/missing bins; returns pandas DataFrame. **Note:** the Streamlit UI no longer calls this directly ? see §11.6 (`generate_feature_health_local`). |
@@ -171,11 +172,11 @@ Each segment dict in `self.segments`:
 | Method | Line | Purpose |
 |---|---|---|
 | `__init__(target_col, primary_key, segment_cols)` | 45 | Stores config, initializes `model_artifact` |
-| `calculate_and_export_weights(data, export_path)` | 56 | Full scorecard pipeline (detailed below) |
+| `calculate_and_export_weights(data, export_path, db_path=None)` | 56 | Full scorecard pipeline (detailed below). `db_path` optionally reuses a shared DuckDB file (e.g. the builder's `db_path`); if omitted, a unique temp DB is created and removed after export (no `score_experiment_*.db` left in the working directory) |
 
 #### Scorecard pipeline (inside `calculate_and_export_weights`)
 
-1. **DB setup**: file-backed DuckDB `score_experiment_{timestamp}.db` (removed first if exists); `CREATE OR REPLACE TABLE df AS SELECT * FROM data`.
+1. **DB setup**: if `db_path` is given, reuse that file; otherwise create a unique file-backed DuckDB under the system temp dir (`tempfile.gettempdir()` + uuid) and remove it after export. `CREATE OR REPLACE TABLE df AS SELECT * FROM data`.
 2. **Master aggregation**: single query — `COUNT(*) total_pop`, `SUM(target) total_ev`, per-segment `COUNT(flag=1)` and `SUM(flag=1 ? target : 0)`. Validates pop/events > 0.
 3. **Weights**: per segment `response_rate = ev/cnt`, `capture_rate = ev/total_ev`, `lift = rr/baseline`, `raw_weight = rr * 100`, exported weight = `int(round(raw_weight))`. Zero-volume/zero-event segments get weight 0.
 4. **Decile-resolution warning**: counts distinct non-zero weights; `< 10` logs a warning about repeated thresholds.
@@ -204,7 +205,7 @@ State reset → snapshot absolute thresholds (`abs_min_sample_size/events/lift`)
 8. **Grid shortlist**: for each grid config, keep best rule by `_get_sort_key` meeting that config's thresholds; tag with `grid_min_sample_size/lift`.
 9. **Raw validation**: candidates sorted; for each, `parse_rule_to_sql` → validate against RAW `current_df` (`COUNT`/`SUM`); first passing `abs_min_sample_size/events/lift` becomes `selected_candidate`; else record `closest_miss` (near-miss gaps).
 10. Store segment with actual counts/rates/lift; bump `feature_usage_counts` for winner vars.
-11. **Residual update (NULL-safe)**: `current_df ← WHERE NOT (sql) OR (sql) IS NULL`. This mirrors the hierarchical CASE in `evaluate_final_coverage`.
+11. **Residual update (in-place exclusion flag)**: instead of rewriting `current_df` every iteration, a boolean column `__rs_excluded` (default `FALSE`) is added to the base table `current_df_base`, and `current_df` is a **view** (`WHERE "__rs_excluded" IS NOT TRUE`). A selected rule does `UPDATE current_df_base SET "__rs_excluded" = TRUE WHERE ({sql}) IS TRUE` — no full-table copy per iteration; NULLs never match and remain in the residual, mirroring the hierarchical CASE in `evaluate_final_coverage`.
 12. Champion/expansion logging per `expand_log_mode`.
 
 Cleanup in `finally`: close con; if DB auto-created, remove db file + temp dir. Restore original thresholds. If loop finished with full `max_segments`, set stop_reason. Returns `self.segments`.
@@ -237,7 +238,10 @@ Helpers: `_quote_sql_ident` (double-quote escaping `"` → `""`), `_quote_sql_st
 - **NULL handling**: NULLs never match rules, remain in residual, land in `ELSE 0` bucket in final coverage.
 - **Target-leak feature**: OptBinning drops it during segment creation; BigQueryFeatureSelector marks IV 0.
 - **Zero-score population** excluded from decile calibration (only active scored population).
-- **Storage**: extraction defaults to disk-backed DuckDB under `experiments/` with auto-cleanup; scorer uses file-backed DB `score_experiment_{ts}.db`.
+- **Single artifact (opt-in)**: with `persist_db=True`, `extract_segments` keeps the DuckDB file + temp dir and materialises `original_df` once; `evaluate_final_coverage` / `generate_feature_health_report` reuse it and the scorer can share it via `db_path=` — avoiding several full re-copies of the source. Call `close()` or use `with` to clean up; when `persist_db=False` the legacy auto-delete in `finally` still applies.
+- **In-place residual exclusion**: the selected rule sets `__rs_excluded = TRUE` on `current_df_base` (a filtered `current_df` view) instead of rebuilding the residual table each iteration, so extraction stays O(1) appends rather than O(n) copies.
+- **Determinism**: OptBinning is seeded with `random_state=42` inside `extract_segments`, removing the pre-existing run-to-run variance in `optimal_cart` / `optimal_quantile` bin fits.
+- **Storage**: extraction defaults to disk-backed DuckDB under `experiments/` with auto-cleanup (or persists when `persist_db=True`); the scorer uses a unique temp DB (no `score_experiment_*.db` CWD leak).
 
 ---
 
@@ -256,7 +260,7 @@ StrategicSegmentBuilder.extract_segments(data)
         ├─ [naive only] _expand_adjacent_bins (max_expansion_hops)
         ├─ grid shortlist (_get_sort_key) 
         ├─ parse_rule_to_sql + raw validation on current_df
-        └─ residual update: WHERE NOT(sql) OR (sql) IS NULL
+         └─ residual update: UPDATE current_df_base SET __rs_excluded = TRUE WHERE (sql) IS TRUE (filtered view)
         │
    => self.segments [ {segment_id, rule_string, sql_filter, count, rate, lift, meta_*} ]
         │
@@ -274,7 +278,7 @@ BigQueryFeatureSelector.screen_features() → DuckDB relation (feature, stddev, 
 
 ## 8. Dependencies & Constraints
 
-- Python ≥ 3.9; build backend `uv_build`; version `1.2.4`.
+- Python ≥ 3.11; build backend `uv_build`; version `1.2.4`.
 - Runtime: `duckdb>=1.5.4`, `joblib>=1.5.3`, `numpy>=2.5.1`, `optbinning>=0.21.0`, `pandas>=2.2.0`, `psutil>=7.2.2`, `pyarrow>=25.0.0`.
 - Optional extras: `excel` (openpyxl), `gcp` (google-cloud-bigquery), `prettytable`.
 - Packaging: src layout; package name `rapidsegment`; module `rapidsegment` inside `rapidsegment/src/rapidsegment`.

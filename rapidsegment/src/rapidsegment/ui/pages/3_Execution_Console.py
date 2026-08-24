@@ -335,21 +335,6 @@ ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
 """
 
 
-def compute_coverage_local(segments, df, target):
-    """Replicates StrategicSegmentBuilder.evaluate_final_coverage with a fresh,
-    in-memory DuckDB connection (the library method is NOT called — it hangs on
-    the shared db_path file lock in this environment)."""
-    if not segments:
-        return []
-    con = duckdb.connect()
-    try:
-        con.execute("SET threads = 4;")
-        con.register("input_data_view", df)
-        return con.execute(_build_coverage_sql(segments, target)).df().to_dict(orient="records")
-    finally:
-        con.close()
-
-
 def _build_sql_script(segments, coverage, cfg=None, exp=None):
     cfg = cfg or {}
     exp = exp or {}
@@ -531,8 +516,7 @@ def _finalize(run, status):
                 _ui_log(run, "INFO",
                         f"Cancelled — snapshotting {len(run['segments'])} partial segment(s).")
                 try:
-                    run["coverage"] = compute_coverage_local(
-                        run["segments"], run["df"], run["cfg"]["target_col"])
+                    run["coverage"] = run["builder"].evaluate_final_coverage(run["data_path"])
                     run["coverage_done"] = True
                 except Exception as exc:
                     run["coverage"] = []
@@ -568,7 +552,9 @@ def _finalize(run, status):
 def _run_extract(run):
     try:
         run["out_q"].put(("phase", 1))
-        segments = run["builder"].extract_segments(run["df"])
+        # Feed the on-disk dataset path (zero-copy) — the builder attaches it
+        # read-only and never materialises the full table into Python.
+        segments = run["builder"].extract_segments(run["data_path"])
         run["out_q"].put(("extracted", segments, run["builder"].stop_reason))
     except Exception as exc:
         run["out_q"].put(("error", str(exc)))
@@ -576,8 +562,9 @@ def _run_extract(run):
 
 def _run_coverage(run):
     try:
-        coverage = compute_coverage_local(
-            run["segments"], run["df"], run["cfg"]["target_col"])
+        # Pure-DuckDB coverage over the builder's persisted `original_df`
+        # (no in-memory dataframe, no second full copy of the data).
+        coverage = run["builder"].evaluate_final_coverage(run["data_path"])
         run["out_q"].put(("done", coverage))
     except Exception as exc:
         run["out_q"].put(("error", f"Coverage computation failed: {exc}"))
@@ -587,13 +574,19 @@ def _start_run(cfg):
     if not cfg.get("target_col"):
         st.error("Config has no target_col — re-run from the Workbench (Module 2).")
         return None
+    data_path = active_db()
+    if not os.path.exists(data_path):
+        st.error(f"Cannot find dataset `{data_path}` — re-run Module 1 (Data Loader) first.")
+        return None
     try:
-        df = db_query("SELECT * FROM udl_data")
+        n_rows = db_scalar("SELECT COUNT(*) FROM udl_data")
+        n_cols = db_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='udl_data'")
     except Exception as exc:
-        st.error(f"Cannot load dataset from `{DB_FILE}`: {exc}\n\n"
+        st.error(f"Cannot load dataset from `{data_path}`: {exc}\n\n"
                  "Re-run Module 1 (Data Loader) / Module 2 (Workbench) first.")
         return None
-    if df.empty:
+    if n_rows == 0:
         st.error("Dataset is empty — re-run Module 1 with a non-empty file.")
         return None
     exp_id = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -626,17 +619,20 @@ def _start_run(cfg):
         max_expansion_hops=cfg["max_expansion_hops"],
         selection_metric=cfg["selection_metric"],
         expand_log_mode=cfg.get("expand_log_mode", "none"),
+        memory_limit_gb=cfg.get("memory_limit_gb"),
+        engine_threads=cfg.get("engine_threads"),
         db_path=os.path.join(exp_dir, "workbench.duckdb"),
         db_temp_dir=os.path.join(exp_dir, "tmp"),
+        persist_db=True,
     )
     run = {
         "exp_id": exp_id,
         "exp_dir": exp_dir,
         "t0": time.time(),
         "cfg": cfg,
-        "df": df,
-        "n_rows": len(df),
-        "n_cols": df.shape[1],
+        "data_path": data_path,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
         "builder": builder,
         "out_q": queue.Queue(),
         "log_q": queue.Queue(),
@@ -658,7 +654,7 @@ def _start_run(cfg):
     }
     _attach_log_handler(run)
     _ui_log(run, "INFO", f"Experiment '{cfg.get('experiment_name', 'Experiment')}' started — exp_id={exp_id}")
-    _ui_log(run, "INFO", f"Data: {len(df):,} rows × {df.shape[1]} cols · target=`{cfg['target_col']}`")
+    _ui_log(run, "INFO", f"Data: {n_rows:,} rows × {n_cols} cols · target=`{cfg['target_col']}`")
     threading.Thread(target=_run_extract, args=(run,), daemon=True).start()
     st.session_state["m3_run"] = run
     return run

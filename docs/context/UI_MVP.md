@@ -60,7 +60,7 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 | 6 — Arena (1v1 comparison) | ✅ **Done** | KPI face-off (incl. **Cumulative Event Capture %**) with winners, full parameter diff (differing fields flagged), segment overlap (shared/unique/Jaccard + overlaid lift distribution + shared-segment lift table), SQL diff per segment; wired into `app.py` |
 
 **Known caveats / deviations:**
-- ⚠ `builder.evaluate_final_coverage()` hangs in this environment (DuckDB file-lock on shared `db_path`) — never call it; coverage is computed locally (`compute_coverage_local`).
+- ~~`builder.evaluate_final_coverage()` hangs in this environment~~ → **Fixed (gotcha 17)**: path-mode string handling now works (`ATTACH ... READ_ONLY`), so M3 calls it directly (no more local `compute_coverage_local`).
 - Scorecard (`StrategicSegmentScore`) needs ≥10 distinct segments for smooth decile resolution (library warns otherwise) — guide users to `max_segments ≥ 10`.
 - Solara→Streamlit conversion: `st.switch_page` / `st.page_link` for navigation; there is no Jupyter-native mode.
 - `db_path`/`db_temp_dir` are internal-only (per-experiment artifact dirs), not user-facing.
@@ -73,7 +73,10 @@ This document presents an **enhanced UI/UX plan** for the RapidSegment Jupyter-n
 - **M3 save fixes & `dataset_name` persistence.** `upsert_experiment` adds a `dataset_name TEXT` column (auto-migrated in try/except); `_build_experiment` sets it from session. numpy int64/float64 from `df.shape` are coerced to int/float before save; save errors surface via `m3_save_error` (run still completes).
 - **M5 Leaderboard rework.** Experiments grouped/filtered by `dataset_name` (Dataset dropdown, replaced the `rows×cols` signature proxy); grid gains a Dataset column; **date picker removed**; ranking by chosen KPI (Avg/Max Lift, Coverage %, Segments) with 🏆 best-performer highlight; light filters (status + name search); row actions (Clone→Workbench, View results→M4, Export JSON, Duplicate, Delete-with-confirmation); two-run Compare (`param_diff`).
 - **Navigation rename + global `width=` change.** `app.py` uses explicit `st.navigation` + `st.Page`; the entry page is titled **"Home"** (M-pages: Data Loader, Workbench, Execution, Results, Leaderboard, Arena). Across `app.py` and all six pages, every `use_container_width=True/False` was replaced with `width='stretch'` / `width='content'`.
-- **Cyberpunk / AMOLED theme + `cumulative_event_capture` KPI.** Added `rapidsegment/src/rapidsegment/ui/_theme.py` (`apply_cyberpunk_theme()`); the emerald theme comes from `_theme.py` CSS, while `.streamlit/config.toml` only lifts Streamlit's upload/message gate (`[server] maxUploadSize/maxMessageSize = 2000`). Injected into `app.py` and all six pages (Module 3's primary buttons recolored to emerald). Leaderboard ranking gains a **Cumulative Event Capture %** KPI and Arena KPI face-off gains the same metric; `cumulative_event_capture` is computed by `compute_coverage_local` during a run and persisted to the `experiments` table (auto-migrated `cumulative_event_capture DOUBLE`, with read-side migration in both `read_all_experiments`). KPIs stay read from stored artifacts — no live recomputation.
+- **Cyberpunk / AMOLED theme + `cumulative_event_capture` KPI.** Added `rapidsegment/src/rapidsegment/ui/_theme.py` (`apply_cyberpunk_theme()`); the emerald theme comes from `_theme.py` CSS, while `.streamlit/config.toml` only lifts Streamlit's upload/message gate (`[server] maxUploadSize/maxMessageSize = 8000`). Injected into `app.py` and all six pages (Module 3's primary buttons recolored to emerald). Leaderboard ranking gains a **Cumulative Event Capture %** KPI and Arena KPI face-off gains the same metric; `cumulative_event_capture` is computed by `compute_coverage_local` during a run and persisted to the `experiments` table (auto-migrated `cumulative_event_capture DOUBLE`, with read-side migration in both `read_all_experiments`). KPIs stay read from stored artifacts — no live recomputation.
+- **M4 Feature Journey/Health Report lists ALL engine-tracked features (Option A).** `render_diagnostics` derives `feats` from `_tracked_features_from_artifacts` (reads persisted `diagnostics_[-1]["features_state"].keys()`) with fallback to `_eligible_features_from_dataset` (dataset columns minus target/pk/ignored). This makes eligible-but-unused features visible/traceable in the Feature Journey dropdown and Health Report multiselect — matching `StrategicSegmentBuilder.features_state` exactly. Ignored features are excluded. `_build_diag_builder` stays lazy inside button handlers (no eager re-extraction on page load).
+- **M5 "Cumulative Event Capture %" grid column.** The M5 leaderboard grid now includes a `Cumulative Event Capture %` column (after Coverage %) so sorting by that KPI is self-explanatory.
+- **2_Workbench.py mojibake resolved.** The file previously had mixed-encoding mojibake (double-encoded UTF-8 where cp1252-decoded bytes produced sequences like `ðŸ"Š` for `📊`). User manually restored correct UTF-8 emoji. The "??" display in PowerShell was a cp1252 console rendering artifact — actual file bytes were correct.
 
 ---
 
@@ -90,7 +93,7 @@ Load data from multiple sources and deliver instant, actionable insights about d
 - **Sample datasets**: Quick-start with RapidSegment example datasets (bank-full.csv, train.csv)
 
 #### 1.2 File Upload & Parsing
-- **Drag-and-drop zone** with a 2000 MB upload gate (set in `.streamlit/config.toml` via `server.maxUploadSize`); files are streamed chunked (`shutil.copyfileobj`) to match the disk/BigQuery load path
+- **Drag-and-drop zone** with an **8000 MB** upload gate (set in `.streamlit/config.toml` via `server.maxUploadSize`); files are streamed chunked (`shutil.copyfileobj`) to match the disk/BigQuery load path. For multi-GB files, the **File path** method (direct DuckDB ingestion via `stream_to_duckdb`) is recommended — it streams straight from disk with zero in-RAM materialisation
 - **Format detection**: Auto-infer CSV vs. Parquet vs. Excel vs. Arrow
 - **Encoding support**: UTF-8, Latin-1, auto-detect — CSV encoding read through PyArrow `ReadOptions(encoding=…)`, always producing a PyArrow table with float64 numerics (no pandas fallback)
 - **Progress indicator**: File load, profiling progress
@@ -332,8 +335,8 @@ Display extracted segments with rich context, metrics, and actionable export opt
 - Copy-to-clipboard
 
 #### 4.5 Diagnostic Drilldown
-- **Feature Journey**: Audit trail per feature (`explain_feature_journey` captured via `redirect_stdout` in a dedicated expander)
-- **Feature Health Report**: Bin-level stats via `generate_feature_health_local(df, features, target, type_overrides, naive_bins)` (replaces library `generate_feature_health_report`; respects type overrides, unique `Bin N: [min, max]` labels, TRY_CAST DOUBLE for text-stored numerics, degenerate bins as single value) — downloadable CSV
+- **Feature Journey**: Audit trail per feature (`explain_feature_journey` captured via `redirect_stdout` in a dedicated expander). The dropdown now lists **ALL engine-tracked features** (every eligible column the builder scored, including eligible-but-unused ones), not just features appearing in a segment rule. Ignored features are excluded (matching the builder's logic). `feats` derived from `_tracked_features_from_artifacts` (persisted `diagnostics_`) with fallback to `_eligible_features_from_dataset`.
+- **Feature Health Report**: Bin-level stats via `generate_feature_health_local(df, features, target, type_overrides, naive_bins)` (replaces library `generate_feature_health_report`; respects type overrides, unique `Bin N: [min, max]` labels, TRY_CAST DOUBLE for text-stored numerics, degenerate bins as single value) — downloadable CSV. The multiselect now lists all tracked features (same as Feature Journey).
 - **No Segments Explanation**: Why extraction stopped + recommendations (`explain_no_segments`)
 
 #### 4.6 Export Hub
@@ -364,8 +367,8 @@ Central hub to track all experiments, rank by metrics, and enable quick cloning 
 ### Design Details
 
 #### 5.1 Ranked Data Grid
-**Columns**: 🏆 | Rank | Experiment | Dataset | Status | Avg Lift | Max Lift | Coverage % | Segments | Rows | Time | Actions
-- Sortable, ranked by a chosen KPI (Avg Lift / Max Lift / Coverage % / Segments / **Cumulative Event Capture %**); top completed run by KPI gets a 🏆 Best highlight.
+**Columns**: 🏆 | Rank | Experiment | Dataset | Status | Avg Lift | Max Lift | Coverage % | **Cumulative Event Capture %** | Segments | Rows | Time | Actions
+- Sortable, ranked by a chosen KPI (Avg Lift / Max Lift / Coverage % / Segments / **Cumulative Event Capture %**); top completed run by KPI gets a 🏆 Best highlight. Grid now includes a **Cumulative Event Capture %** column (after Coverage %) so the sort value is visible.
 - Grouped/filtered by **Dataset** (dropdown of `dataset_name` values); the old `rows×cols` signature proxy is gone.
 - **Date picker removed** — every saved run counts.
 - Light filters: status multiselect + name search.

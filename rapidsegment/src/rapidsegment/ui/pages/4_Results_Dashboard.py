@@ -204,6 +204,57 @@ def segment_complexity(rule_string):
     return len([p for p in str(rule_string).split("&") if "=" in p])
 
 
+def _tracked_features_from_artifacts(exp_id):
+    """Return the engine's tracked feature names (sorted) from persisted diagnostics, or None.
+
+    Reuses the diagnostics_ Module 3 saved into artifacts/<exp_id>/result.json — no
+    re-extraction. This is the authoritative feature set (every eligible column the
+    builder scored per iteration), matching StrategicSegmentBuilder.features_state.
+    """
+    if not exp_id:
+        return None
+    art = os.path.join(ARTIFACTS_DIR, exp_id, "result.json")
+    if not os.path.exists(art):
+        return None
+    try:
+        with open(art, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        diag = (saved.get("result") or {}).get("diagnostics_")
+        if diag:
+            fs = (diag[-1].get("features_state") or {})
+            if fs:
+                return sorted(fs.keys())
+    except Exception:
+        pass
+    return None
+
+
+def _eligible_features_from_dataset(data_path, cfg):
+    """Fallback feature list: columns of udl_data minus target / primary key / ignored.
+
+    Mirrors builder.extract_segments' eligible_cols when persisted diagnostics are
+    unavailable, so the module still surfaces the same eligible set.
+    """
+    if not data_path or not os.path.exists(data_path):
+        return []
+    try:
+        con = duckdb.connect(data_path, read_only=True)
+        try:
+            cols = [r[0] for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='udl_data'").fetchall()]
+        finally:
+            con.close()
+        target = cfg.get("target_col")
+        ignore = set(cfg.get("ignore_features") or [])
+        pk = cfg.get("primary_key")
+        if pk:
+            ignore.add(pk)
+        return sorted(c for c in cols if c not in ignore and c != target)
+    except Exception:
+        return []
+
+
 # ── Scorecard (StrategicSegmentScore) ─────────────────────────────────────────
 def build_scorecard(cfg, data_path, segments):
     """Create per-segment flag columns, score the population, return artifact dict.
@@ -837,10 +888,15 @@ def render_diagnostics(exp, cfg, data_path, segments):
         st.caption("No stop reason recorded.")
 
     # 1) Feature Journey — dedicated space
+    # Feature list = exactly what the engine tracked (all eligible columns except
+    # target / primary key / ignored), so eligible-but-unused features are visible
+    # here too. Mirrors StrategicSegmentBuilder.features_state (builder.py).
+    feats = (_tracked_features_from_artifacts(exp.get("exp_id"))
+             or _eligible_features_from_dataset(data_path, cfg))
+
     with st.expander("Feature Journey (audit trail per feature)", expanded=True):
-        feats = sorted({v for s in segments for v in segment_variables(s.get("rule_string", ""))})
         if not feats:
-            st.caption("No features were used (no segments produced).")
+            st.caption("No features were tracked (no dataset / diagnostics available).")
         else:
             fj = st.selectbox("Choose a feature to trace", feats, key="m4_fj")
             if st.button("Show feature journey", key="m4_fj_btn"):
@@ -856,9 +912,8 @@ def render_diagnostics(exp, cfg, data_path, segments):
 
     # 2) Feature Health Report
     with st.expander("Feature Health Report (bin-level stats)"):
-        feats = sorted({v for s in segments for v in segment_variables(s.get("rule_string", ""))})
         if not feats:
-            st.caption("No features to profile (no segments).")
+            st.caption("No features to profile (no dataset / diagnostics available).")
         else:
             sel = st.multiselect("Features to profile", feats, default=feats[:5], key="m4_health_sel")
             if st.button("Generate health report", key="m4_health"):

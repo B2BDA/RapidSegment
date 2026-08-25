@@ -5,7 +5,7 @@ Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning,
 and vectorized DuckDB scorecard deciling.
 
 Author: Bishwarup Biswas
-Python Version: 3.9+
+Python Version: 3.11+
 """
 
 import logging

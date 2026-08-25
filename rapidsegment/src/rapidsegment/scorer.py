@@ -3,9 +3,9 @@ Strategic Segmentation Scorecard Engine
 =======================================
 Creating scorecards for multi‑segmented populations using vectorised DuckDB aggregations.
 
-Author: Bishwarup Biswas + Gemini + DeepSeek + ChatGPT
+Author: Bishwarup Biswas
 
-Python Version: 3.9+
+Python Version: 3.11+
 """
 
 import json

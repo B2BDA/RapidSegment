@@ -26,6 +26,7 @@
 - [⚙️ How It Works – Step by Step](#️-how-it-works--step-by-step)
 - [📊 Statistical Foundations](#-statistical-foundations)
 - [🔧 Configuration Reference](#-configuration-reference)
+- [🔋 Single Data Artifact & Memory Efficiency](#-single-data-artifact--memory-efficiency)
 - [🤔 FAQs & Troubleshooting](#-faqs--troubleshooting)
 - [🤝 Contributing](#-contributing)
 - [📄 License](#-license)
@@ -34,14 +35,16 @@
 ## ✨ Features
 
 - **🔎 Automated Rule Discovery** – Uses Optimal Binning (or fast naive quantile binning) + Apriori pruning to find multi‑way (1‑, 2‑, 3‑way) conditions that maximise lift and volume.
-- **🧩 Hierarchical Segments** – Extracts mutually exclusive rules sequentially on a shrinking residual dataset, ensuring clean portfolio decomposition.
+- **🧩 Hierarchical Segments** – Extracts mutually exclusive rules sequentially on a shrinking residual population, ensuring clean portfolio decomposition.
 - **🔀 Adjacent-Bin Expansion** – Optionally merges neighbouring bins (`max_expansion_hops`) to recover higher-event rules that pure single-bin candidates miss.
 - **⚡ Hyper‑Efficient & Out-of-Core** – Leverages **DuckDB** (disk-backed by default) for vectorised SQL aggregations; spills to disk so large datasets fit in limited RAM.
+- **🔋 Single Data Artifact (opt-in)** – With `persist_db=True`, extraction keeps one DuckDB file for evaluate / health / score reuse; residual rows are flagged in place (`__rs_excluded`) instead of rewriting the full table each iteration.
+- **📉 Two-Phase Binning** – Fits IV ranking across all eligible features, then materialises full-length bin-label arrays only for `top_n_vars`, bounding peak Python memory.
+- **📁 Zero-Copy File Path** – Pass a path to an existing DuckDB file (table `udl_data` for the builder, `df` for the scorer) so data never has to be pulled into a Python frame.
 - **☁️ BigQuery Ready** – Optional feature screening runs natively inside Google BigQuery, downloading only the most predictive columns.
 - **📦 Production‑Ready Outputs** – Exports pure ANSI SQL filters and a JSON scorecard with decile thresholds, ready for deployment.
 - **📊 Transparent Weighting** – Uses the segment response rate to compute intuitive integer weights, while retaining lift, response rate, and capture rate for each segment.
 - **🔬 Full Audit Trail** – `explain_feature_journey`, `explain_no_segments`, and `generate_feature_health_report` for complete diagnostics.
-
 ---
 
 ## 🌳 Decision Trees vs RapidSegment
@@ -63,6 +66,21 @@ Decision trees and RapidSegment both aim to create interpretable segments, but t
 - The output is already aligned with SQL and scorecard workflows, reducing the gap between modeling and deployment.
 - It is easier to reason about when you want stable, reusable segmentation logic rather than a branching tree structure.
 - It is well suited for scenarios where you want a fixed set of business rules, consistent segment definitions, and explainable weights.
+  
+#### Empirical 1v1: Decision Tree vs RapidSegment
+
+See the full showdown notebook:  
+**[DT vs RS comparison](https://github.com/B2BDA/RapidSegment/blob/main/Examples/compare_segmenters_general.ipynb)**
+
+On matched runs with similar population and event capture:
+
+| Pattern | Decision tree | RapidSegment |
+|--------|----------------|--------------|
+| Lift / response rate | Highly variable across segments | More stable segment to segment |
+| Segment size | Often large (many customers per rule) | Typically tighter (on the order of ~1K rows per segment in this study) |
+| Trade-off | High volume can inflate false positives | Lower volume per segment, steadier response rates |
+
+**Takeaway:** Similar overall capture does not imply similar segment quality. Trees tend to grow broad leaves that pull in more non-events; RapidSegment favors smaller, higher-signal rules with more consistent lift and response rate.
 
 In short, a decision tree is great when you want a predictive model structure; RapidSegment is better when you want transparent, deployable segments that are easy to understand and operationalize.
 
@@ -246,47 +264,47 @@ config:
   theme: dark
 ---
 flowchart TD
-    A["Original Data\n(input to extract_segments)"] 
-    --> B["Create current_df\n(full copy)"]
+    A["Original Data - input to extract_segments"]
+    --> B["Create current_df_base + __rs_row_id, target to DOUBLE, __rs_excluded = FALSE"]
 
-    B --> C{For each segment\ni = 1 to max_segments}
+    B --> V["current_df = VIEW WHERE __rs_excluded IS NOT TRUE"]
 
-    C --> D[Compute base_rate & volume\non current residual current_df]
+    V --> C{"For each segment i = 1 to max_segments"}
 
-    D --> E[IV Ranking + Optimal Binning\non current residual]
+    C --> D["Compute base_rate and volume on residual current_df"]
 
-    E --> F[Build binned_df\nusing precomputed bins from residual]
+    D --> E["IV Ranking + Binning: Phase 1 fit all eligible, Phase 2 transform top_n_vars only"]
 
-    F --> G[Generate Candidates\n1-way, 2-way, 3-way on binned_df]
+    E --> F["Build binned_df from top_n bin labels"]
 
-    G --> H[Select best candidate\nby sort_priority]
+    F --> G["Generate candidates 1-way, 2-way, 3-way on binned_df"]
 
-    H --> I["Parse rule → SQL filter\nparse_rule_to_sql()"]
+    G --> H["Select best candidate by sort_priority"]
 
-    I --> J[Validate on RAW current_df\nCOUNT + SUM WHERE sql_filter]
+    H --> I["Parse rule to SQL filter via parse_rule_to_sql"]
 
-    J --> K{Meets min_sample_size\nand min_events?}
+    I --> J["Validate on residual current_df: COUNT + SUM WHERE sql_filter"]
 
-    K -- No --> L[Reject & Try Next Candidate\nor Stop]
+    J --> K{"Meets min_sample_size, min_events, and min_lift?"}
+
+    K -- No --> L["Reject and try next candidate, or stop"]
     L --> C
 
-    K -- Yes --> M[Store Segment\nwith actual counts from residual]
+    K -- Yes --> M["Store segment with actual counts from residual"]
 
-    M --> N[Update Feature Usage Tracker]
+    M --> N["Update feature usage tracker"]
 
-    N --> O["Delete matching rows from residual\nWHERE NOT (sql_filter) OR IS NULL"]
+    N --> O["In-place residual update: SET __rs_excluded = TRUE WHERE sql_filter IS TRUE"]
 
-    O --> P[current_df ← smaller residual]
+    O --> P["current_df view shrinks - no full-table rewrite"]
 
     P --> C
 
-    C --> Q[End Loop]
+    C --> Q["End loop"]
 
-    Q --> R[Return self.segments\nhierarchical rules]
+    Q --> R["Return self.segments hierarchical rules"]
 
-    subgraph Final Evaluation
-    R --> S[evaluate_final_coverage\nCASE WHEN on Original Data]
-    end
+    R --> S["evaluate_final_coverage: CASE WHEN on original population"]
 ```
 ## ⚙️ How It Works – Step by Step
 
@@ -391,12 +409,15 @@ For each iteration, the engine sweeps over a user‑defined grid of `(min_sample
 ### 4. Champion Validation & Extraction
 The champion’s SQL filter is validated against the **raw residual** to ensure it meets the absolute hard constraints. Only then is it accepted.
 
-### 5. Residual Update (NULL‑safe)
-Rows matching the rule are removed using:
-```sql
-WHERE NOT (rule) OR (rule) IS NULL
-```
+### 5. Residual Update (NULL‑safe, in-place)
+
+Matched residual rows are **excluded in place** on the base table — the engine does **not** rewrite a new residual table each iteration:
 This guarantees that the residual dataset exactly matches the `CASE`‑based hierarchical segmentation used in `evaluate_final_coverage`.
+```sql
+UPDATE current_df_base
+SET "__rs_excluded" = TRUE
+WHERE ({rule}) IS TRUE
+```
 
 ### 6. Loop
 Steps 1‑5 repeat until either `max_segments` is reached or no more rules can be found.
@@ -448,7 +469,7 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `min_sample_size` | `int` | `1000` | Absolute minimum rows for a valid rule. |
 | `min_lift` | `float` | `1.5` | Absolute minimum lift (hard constraint). |
 | `min_events` | `int` | `100` | Minimum positive events for a valid rule. |
-| `top_n_vars` | `int` | `15` | Number of top features passed to the Apriori engine. |
+| `top_n_vars` | `int` | `15` | Number of top features passed to the Apriori engine (and for which full bin-label arrays are materialised). |
 | `max_segments` | `int` | `10` | Maximum segments to extract. |
 | `max_feature_reuse` | `int` | `1` | Max times any single feature may appear across segments. |
 | `param_grid` | `dict` | `{}` | Optional grid of `{min_sample_size, min_lift}` to sweep. |
@@ -457,24 +478,33 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `feature_groups` | `dict` | `{}` | Business-category → column list (used by diversity). |
 | `ignore_features` | `list` | `[]` | Columns to exclude before IV calculation. |
 | `sort_priority` | `str` | `"rate_lift_count"` | Ranking key for champion selection (many variants supported). |
-| `binning_method` | `str` | `"optimal"` | `"optimal_cart"` or `optimal` (OptBinning with CART) or `"optimal_quantile"` (OptBinning with Quantile) or `"naive"` (quantile bins). |
+| `binning_method` | `str` | `"optimal_cart"` | `"optimal_cart"` (or alias `"optimal"`), `"optimal_quantile"`, or `"naive"`. |
 | `naive_bins` | `int` | `5` | Number of quantile bins when `binning_method="naive"`. |
 | `max_expansion_hops` | `int` | `0` | Adjacent-bin merge distance (0 = disabled). |
 | `selection_metric` | `str` | `"iv"` | Rank features by `"iv"` or `"response_rate"`. |
 | `expand_log_mode` | `str` | `"none"` | Expansion logging: `"none"` \| `"summary"` \| `"champion"` \| `"full"`. |
+| `memory_limit_gb` | `float` | `None` | DuckDB RAM buffer cap in GB. `None` → ~80% of host RAM. |
+| `engine_threads` | `int` | `None` | DuckDB execution threads. `None` → all-but-two cores (or all cores if ≤4). |
 | `db_path` / `db_temp_dir` | `str` | `None` | Optional explicit DuckDB file + temp dir (auto-created otherwise). |
-| `persist_db` | `bool` | `False` | Opt-in single-artifact mode. Keeps the auto-created DuckDB file alive after `extract_segments` returns (exposed as `builder.db_path` / `builder.db_temp_dir`) so `evaluate_final_coverage` / `generate_feature_health_report` — and the scorer via `db_path=` — reuse the **same** materialised dataset instead of re-copying the full source 3+ times. Requires `close()` or a `with` block to clean up. |
+| `persist_db` | `bool` | `False` | Keep the auto-created DuckDB artifact after `extract_segments` so evaluate / health / score can share the same file. Requires `close()` or a `with` block to clean up. |
 
 **Output** – list of dicts with keys: `segment_id`, `rule_string`, `sql_filter`, `count`, `rate`, `lift`, `meta_applied_sample_size`, `meta_applied_min_lift`.
 
 ### `StrategicSegmentScore`
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `target_col` | `str` | Binary target column. |
-| `primary_key` | `str` | Unique row identifier. |
-| `segment_cols` | `list` | List of binary segment flag columns. |
-| `db_path` | `str` | `None` | Optional path to a shared DuckDB file (e.g. the builder's `db_path`) so the scorer reuses the single artifact. If omitted, a unique temp DB is created under the system temp dir and deleted after export — no `score_experiment_*.db` is left in the working directory. |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `target_col` | `str` | **Required** | Binary target column. |
+| `primary_key` | `str` | **Required** | Unique row identifier. |
+| `segment_cols` | `list` | **Required** | List of binary segment flag columns. |
+
+`calculate_and_export_weights(data, export_path=..., db_path=None)`:
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `data` | any / `str` | **Required** | Frame/table, or path to a DuckDB file containing table `df` (zero-copy attach). |
+| `export_path` | `str` | timestamped JSON | Path for the model artifact. |
+| `db_path` | `str` | `None` | Optional shared DuckDB file (e.g. the builder’s `db_path`). If omitted, a unique temp DB under the system temp dir is created and removed after export. |
 
 **Export** – JSON artifact with `model_metadata`, `segment_weights`, and `decile_min_thresholds`.
 
@@ -482,9 +512,16 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 
 ## 🔋 Single Data Artifact & Memory Efficiency
 
-By default RapidSegment materialises the dataset into a DuckDB table during `extract_segments` and cleans it up automatically. If you chain `extract_segments → evaluate_final_coverage → generate_feature_health_report → StrategicSegmentScore`, the engine can instead keep **one** DuckDB artifact and reuse it — avoiding several full re-copies of your data in memory/disk.
+By default RapidSegment materialises the residual workspace into a DuckDB file during `extract_segments` and deletes it when the run finishes. If you chain `extract_segments → evaluate_final_coverage → generate_feature_health_report → StrategicSegmentScore`, set **`persist_db=True`** so the **same DuckDB file** stays alive and later steps can share it instead of each opening a fresh, isolated DB.
 
-**Why:** each of those steps previously re-materialised the full source from scratch. With `persist_db=True` the builder stores the dataset once and the later steps read from it; the scorer can share the same file via `db_path`. The residual inside extraction is also tracked with an in-place exclusion flag (a filtered view), so no full-table rewrite happens on every iteration.
+**What is reused**
+
+| Stage | Behaviour with `persist_db=True` |
+|-------|----------------------------------|
+| Residual inside extraction | One base table (`current_df_base`) + in-place `__rs_excluded` flag; `current_df` is a filtered **view** (no full-table rewrite per segment). |
+| Binning memory | Phase 1 fits all eligible features; Phase 2 materialises full-length bin-label arrays only for `top_n_vars`. |
+| Evaluate / health | Connect to the same `db_path`. If `original_df` is not already present in that file, it is materialised **once** from the data you pass (or attached zero-copy when you pass a DuckDB file path). Subsequent calls on the same file can reuse `original_df`. |
+| Scorer | Pass `db_path=b.db_path` (or a path to a file that already contains table `df`) so scoring does not create a separate CWD `score_experiment_*.db`. |
 
 **How to use** — prefer the context manager so cleanup is automatic:
 
@@ -493,13 +530,13 @@ from rapidsegment import StrategicSegmentBuilder, StrategicSegmentScore
 
 with StrategicSegmentBuilder(target="default_flag", persist_db=True) as b:
     segments = b.extract_segments(data)
-    coverage = b.evaluate_final_coverage(data)          # reuses the same artifact
-    health   = b.generate_feature_health_report(data, ["age", "balance"])  # reuses
+    coverage = b.evaluate_final_coverage(data)   # same DB file
+    health = b.generate_feature_health_report(data, ["age", "balance"])
 
-    # build seg_N flag columns, then score reusing the builder's DB:
+    # build seg_N flag columns on your scoring frame, then:
     scorer = StrategicSegmentScore("default_flag", "cust_id", segment_cols)
     scorer.calculate_and_export_weights(scored_df, "model.json", db_path=b.db_path)
-# b.close() runs here -> temp DuckDB file + temp dir removed
+# b.close() runs here → temp DuckDB file + temp dir removed
 ```
 
 Or manage it manually — but you **must** call `b.close()`:
@@ -518,8 +555,8 @@ Leave `persist_db=False` (the default) if you only call `extract_segments` — t
 ## 🤔 FAQs & Troubleshooting
 
 **Q: Why are later segments sometimes stronger in lift than earlier ones?**  
-A: The segment extraction process is entirely sequential and operates on a shrinking residual population. Once a champion rule is discovered, its matching records are deleted from the working environment before the next iteration begins.
-Because of this cascading extraction:  
+A: Extraction is sequential and operates on a shrinking residual population. Once a champion rule is discovered, matching residual rows are **flagged out** (`__rs_excluded = TRUE`) before the next iteration.  
+Because of this cascading extraction:
     **`Local Optimization`**: The engine optimizes parameters and evaluates candidates based purely on the residual portfolio left behind by previous segments. A rule that yields massive lift on a specific, purified subset of data might look less dominant if it had been evaluated against the noisy baseline of the entire original population.  
     **`Changing Base Rates`**: As high-risk or high-performing records are stripped away in early rounds, the baseline event rate of the remaining pool shifts dynamically. This shifting baseline changes the mathematical benchmark for what constitutes a "high-lift" rule during that specific loop.  Consequently, when evaluate_final_coverage maps all rules simultaneously back over the original, unfiltered dataset, the global KPIs can naturally surface instances where a later segment outperforms an earlier one.  
 
@@ -535,14 +572,17 @@ A: Yes – just pass a DuckDB‑compatible table (e.g., a Pandas DataFrame) dire
 **Q: Does the engine handle missing values (NULLs) correctly?**  
 A: Yes. Both extraction and evaluation treat NULLs consistently – NULL conditions do not match the rule and are carried forward to later segments (or the `ELSE 0` bucket).
 
-**Q: My dataset may contain target leaked feature (100% correaltion with Target). Will it be taken as important feature?**
-A: No. The feature will be dropped by Optbinning during segment creation steps. Furthermore, if you are using BigQueryFeatureSelector the feature IV will be marked as 0 and not considered.
+**Q: My dataset may contain a target-leaked feature (100% correlation with the target). Will it be treated as an important feature?**  
+A: No. OptBinning drops it during segment creation. If you use `BigQueryFeatureSelector`, that feature’s IV is marked 0 and it is not considered.
+
+**Q: I want to showcase/introduce to my tream for adoption! Are there any deck that I can use?**  
+A: Yes. Please refer to the [business deck](https://github.com/B2BDA/RapidSegment/blob/main/docs/RapidSegment_Business_Deck.pdf)
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions! Please open an issue or pull request on [GitHub](https://github.com/your-org/rapidsegment).  
+We welcome contributions! Please open an issue or pull request on [GitHub](https://github.com/B2BDA/RapidSegment).  
 For major changes, please discuss them first via an issue.
 
 ---

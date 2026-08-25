@@ -299,6 +299,7 @@ def main():
             "Avg Lift ×": round(_f(r.get("avg_lift")) or 0.0, 3),
             "Max Lift ×": round(_f(r.get("max_lift")) or 0.0, 3),
             "Coverage %": round(_f(r.get("coverage_pct")) or 0.0, 1),
+            "Cumulative Event Capture %": round(_f(r.get("cumulative_event_capture")) or 0.0, 1),
             "Segments": _i(r.get("segments_count")),
             "Rows": _i(r.get("data_rows")),
             "Time (s)": round(_f(r.get("execution_time_sec")) or 0.0, 2),

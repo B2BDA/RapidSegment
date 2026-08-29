@@ -472,7 +472,7 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `top_n_vars` | `int` | `15` | Number of top features passed to the Apriori engine (and for which full bin-label arrays are materialised). |
 | `max_segments` | `int` | `10` | Maximum segments to extract. |
 | `max_feature_reuse` | `int` | `1` | Max times any single feature may appear across segments. |
-| `param_grid` | `dict` | `{}` | Optional grid of `{min_sample_size, min_lift}` to sweep. |
+| `param_grid` | `dict` | `{}` | Optional grid of `{min_sample_size, min_lift}` to sweep. Grid values temporarily widen the candidate pool (the engine uses the minimum grid value during exploration), but the hard constraints (`min_sample_size`, `min_lift`) always enforce the final acceptance floor — a segment must meet the hard constraint to be selected. |
 | `enable_diversity` | `bool` | `False` | Block combinations that mix features from the same group. |
 | `enable_1way` / `enable_2way` / `enable_3way` | `bool` | `True` | Toggle 1-, 2-, and 3-way rules. |
 | `feature_groups` | `dict` | `{}` | Business-category → column list (used by diversity). |

@@ -138,7 +138,7 @@ BigQuery downsampling snippet: keep 100% of `target_y = 1`, deterministic 10% of
 - `self.feature_usage_counts: Dict[str, int]`
 - `self._feature_to_group: Dict[str, str]` — reverse group map
 - `self._columns_types`, `self._categorical_cols` — schema memo
-- `self.min_sample_size/min_lift/min_events` are MUTATED inside `extract_segments` during grid search and restored after (see below)
+- `self.min_sample_size/min_lift/min_events` are MUTATED inside `extract_segments` during grid search and restored after. Specifically: (1) the originals are snapshotted as `abs_min_sample_size/abs_min_lift/abs_min_events` at the start (lines 1236-1238); (2) during each iteration, `self.min_sample_size` and `self.min_lift` are set to the MINIMUM of the grid values (lines 1505-1506) to widen the candidate pool; (3) the final segment acceptance gate at line 1587 uses the snapshotted hard constraints (`abs_min_*`), NOT the mutated values — so grid values below the hard constraint expand search but never override the floor; (4) after extraction completes, originals are restored (lines 1795-1797).
 
 #### Methods
 

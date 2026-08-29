@@ -218,9 +218,8 @@ EXPAND_LOG_OPTIONS = ["none", "summary", "champion", "full"]
 
 
 
-GRID_SIZE_OPTIONS = [250, 500, 750, 1000, 1500, 2000, 2500, 3000, 5000]
-
-GRID_LIFT_OPTIONS = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
+GRID_SIZE_RANGE = (1000, 20000)
+GRID_LIFT_RANGE = (1.0, 10.0)
 
 
 
@@ -474,9 +473,26 @@ def build_params():
 
     if st.session_state["wb_enable_grid"]:
 
-        sizes = list(st.session_state.get("wb_grid_sizes") or [])
+        sizes_str = str(st.session_state.get("wb_grid_sizes") or "")
+        lifts_str = str(st.session_state.get("wb_grid_lifts") or "")
 
-        lifts = list(st.session_state.get("wb_grid_lifts") or [])
+        sizes = []
+        for v in sizes_str.split(","):
+            v = v.strip()
+            if v:
+                try:
+                    sizes.append(int(v))
+                except ValueError:
+                    pass
+
+        lifts = []
+        for v in lifts_str.split(","):
+            v = v.strip()
+            if v:
+                try:
+                    lifts.append(float(v))
+                except ValueError:
+                    pass
 
         if sizes or lifts:
 
@@ -938,11 +954,11 @@ def apply_config(cfg):
 
         if pg.get("min_sample_size"):
 
-            st.session_state["wb_grid_sizes"] = list(pg["min_sample_size"])
+            st.session_state["wb_grid_sizes"] = ", ".join(str(v) for v in pg["min_sample_size"])
 
         if pg.get("min_lift"):
 
-            st.session_state["wb_grid_lifts"] = list(pg["min_lift"])
+            st.session_state["wb_grid_lifts"] = ", ".join(str(v) for v in pg["min_lift"])
 
     else:
 
@@ -1130,9 +1146,9 @@ defaults = {
 
     "wb_enable_grid": False,
 
-    "wb_grid_sizes": [500, 1000, 2000],
+    "wb_grid_sizes": "500, 1000, 2000",
 
-    "wb_grid_lifts": [1.5, 2.0, 3.0],
+    "wb_grid_lifts": "1.5, 2.0, 3.0",
 
     "wb_template_name": "",
 
@@ -1156,13 +1172,11 @@ if st.session_state["wb_primary_key"] not in ["(none)"] + all_cols:
 
     st.session_state["wb_primary_key"] = "(none)"
 
-valid_sizes = [v for v in st.session_state["wb_grid_sizes"] if v in GRID_SIZE_OPTIONS]
+if isinstance(st.session_state["wb_grid_sizes"], list):
+    st.session_state["wb_grid_sizes"] = ", ".join(str(v) for v in st.session_state["wb_grid_sizes"])
 
-st.session_state["wb_grid_sizes"] = valid_sizes or [500, 1000, 2000]
-
-valid_lifts = [v for v in st.session_state["wb_grid_lifts"] if v in GRID_LIFT_OPTIONS]
-
-st.session_state["wb_grid_lifts"] = valid_lifts or [1.5, 2.0, 3.0]
+if isinstance(st.session_state["wb_grid_lifts"], list):
+    st.session_state["wb_grid_lifts"] = ", ".join(str(v) for v in st.session_state["wb_grid_lifts"])
 
 
 
@@ -1682,33 +1696,48 @@ with left:
 
             g1, g2 = st.columns(2)
 
-            g1.multiselect(
-
-                "min_sample_size values",
-
-                GRID_SIZE_OPTIONS,
-
+            g1.text_input(
+                f"min_sample_size values (comma-separated, {GRID_SIZE_RANGE[0]}-{GRID_SIZE_RANGE[1]})",
                 key="wb_grid_sizes",
-
+                placeholder="e.g. 500, 1000, 2000, 5000",
             )
 
-            g2.multiselect(
-
-                "min_lift values",
-
-                GRID_LIFT_OPTIONS,
-
+            g2.text_input(
+                f"min_lift values (comma-separated, {GRID_LIFT_RANGE[0]}-{GRID_LIFT_RANGE[1]})",
                 key="wb_grid_lifts",
-
+                placeholder="e.g. 1.5, 2.0, 3.0",
             )
 
-            sizes = st.session_state.get("wb_grid_sizes") or []
+            sizes_str = str(st.session_state.get("wb_grid_sizes") or "")
+            lifts_str = str(st.session_state.get("wb_grid_lifts") or "")
 
-            lifts = st.session_state.get("wb_grid_lifts") or []
+            sizes = []
+            for v in sizes_str.split(","):
+                v = v.strip()
+                if v:
+                    try:
+                        val = int(v)
+                        if GRID_SIZE_RANGE[0] <= val <= GRID_SIZE_RANGE[1]:
+                            sizes.append(val)
+                    except ValueError:
+                        pass
+
+            lifts = []
+            for v in lifts_str.split(","):
+                v = v.strip()
+                if v:
+                    try:
+                        val = float(v)
+                        if GRID_LIFT_RANGE[0] <= val <= GRID_LIFT_RANGE[1]:
+                            lifts.append(val)
+                    except ValueError:
+                        pass
 
             combos = max(1, len(sizes)) * max(1, len(lifts))
-
-            st.caption(f"Evaluating **{combos}** combination(s).")
+            if sizes or lifts:
+                st.caption(f"Evaluating **{combos}** combination(s).")
+            else:
+                st.caption("Enter at least one value for min_sample_size or min_lift.")
 
         else:
 

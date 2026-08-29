@@ -73,6 +73,7 @@ Navigation hub that links to every module.
 
 ### M2 · Workbench
 - Configure the `StrategicSegmentBuilder` (binning method, Apriori pruning thresholds, grid-search settings, max segments, target / primary-key columns). Engine defaults scale with the host (80% RAM, all-but-two cores on a 32 GB / 16-core machine); `memory_limit_gb` and `engine_threads` can cap on constrained hardware.
+- **Grid search vs hard constraints**: when grid search is enabled, the grid values for `min_sample_size` and `min_lift` temporarily override the hard constraints during candidate exploration (the engine uses the minimum grid value to widen the candidate pool). However, the original hard constraints are always enforced as the **final acceptance gate** — a segment must meet the hard constraint to be selected, even if the grid iteration explored a lower threshold. Grid values below the hard constraint expand the search space but never lower the floor.
 - Save and load configurations and preview before running.
 
 ### M3 · Execution Console

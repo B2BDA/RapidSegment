@@ -16,6 +16,9 @@
 
 [30 Second Promo](https://github.com/user-attachments/assets/fac07334-4e2e-4062-9ced-232833295e54)
 
+## Rapid Segment Interactive Explainer (Must Try)
+[Explainer](https://b2bda.github.io/RapidSegment/)
+
 ---
 
 ## 📖 Table of Contents

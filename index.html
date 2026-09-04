@@ -333,8 +333,8 @@ const RAW_ROWS = [
   { id: 7,  age: 41, income: 62, risk: "high", util: 0.80, default: 1 },
   { id: 8,  age: 44, income: 58, risk: "high", util: 0.66, default: 1 },
   { id: 9,  age: 48, income: 72, risk: "low",  util: 0.22, default: 1 },
-  { id: 10, age: 52, income: 68, risk: "med",  util: 0.49, default: 0 },
-  { id: 11, age: 27, income: 30, risk: "high", util: 0.75, default: 1 },
+  { id: 10, age: 52, income: 68, risk: "high", util: 0.49, default: 0 },
+  { id: 11, age: 27, income: 30, risk: "med", util: 0.75, default: 1 },
   { id: 12, age: 39, income: 51, risk: "low",  util: 0.15, default: 0 },
 ];
 
@@ -360,26 +360,26 @@ const FEATURE_IV = [
 
 const BINS = {
   util: [
-    { label: "util ≤ 0.25", ids: [1, 2, 9, 12], events: 1, n: 4, rate: 0.25 },
-    { label: "0.25 < util ≤ 0.55", ids: [3, 4, 6, 10], events: 1, n: 4, rate: 0.25 },
-    { label: "util > 0.55", ids: [5, 7, 8, 11], events: 4, n: 4, rate: 1.0 },
+    { label: "util ≤ 0.25", events: 1, n: 4, rate: 0.25 },
+    { label: "0.25 < util ≤ 0.55", events: 1, n: 4, rate: 0.25 },
+    { label: "util > 0.55", events: 4, n: 4, rate: 1.0 },
   ],
   risk: [
-    { label: "risk = low", ids: [1, 2, 9, 12], events: 1, n: 4, rate: 0.25 },
-    { label: "risk = med", ids: [3, 4, 6, 10], events: 1, n: 4, rate: 0.25 },
-    { label: "risk = high", ids: [5, 7, 8, 11], events: 4, n: 4, rate: 1.0 },
+    { label: "risk = low", events: 1, n: 4, rate: 0.25 },
+    { label: "risk = med", events: 2, n: 4, rate: 0.5 },
+    { label: "risk = high", events: 3, n: 4, rate: 0.75 },
   ],
   age: [
-    { label: "age ≤ 30", ids: [1, 2, 11], events: 1, n: 3, rate: 0.33 },
-    { label: "30 < age ≤ 40", ids: [3, 4, 5, 6, 12], events: 2, n: 5, rate: 0.4 },
-    { label: "age > 40", ids: [7, 8, 9, 10], events: 3, n: 4, rate: 0.75 },
+    { label: "age ≤ 30", events: 1, n: 3, rate: 0.33 },
+    { label: "30 < age ≤ 40", events: 2, n: 5, rate: 0.4 },
+    { label: "age > 40", events: 3, n: 4, rate: 0.75 },
   ],
 };
 
-// Progressive candidates with distinct KPIs so rate → lift → size has one clear winner
+// Clear KPI ladder: util (100%, 2.0×, n=4) > 2-ways with rate 100% but smaller n > risk (75%)
 const CANDIDATES_1WAY = [
   { id: "1a", rule: "util > 0.55", way: "1-way", n: 4, events: 4, rate: 1.0, lift: 2.0, ok: true },
-  { id: "1b", rule: "risk = high", way: "1-way", n: 4, events: 3, rate: 0.85, lift: 1.7, ok: true },
+  { id: "1b", rule: "risk = high", way: "1-way", n: 4, events: 3, rate: 0.75, lift: 1.5, ok: true },
   { id: "1c", rule: "age > 40", way: "1-way", n: 4, events: 3, rate: 0.75, lift: 1.5, ok: true },
 ];
 const CANDIDATES_2WAY = [
@@ -387,12 +387,12 @@ const CANDIDATES_2WAY = [
   { id: "2b", rule: "util > 0.55 AND age > 40", way: "2-way", n: 2, events: 2, rate: 1.0, lift: 2.0, ok: true },
   { id: "2c", rule: "risk = high AND age > 40", way: "2-way", n: 3, events: 2, rate: 0.67, lift: 1.3, ok: false, reason: "lift too low" },
   { id: "2d", rule: "util > 0.55 AND age ≤ 30", way: "2-way", n: 1, events: 1, rate: 1.0, lift: 2.0, ok: false, reason: "too few rows" },
-  { id: "2e", rule: "risk = high AND age ≤ 30", way: "2-way", n: 1, events: 1, rate: 1.0, lift: 2.0, ok: false, reason: "too few rows" },
-  { id: "2f", rule: "age > 40 AND util ≤ 0.25", way: "2-way", n: 2, events: 0, rate: 0, lift: 0, ok: false, reason: "lift too low" },
+  { id: "2e", rule: "risk = high AND age ≤ 30", way: "2-way", n: 0, events: 0, rate: 0, lift: 0, ok: false, reason: "too few rows" },
+  { id: "2f", rule: "age > 40 AND util ≤ 0.25", way: "2-way", n: 2, events: 1, rate: 0.5, lift: 1.0, ok: false, reason: "lift too low" },
 ];
 const CANDIDATES_3WAY = [
-  { id: "3a", rule: "util > 0.55 AND risk = high AND age > 40", way: "3-way", n: 2, events: 1, rate: 0.5, lift: 1.0, ok: false, reason: "lift too low" },
-  { id: "3b", rule: "util > 0.55 AND risk = high AND age > 30", way: "3-way", n: 2, events: 2, rate: 0.9, lift: 1.8, ok: true },
+  { id: "3a", rule: "util > 0.55 AND risk = high AND age > 40", way: "3-way", n: 2, events: 2, rate: 1.0, lift: 2.0, ok: true },
+  { id: "3b", rule: "util > 0.55 AND risk = high AND age > 30", way: "3-way", n: 3, events: 2, rate: 0.67, lift: 1.3, ok: false, reason: "lift too low" },
 ];
 const CANDIDATES_ALL = [...CANDIDATES_1WAY, ...CANDIDATES_2WAY, ...CANDIDATES_3WAY];
 function rankKey(c) {
@@ -811,7 +811,7 @@ function StepBinning() {
       <div className="table-wrap">
         <table>
           <thead>
-            <tr><th>Bin</th><th>n</th><th>events</th><th>rate</th><th>row ids</th></tr>
+            <tr><th>Bin</th><th>n</th><th>events</th><th>rate</th></tr>
           </thead>
           <tbody>
             {BINS.util.map((b) => (
@@ -820,7 +820,6 @@ function StepBinning() {
                 <td>{b.n}</td>
                 <td>{b.events}</td>
                 <td>{(b.rate * 100).toFixed(0)}%</td>
-                <td style={{ fontFamily: "var(--mono)", fontSize: 11 }}>{b.ids.join(", ")}</td>
               </tr>
             ))}
           </tbody>
@@ -834,7 +833,7 @@ function StepBinning() {
           </thead>
           <tbody>
             {BINS.risk.map((b) => (
-              <tr key={b.label} className={b.rate === 1 ? "highlight" : ""}>
+              <tr key={b.label} className={b.rate >= 0.7 ? "highlight" : ""}>
                 <td><span className="chip">{b.label}</span></td>
                 <td>{b.n}</td>
                 <td>{b.events}</td>
@@ -848,7 +847,7 @@ function StepBinning() {
       <div className="table-wrap">
         <table>
           <thead>
-            <tr><th>Bin</th><th>n</th><th>events</th><th>rate</th><th>row ids</th></tr>
+            <tr><th>Bin</th><th>n</th><th>events</th><th>rate</th></tr>
           </thead>
           <tbody>
             {BINS.age.map((b) => (
@@ -857,16 +856,15 @@ function StepBinning() {
                 <td>{b.n}</td>
                 <td>{b.events}</td>
                 <td>{(b.rate * 100).toFixed(0)}%</td>
-                <td style={{ fontFamily: "var(--mono)", fontSize: 11 }}>{b.ids.join(", ")}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
       <div className="callout info">
-        Top features each get bins: <span className="chip">util</span>,{" "}
-        <span className="chip">risk</span>, <span className="chip">age</span>. Next we combine those
-        bins into 1-way, 2-way, and 3-way rules.
+        <span className="chip">util &gt; 0.55</span> is the strongest bin (100% rate).{" "}
+        <span className="chip">risk = high</span> is weaker (75% rate). Next we build 1-way, 2-way,
+        and 3-way rules from these bins.
       </div>
     </>
   );

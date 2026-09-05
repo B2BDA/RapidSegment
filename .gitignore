@@ -46,6 +46,29 @@ Thumbs.db
 *.png
 *.log
 
+# npm manifests (committed) — re-enable the specific files the repo needs
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.node.json
+
+# Node / npm
+node_modules/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# generated from vite.config.ts by `tsc -b`
+rapidsegment/src/rapidsegment/webui/frontend/vite.config.js
+rapidsegment/src/rapidsegment/webui/frontend/vite.config.d.ts
+
 # Runtime suites / experiments
 experiments/
 .rapidsegment_suite/

@@ -39,7 +39,7 @@ Thumbs.db
 *.duckdb
 *.parquet
 # *.csv
-*.ipynb
+# *.ipynb
 
 # Generated / runtime artifacts
 *.json

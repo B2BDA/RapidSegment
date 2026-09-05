@@ -581,7 +581,7 @@ A: Yes. Both extraction and evaluation treat NULLs consistently – NULL conditi
 A: No. OptBinning drops it during segment creation. If you use `BigQueryFeatureSelector`, that feature’s IV is marked 0 and it is not considered.
 
 **Q: I want to showcase/introduce to my tream for adoption! Are there any deck that I can use?**  
-A: Yes. Please refer to the [business deck](https://github.com/B2BDA/RapidSegment/blob/main/docs/RapidSegment_Business_Deck.pdf)
+A: Yes. Please refer to the [business deck](https://github.com/B2BDA/RapidSegment/blob/main/docs/decks/RapidSegment_Business_Deck.pdf)
 
 ---
 

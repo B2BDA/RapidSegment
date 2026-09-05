@@ -75,7 +75,7 @@ Decision trees and RapidSegment both aim to create interpretable segments, but t
 #### Empirical 1v1: Decision Tree vs RapidSegment
 
 See the full showdown notebook:  
-**[DT vs RS comparison](https://github.com/B2BDA/RapidSegment/blob/main/Examples/compare_segmenters_general.ipynb)**
+**[DT vs RS comparison](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/DT_vs_RS/compare_segmenters_general.ipynb)**
 
 On matched runs with similar population and event capture:
 
@@ -604,6 +604,11 @@ A: No. OptBinning drops it during segment creation. If you use `BigQueryFeatureS
 
 **Q: I want to showcase/introduce to my tream for adoption! Are there any deck that I can use?**  
 A: Yes. Please refer to the [business deck](https://github.com/B2BDA/RapidSegment/blob/main/docs/decks/RapidSegment_Business_Deck.pdf)
+
+**Q: Where can I find example notebooks?**  
+A: Yes. Please refer to the [Example Notebooks](https://github.com/B2BDA/RapidSegment/tree/main/Notebooks/Examples) here.
+
+
 
 ---
 

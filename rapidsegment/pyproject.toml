@@ -37,6 +37,13 @@ ui = [
     "plotly>=5.18,<6.0",
 ]
 
+webui = [
+    "fastapi>=0.109.0,<1.0",
+    "uvicorn[standard]>=0.27.0,<1.0",
+    "pydantic>=2.5.0,<3.0",
+    "starlette>=0.35.0,<1.0",
+]
+
 excel = [
     "openpyxl>=3.1.5,<4.0",
 ]
@@ -49,6 +56,7 @@ prettytable = [
 
 [project.scripts]
 rapidsegment-ui = "rapidsegment.ui.app:run_ui"
+rapidsegment-webui = "rapidsegment.webui.backend.main:run_webui"
 
 [project.urls]
 Homepage = "https://github.com/B2BDA/RapidSegment"

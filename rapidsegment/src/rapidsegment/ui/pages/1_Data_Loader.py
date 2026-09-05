@@ -750,8 +750,19 @@ with tab_target:
         if plabel in display_names:
             default_idx = display_names.index(plabel)
 
-    sel_display = st.selectbox("Target column  (★ = ≤ 2 unique values — likely binary)", display_names, index=default_idx)
+    sel_display = st.selectbox(
+        "Target column  (★ = ≤ 2 unique values — likely binary)",
+        display_names,
+        index=default_idx,
+        key="target_col_select",
+    )
     sel_col = name_map[sel_display]
+
+    # Keep target_col in session state in sync with the selectbox.
+    if "target_col_select" in st.session_state and st.session_state["target_col_select"]:
+        _tc = name_map.get(st.session_state["target_col_select"])
+        if _tc:
+            st.session_state["target_col"] = _tc
 
     if st.button("Validate Target", type="primary"):
         with st.spinner("Validating…"):

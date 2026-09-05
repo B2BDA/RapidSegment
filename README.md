@@ -163,12 +163,34 @@ The exported model retains each `weight` together with `lift`, `response_rate`, 
 
 ## 🖥️ Web UI
 
-RapidSegment also ships a no-code **Streamlit** app that wraps the engine above. Install the UI extra and launch it with one command:
+RapidSegment ships two no-code web apps:
+
+### Streamlit UI
+Install the UI extra and launch it with one command:
 
 ```bash
 pip install "rapidsegment[ui]"
 rapidsegment-ui          # opens http://localhost:8501
 ```
+
+### FastAPI Web UI (React frontend)
+
+**Step 1 — Start the backend:**
+```bash
+pip install "rapidsegment[webui]"
+cd rapidsegment/src/rapidsegment/webui/backend
+python -m uvicorn main:app --reload --port 8000
+```
+
+**Step 2 — Start the frontend (in a separate terminal):**
+```bash
+cd rapidsegment/src/rapidsegment/webui/frontend
+npm install
+npm run dev          # opens http://localhost:5173
+```
+
+The Vite dev server proxies all `/api/*` requests to the backend on port 8000.
+For production, build the frontend with `npm run build` and the server serves the built files automatically.
 
 Full installation, launch, and per-module details are in the [UI guide](https://github.com/B2BDA/RapidSegment/blob/main/docs/UI.md). In short:
 

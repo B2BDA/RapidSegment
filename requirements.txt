@@ -1,9 +1,0 @@
-duckdb>=0.10.0
-pandas>=2.0.0
-pyarrow>=14.0
-ipywidgets>=8.0.0
-rapidsegment[prettytable]
-rapidsegment[gcp]
-rapidsegment[excel]
-streamlit
-plotly

@@ -224,7 +224,7 @@ class StrategicSegmentScore:
         # Compute all 10 deciles in a single table scan using quantile_disc
         quantile_query = f"""
             SELECT QUANTILE_DISC(total_score, [
-                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
+                0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9
             ])
             FROM scored_population
             {filter_clause}

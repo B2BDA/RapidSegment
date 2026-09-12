@@ -238,6 +238,10 @@
       background: rgba(52,211,153,0.1);
     }
     .candidate.rejected { opacity: 0.45; }
+    .candidate.lift-miss {
+      border-color: rgba(251,191,36,0.4);
+      background: rgba(251,191,36,0.06);
+    }
     .candidate .tag {
       position: absolute; top: 10px; right: 10px;
       font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em;
@@ -267,6 +271,14 @@
       border-color: var(--emerald); background: rgba(52,211,153,0.15); color: var(--emerald-dim);
       box-shadow: 0 0 16px var(--emerald-glow);
     }
+    .pipe-node.vol {
+      border-color: var(--sky); background: rgba(56,189,248,0.12); color: var(--sky);
+    }
+    .pipe-node.lift {
+      border-color: var(--amber); background: rgba(251,191,36,0.14); color: var(--amber);
+      box-shadow: 0 0 14px rgba(251,191,36,0.3);
+    }
+    .pipe-node.dim { opacity: 0.55; }
     .pipe-arrow { color: var(--muted); font-family: var(--mono); }
 
     .anim-dots::after {
@@ -386,8 +398,8 @@ const CANDIDATES_2WAY = [
   { id: "2a", rule: "util > 0.55 AND risk = high", way: "2-way", n: 3, events: 3, rate: 1.0, lift: 2.0, ok: true },
   { id: "2b", rule: "util > 0.55 AND age > 40", way: "2-way", n: 2, events: 2, rate: 1.0, lift: 2.0, ok: true },
   { id: "2c", rule: "risk = high AND age > 40", way: "2-way", n: 3, events: 2, rate: 0.67, lift: 1.3, ok: false, reason: "lift too low" },
-  { id: "2d", rule: "util > 0.55 AND age ≤ 30", way: "2-way", n: 1, events: 1, rate: 1.0, lift: 2.0, ok: false, reason: "too few rows" },
-  { id: "2e", rule: "risk = high AND age ≤ 30", way: "2-way", n: 0, events: 0, rate: 0, lift: 0, ok: false, reason: "too few rows" },
+  { id: "2d", rule: "util > 0.55 AND age ≤ 30", way: "2-way", n: 1, events: 1, rate: 1.0, lift: 2.0, ok: false, pruned: true, reason: "too few rows" },
+  { id: "2e", rule: "risk = high AND age ≤ 30", way: "2-way", n: 0, events: 0, rate: 0, lift: 0, ok: false, pruned: true, reason: "too few rows" },
   { id: "2f", rule: "age > 40 AND util ≤ 0.25", way: "2-way", n: 2, events: 1, rate: 0.5, lift: 1.0, ok: false, reason: "lift too low" },
 ];
 const CANDIDATES_3WAY = [
@@ -406,9 +418,11 @@ function cmpRank(a, b) {
   }
   return 0;
 }
-const CANDIDATES_PASSED = CANDIDATES_ALL.filter((c) => c.ok).slice().sort(cmpRank);
-const CHAMPION = CANDIDATES_PASSED[0];
-const CANDIDATES = CANDIDATES_PASSED.map((c, i) => ({ ...c, winner: i === 0 }));
+// Pool = rules that survived growth (rows + events floors only). Lift is NOT a pruning gate here —
+// a rule that misses lift still sits in the pool and is simply not champion.
+const CANDIDATES_POOL = CANDIDATES_ALL.filter((c) => !c.pruned).slice().sort(cmpRank);
+const CHAMPION = CANDIDATES_POOL.find((c) => c.ok);
+const CANDIDATES = CANDIDATES_POOL.map((c) => ({ ...c, winner: c === CHAMPION }));
 
 const SEGMENTS = [
   {
@@ -871,15 +885,38 @@ function StepBinning() {
 }
 
 function CandidateCard({ c, showWinner }) {
+  const state = c.pruned ? "pruned" : !c.ok ? "lift-miss" : "passed";
+  const tagColor =
+    showWinner && c.winner
+      ? "var(--emerald)"
+      : state === "pruned"
+      ? "var(--rose)"
+      : state === "lift-miss"
+      ? "var(--amber)"
+      : "var(--muted)";
+  const tagText =
+    showWinner && c.winner
+      ? "best so far"
+      : state === "pruned"
+      ? "pruned"
+      : state === "lift-miss"
+      ? "misses lift"
+      : "passed";
   return (
-    <div className={"candidate" + (showWinner && c.winner ? " winner" : !c.ok ? " rejected" : "")}>
-      <span
-        className="tag"
-        style={{
-          color: showWinner && c.winner ? "var(--emerald)" : !c.ok ? "var(--rose)" : "var(--muted)",
-        }}
-      >
-        {showWinner && c.winner ? "best so far" : !c.ok ? "failed" : "passed"}
+    <div
+      className={
+        "candidate" +
+        (showWinner && c.winner
+          ? " winner"
+          : state === "pruned"
+          ? " rejected"
+          : state === "lift-miss"
+          ? " lift-miss"
+          : "")
+      }
+    >
+      <span className="tag" style={{ color: tagColor }}>
+        {tagText}
       </span>
       <h4>{c.rule}</h4>
       <div>
@@ -897,8 +934,16 @@ function CandidateCard({ c, showWinner }) {
         <span className="chip">rate={(c.rate * 100).toFixed(0)}%</span>
         <span className="chip green">lift={c.lift.toFixed(1)}×</span>
       </div>
-      {!c.ok && (
-        <div style={{ marginTop: 8, fontSize: 12, color: "var(--rose)" }}>Failed: {c.reason}</div>
+      {state === "pruned" && (
+        <div style={{ marginTop: 8, fontSize: 12, color: "var(--rose)" }}>
+          Failed: {c.reason}
+        </div>
+      )}
+      {state === "lift-miss" && (
+        <div style={{ marginTop: 8, fontSize: 12, color: "var(--amber)" }}>
+          Passes growth floors · misses acceptance lift ({c.lift.toFixed(1)}× &lt; 1.5×) — not
+          pruned, loses at the acceptance check.
+        </div>
       )}
     </div>
   );
@@ -913,6 +958,24 @@ function StepApriori() {
         then triples (3-way) only where the pieces still look viable.
       </p>
 
+      <div className="pipeline" style={{ margin: "6px 0 4px" }}>
+        <span className="pipe-node vol">growth · rows + events</span>
+        <span className="pipe-arrow">→</span>
+        <span className="pipe-node dim">pool</span>
+        <span className="pipe-arrow">→</span>
+        <span className="pipe-node lift">shortlist · rows + lift</span>
+        <span className="pipe-arrow">→</span>
+        <span className="pipe-node dim">rank</span>
+        <span className="pipe-arrow">→</span>
+        <span className="pipe-node lift">raw check · rows + events + lift</span>
+        <span className="pipe-arrow">→</span>
+        <span className="pipe-node on">champion</span>
+      </div>
+      <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 0 }}>
+        Blue nodes = candidate growth (volume floors only — <code>min_lift</code> is not used here).
+        Amber nodes = where <code>min_lift</code> is actually enforced.
+      </p>
+
       <h3 style={{ fontSize: 14, marginTop: 4 }}>1 · One-way rules (each strong bin alone)</h3>
       <div className="candidate-grid">
         {CANDIDATES_1WAY.map((c) => (
@@ -920,8 +983,10 @@ function StepApriori() {
         ))}
       </div>
       <div className="callout">
-        <strong>Hard constraints</strong> (demo floors): min rows ≥ 2, min events ≥ 1, min lift ≥ 1.5×.
-        All three 1-ways pass — so we are allowed to combine these bins further.
+        <strong>Growth floors</strong> (applied at every layer): min rows ≥ 2 · min events ≥ 1.{" "}
+        <strong>Lift is not part of growth</strong> — <code>min_lift = 1.5×</code> is the
+        acceptance floor checked later, at shortlist and raw validation. All three 1-ways clear the
+        growth floors, so their features stay valid and we may combine these bins further.
       </div>
 
       <h3 style={{ fontSize: 14, marginTop: 18 }}>2 · Two-way rules (AND of two bins)</h3>
@@ -931,8 +996,11 @@ function StepApriori() {
         ))}
       </div>
       <div className="callout warn">
-        Some pairs <strong>fail</strong> (too few rows or lift below the floor). Failed pairs are not
-        grown into 3-ways — that keeps the search small.
+        Some pairs <strong>fail</strong> — but it matters <em>why</em>. A pair that never clears the
+        rows / events floor is pruned from 3-way growth (<code className="nowrap">2d</code> n=1,
+        <code className="nowrap">2e</code> n=0). A pair that only misses the <strong>lift</strong> floor
+        (<code className="nowrap">2c</code>, 1.3× &lt; 1.5×) is <em>still</em> grown into 3-ways — lift is an
+        acceptance floor applied after aggregation, not a pruning gate.
       </div>
 
       <h3 style={{ fontSize: 14, marginTop: 18 }}>3 · Three-way rules (only a few survive)</h3>
@@ -942,8 +1010,12 @@ function StepApriori() {
         ))}
       </div>
       <div className="callout info">
-        Because several 2-ways failed, only <strong>1–2</strong> triples are worth checking. Next step:
-        rank every <em>passed</em> candidate (1-, 2-, and 3-way) and pick one champion.
+        Pair validity is tracked per <strong>variable pair</strong>, not per bin: the{" "}
+        <code className="nowrap">risk</code>/<code className="nowrap">age</code> pair cleared the
+        rows / events floor even though <code className="nowrap">2c</code> missed lift — so{" "}
+        <strong>3a</strong> is still grown, and it passes on its own floors. <strong>3b</strong> misses
+        lift (1.3×). Next step: rank every <em>survivor</em> (1-, 2-, and 3-way) and pick one
+        champion.
       </div>
     </>
   );
@@ -951,12 +1023,13 @@ function StepApriori() {
 
 function StepSelect() {
   const champ = CHAMPION;
-  const ranked = CANDIDATES; // already sorted rate → lift → size, winner first
+  const ranked = CANDIDATES; // already sorted rate → lift → size, champion first
   return (
     <>
       <p>
-        Drop candidates that failed the hard floors, then rank every survivor by{" "}
-        <strong>rate → lift → size</strong>. The top row is the champion for this residual.
+        Every rule that survived growth (<strong>rows + events</strong> floors) is ranked by{" "}
+        <strong>rate → lift → size</strong>. The engine then re-checks each rule in that order; the
+        first one that clears all three floors (rows, events, lift) is the champion for this residual.
       </p>
       <div className="kpi-grid">
         <div className="kpi"><div className="label">Min rows</div><div className="value">2*</div></div>
@@ -971,8 +1044,11 @@ function StepSelect() {
         <span className="chip sky">{champ.way}</span>
         <br />
         Clear KPI lead: rate <strong>{(champ.rate * 100).toFixed(0)}%</strong>, lift{" "}
-        <strong>{champ.lift.toFixed(1)}×</strong>, n = <strong>{champ.n}</strong>. Every other passed
-        rule is worse on rate, or on lift, or on size when rate and lift match.
+        <strong>{champ.lift.toFixed(1)}×</strong>, n = <strong>{champ.n}</strong>. Every other rule
+        in the pool ranks lower on rate, or on lift, or on size when rate and lift match. The
+        miss-lift rules (<code className="nowrap">2c</code>, <code className="nowrap">2f</code>,{" "}
+        <code className="nowrap">3b</code>) would be ruled out at the acceptance check — but they sit
+        below #1 anyway.
       </div>
       <div className="table-wrap">
         <table>
@@ -1003,6 +1079,12 @@ function StepSelect() {
             ))}
           </tbody>
         </table>
+      </div>
+      <div className="callout info">
+        The ranked list is the <strong>validation scan order</strong>. The engine re-runs each rule as
+        raw SQL on the actual residual (not the binned view) and the <strong>first rule that clears all
+        three floors</strong> (rows, events, lift) is the champion. Lower rules are only consulted if a
+        higher one fails on the raw data.
       </div>
     </>
   );

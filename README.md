@@ -293,12 +293,15 @@ flowchart TD
 
     I --> J["Validate on residual current_df: COUNT + SUM WHERE sql_filter"]
 
-    J --> K{"Meets min_sample_size, min_events, and min_lift?"}
+    J --> K{"Volume floors (growth): count ≥ min_sample_size AND events ≥ min_events?"}
 
     K -- No --> L["Reject and try next candidate, or stop"]
     L --> C
 
-    K -- Yes --> M["Store segment with actual counts from residual"]
+    K -- Yes --> K2{"Acceptance floor: lift ≥ min_lift?"}
+
+    K2 -- No --> L
+    K2 -- Yes --> M["Store segment with actual counts from residual"]
 
     M --> N["Update feature usage tracker"]
 
@@ -349,13 +352,13 @@ The engine evaluates combinations in a layered fashion:
 
 ```mermaid
 flowchart LR
-    A[Top 20 Features] --> B[1‑Way Checks]
-    B -->|Only successful features| C[2‑Way Combinations]
-    C -->|Only pairs that passed| D[3‑Way Combinations]
+    A[Top-N Features<br/>top_n_vars] --> B[1‑Way Checks]
+    B -->|Only features with bins clearing volume floors| C[2‑Way Combinations]
+    C -->|Only variable pairs that cleared volume floors| D[3‑Way Combinations]
     D --> E[Final Candidate Rules]
 ```
 
-If a 1‑way rule fails the thresholds, all higher‑order combinations containing that feature are pruned – drastically reducing the search space.
+The pruning trigger at each layer is **volume only** — a rule clears the floor when `count ≥ min_sample_size` **and** `events ≥ min_events`. `min_lift` is deliberately **not** part of pruning: it is a hard *acceptance* floor applied to candidate rules afterwards, at the grid shortlist and the final raw-SQL validation (see [How 1-Way → 2-Way → 3-Way Segment Search Works](#how-1-way--2-way--3-way-segment-search-works)). A feature leaves the search only when **none of its bins** clears the volume floors. That keeps the search small while still allowing a 3-way rule to carry more lift than any of the parts it was grown from.
 
 ## How 1-Way → 2-Way → 3-Way Segment Search Works
  
@@ -363,34 +366,34 @@ RapidSegment builds candidate segments in layers: it tests single features first
  
 ### Worked example — from 1-way to 3-way on real-looking data
  
-Say the target is `churned` (1 = customer left), the overall base rate is **20%** (2,000 of 10,000 customers churned), `min_lift = 1.5`, and `min_sample_size = 300`. Three binned features are in play: `tenure_bin`, `plan_type`, `support_tickets_bin`.
+Say the target is `churned` (1 = customer left), the overall base rate is **20%** (2,000 of 10,000 customers churned), and the floors are `min_sample_size = 300`, `min_events = 30`, `min_lift = 1.5`. Three binned features are in play: `tenure_bin`, `plan_type`, `support_tickets_bin`.
  
 #### Step 1 — 1-way: test each bin of each feature alone
  
-Every individual bin is checked against the base rate. A rule only survives if its `count ≥ min_sample_size` and `lift ≥ min_lift` (`lift = segment_rate / base_rate`):
+Every individual bin is checked against the base rate. To **survive the pruning gate** a rule must clear the *volume* floors — `count ≥ min_sample_size` **and** `events ≥ min_events`. Rows and events are anti‑monotone (adding a condition can only shrink the population), so pruning on them is safe. `lift = segment_rate / base_rate` is a separate **acceptance** floor (`min_lift`) applied later — surviving the pruning gate does not by itself make a rule a segment:
+
+| Rule (1-way) | Count | Churn rate | Lift | Pruning gate (count+events) | Accepted as segment (lift)? |
+|---|---|---|---|:---:|:---:|
+| `tenure_bin = [0-3mo]` | 1,200 | 42% | 2.1x | ✅ count 1,200 ≥ 300, events ≥ 30 | ✅ |
+| `plan_type = [Basic]` | 900 | 35% | 1.75x | ✅ count 900 ≥ 300, events ≥ 30 | ✅ |
+| `support_tickets_bin = [3+]` | 600 | 55% | 2.75x | ✅ count 600 ≥ 300, events ≥ 30 | ✅ |
+| `plan_type = [Premium]` | 800 | 8% | 0.4x | ✅ count 800 ≥ 300, events ≥ 30 | ❌ lift 0.4x < 1.5 (protective, not risky) |
+| `tenure_bin = [12mo+]` | 3,000 | 6% | 0.3x | ✅ count 3,000 ≥ 300, events ≥ 30 | ❌ lift 0.3x < 1.5 |
  
-| Rule (1-way) | Count | Churn rate | Lift | Survives? |
-|---|---|---|---|:---:|
-| `tenure_bin = [0-3mo]` | 1,200 | 42% | 2.1x | ✅ |
-| `plan_type = [Basic]` | 900 | 35% | 1.75x | ✅ |
-| `support_tickets_bin = [3+]` | 600 | 55% | 2.75x | ✅ |
-| `plan_type = [Premium]` | 800 | 8% | 0.4x | ❌ (below 1.0, protective not risky) |
-| `tenure_bin = [12mo+]` | 3,000 | 6% | 0.3x | ❌ |
- 
-Only bins that pass move forward. Say the survivors are `{[0-3mo], [Basic], [3+ tickets]}` — call them **A**, **B**, **C** for short. Anything that failed (like `[Premium]` or `[12mo+]`) is now completely dropped: it will never be tried in any pair or triplet, because pairing a bad bin with anything can't undo the fact that alone it wasn't predictive enough at the volume required.
+Every bin above clears the volume gate, so all three features (`tenure_bin`, `plan_type`, `support_tickets_bin`) stay in the search. Only `[0-3mo]`, `[Basic]`, and `[3+ tickets]` — call them **A**, **B**, **C** for short — also clear the 1‑way lift floor. The bins that failed lift (`[Premium]`, `[12mo+]`) are **not** dropped from the search: Apriori pruning here works per **feature**, never per bin. Those bin values are still aggregated into later 2‑way / 3‑way combinations and must themselves clear the volume floors and the lift floor to be accepted — but an individual 1‑way lift shortfall never prunes the feature.
  
 #### Step 2 — 2-way: pair up only the survivors
  
 With 3 survivors there are `C(3,2) = 3` possible pairs: `A+B`, `A+C`, `B+C`. Each pair is aggregated as its own joint segment:
  
-| Rule (2-way) | Count | Churn rate | Lift | Survives? |
-|---|---|---|---|:---:|
-| `A+B` = `[0-3mo] AND [Basic]` | 420 | 51% | 2.55x | ✅ |
-| `A+C` = `[0-3mo] AND [3+ tickets]` | 310 | 58% | 2.9x | ✅ |
-| `B+C` = `[Basic] AND [3+ tickets]` | 180 | 60% | 3.0x | ❌ — count 180 < min_sample_size 300 |
+| Rule (2-way) | Count | Churn rate | Lift | Passes volume gate? | Meets lift floor? |
+|---|---|---|---|:---:|:---:|
+| `A+B` = `[0-3mo] AND [Basic]` | 420 | 51% | 2.55x | ✅ | ✅ |
+| `A+C` = `[0-3mo] AND [3+ tickets]` | 310 | 58% | 2.9x | ✅ | ✅ |
+| `B+C` = `[Basic] AND [3+ tickets]` | 180 | 60% | 3.0x | ❌ — count 180 < min_sample_size 300 | — |
  
-Notice `B+C` actually has the *highest* churn rate and lift of the three pairs — but it's still rejected, because too few customers (180) fall into that exact overlap to trust the number. This is the key trade-off: **survival is about count AND lift together, not lift alone.**
- 
+Notice `B+C` actually has the *highest* churn rate and lift of the three pairs — but it's still rejected, because too few customers (180) fall into that exact overlap to trust the number. This is the key trade-off inside the volume gate: **a rule can fail pruning on count alone, even with the best lift in the room.** `B+C` is pruned before `min_lift` even gets a say.
+
 Survivors: `valid_2way_sets = { {A,B}, {A,C} }`.
  
 #### Step 3 — 3-way: only try triplets where every pair inside them already passed
@@ -404,15 +407,18 @@ With 3 bins there's only one possible triplet: `A+B+C`. Before RapidSegment even
 | `{B,C}` | ❌ (rejected in Step 2 for low count) |
  
 Because `{B,C}` never passed, the triplet `A+B+C` is **skipped entirely** — it is never even aggregated, no matter how strong its true joint churn rate might be. This is the pruning payoff: instead of testing every possible triplet from scratch, the engine only tests triplets whose *every* pairwise sub-relationship already proved itself statistically solid on its own.
+
+> **Granularity note:** the engine keys `valid_2way_sets` on **variable pairs**, not bin pairs. A variable pair qualifies for 3-way growth as soon as *any* joint bin combination of those two variables clears the volume floors. In this example `plan_type` and `tenure_bin` qualify (their `A+B` overlap passes), while `tenure_bin` and `support_tickets_bin` never produce a passing overlap (the `B+C` case at 180 rows), so the triplet isn't grown. The story above shows that same idea at bin-pair level for readability.
  
 ### Why prune this way instead of just testing every triplet directly?
  
 - **Speed:** with `top_n_vars = 15`, testing all triplets directly is `C(15,3) = 455` SQL aggregations. Pruning by pairwise survival first can cut that dramatically, since most triplets get eliminated before ever touching the data.
 - **The cost:** a genuinely strong 3-way interaction can be missed if one of its underlying pairs happened to fall just under `min_sample_size` (as `{B,C}` did above at count 180) — even if the full triplet would have had a healthy count. This is the same trade-off classic Apriori pruning makes in market-basket analysis: cheap, scalable, but not exhaustive.
+- **Why not prune on `min_lift` too?** Because lift can *rise* when you add a condition — a 3-way can beat every pair it was grown from. Pruning on lift would throw away exactly those strong interactions. Rows and events never rise when a rule narrows, so they're what pruning uses; `min_lift` is applied only afterward, as an acceptance check (grid shortlist + final raw validation).
 ---
 
 ### 3. Grid Search
-For each iteration, the engine sweeps over a user‑defined grid of `(min_sample_size, min_lift)` values. Each grid point produces a candidate champion. After all grid points are evaluated, the global champion is chosen by sorting on `(lift, count, rate)`.
+For each iteration, the engine sweeps over a user‑defined grid of `(min_sample_size, min_lift)` values. Each grid point keeps the rules that clear its `count` and `lift` floors, and the top rule for that config (by `sort_priority`) becomes a candidate champion. The champions are ordered and the first to pass the raw‑residual validation (next section) becomes the iteration's champion.
 
 ### 4. Champion Validation & Extraction
 The champion’s SQL filter is validated against the **raw residual** to ensure it meets the absolute hard constraints. Only then is it accepted.

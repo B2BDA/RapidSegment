@@ -409,7 +409,7 @@ With 3 bins there's only one possible triplet: `A+B+C`. Before RapidSegment even
 Because `{B,C}` never passed, the triplet `A+B+C` is **skipped entirely** — it is never even aggregated, no matter how strong its true joint churn rate might be. This is the pruning payoff: instead of testing every possible triplet from scratch, the engine only tests triplets whose *every* pairwise sub-relationship already proved itself statistically solid on its own.
 
 > **Granularity note:** the engine keys `valid_2way_sets` on **variable pairs**, not bin pairs. A variable pair qualifies for 3-way growth as soon as *any* joint bin combination of those two variables clears the volume floors. In this example `plan_type` and `tenure_bin` qualify (their `A+B` overlap passes), while `tenure_bin` and `support_tickets_bin` never produce a passing overlap (the `B+C` case at 180 rows), so the triplet isn't grown. The story above shows that same idea at bin-pair level for readability.
-
+ 
 ### Why prune this way instead of just testing every triplet directly?
  
 - **Speed:** with `top_n_vars = 15`, testing all triplets directly is `C(15,3) = 455` SQL aggregations. Pruning by pairwise survival first can cut that dramatically, since most triplets get eliminated before ever touching the data.
@@ -616,6 +616,7 @@ Special Thanks to Mr. [Guillermo Navas Palencia](https://github.com/guillermo-na
 
 _Independent, open‑source, and ready for production._
 ```
+
 
 
 

@@ -163,7 +163,7 @@ The exported model retains each `weight` together with `lift`, `response_rate`, 
 
 ### DuckDB‑Native / Large‑File Quick Start
 
-Refer Examples: [Handling Large Data](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example3_Big_Data.ipynb) · [Persistent DuckDB Storage (chained `persist_db` way)](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example4_Persist_DB.ipynb)
+Refer Examples: [Handling Large Data](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example3_Big_Data.ipynb)
 
 For files too big for comfortable in‑memory loading — or when you already keep data in DuckDB — stream straight into a `.duckdb` file and let every engine stage read it zero-copy from disk:
 
@@ -585,6 +585,8 @@ By default RapidSegment materialises the residual workspace into a DuckDB file d
 | Scorer | Pass `db_path=b.db_path` (or a path to a file that already contains table `df`) so scoring does not create a separate CWD `score_experiment_*.db`. |
 
 **How to use** — prefer the context manager so cleanup is automatic:
+
+Example Notebook: [Persist DB Usage](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example4_Persist_DB.ipynb)
 
 ```python
 from rapidsegment import StrategicSegmentBuilder, StrategicSegmentScore

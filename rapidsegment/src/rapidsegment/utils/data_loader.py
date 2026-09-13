@@ -4,8 +4,8 @@ Unified Data Ingestion Layer
 Multi‑format data loader supporting Local Files (CSV, Parquet, Arrow, Excel),
 In‑Memory PyArrow Tables, and Google Cloud BigQuery Storage API streams.
 
-Author: Bishwarup Biswas + Gemini + DeepSeek
-Python Version: 3.9+
+Author: Bishwarup Biswas
+Python Version: 3.11+
 """
 
 import logging

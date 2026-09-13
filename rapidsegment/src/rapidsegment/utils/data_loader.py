@@ -11,6 +11,8 @@ Python Version: 3.9+
 import logging
 import os
 import re
+import tempfile
+import uuid
 from typing import Any, Optional, Union
 
 import duckdb
@@ -331,9 +333,10 @@ class UniversalDataLoader:
         ``UniversalDataLoader(file_path=...).load()`` and pass the result as ``data=``.
 
         Args:
-            db_path: REQUIRED. Database name or file path to write to. A ``.duckdb``
+            db_path: Optional. Database name or file path to write to. A ``.duckdb``
                 extension is appended automatically when missing and the parent
-                directory is created as needed.
+                directory is created as needed. When omitted, a unique database is
+                auto-created under the system temp directory.
             path: Source file path (overrides the constructor's ``file_path`` when
                 both are set).
             encoding: Optional encoding hint ("Latin-1" is honored for CSV/TSV).
@@ -359,10 +362,11 @@ class UniversalDataLoader:
             >>> scorer.calculate_and_export_weights(out, "w.json")  # reads view 'df'
         """
         if not db_path:
-            raise ValueError(
-                "db_path (database name / file path) is required, e.g. "
-                "UniversalDataLoader(file_path='data.csv').stream_to_duckdb('data.duckdb')."
+            unique_id = uuid.uuid4().hex[:8]
+            db_path = os.path.join(
+                tempfile.gettempdir(), f"rapidsegment_udl_{unique_id}.duckdb"
             )
+            logger.info(f"🗄️ No db_path given — created default database at: {db_path}")
         table_name = self._validate_identifier(table_name, "table_name")
         if scorer_view_name:
             scorer_view_name = self._validate_identifier(

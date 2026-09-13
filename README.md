@@ -644,7 +644,8 @@ A: Yes. Please refer to the [business deck](https://github.com/B2BDA/RapidSegmen
 **Q: Where can I find example notebooks?**  
 A: Yes. Please refer to the [Example Notebooks](https://github.com/B2BDA/RapidSegment/tree/main/Notebooks/Examples) here.
 
-
+**Q: I have more technical questions, where can I find some answers?**  
+A: Yes. Please refer to the [Q&A](https://github.com/B2BDA/RapidSegment/blob/main/Q%26A.md) here.
 
 ---
 

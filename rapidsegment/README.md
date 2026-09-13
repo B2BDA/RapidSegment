@@ -163,7 +163,7 @@ The exported model retains each `weight` together with `lift`, `response_rate`, 
 
 ### DuckDB‑Native / Large‑File Quick Start
 
-Refer Example: [Handling Large Data](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example3_Big_Data.ipynb)
+Refer Examples: [Handling Large Data](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example3_Big_Data.ipynb) · [Persistent DuckDB Storage (chained `persist_db` way)](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example4_Persist_DB.ipynb)
 
 For files too big for comfortable in‑memory loading — or when you already keep data in DuckDB — stream straight into a `.duckdb` file and let every engine stage read it zero-copy from disk:
 

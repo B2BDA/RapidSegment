@@ -342,9 +342,11 @@ class UniversalDataLoader:
             encoding: Optional encoding hint ("Latin-1" is honored for CSV/TSV).
             data: In-memory source object (PyArrow Table, pandas DataFrame, or any
                 DuckDB-registrable relation) used instead of a file.
-            table_name: Name of the persisted data table (default 'udl_data' — the
-                name `StrategicSegmentBuilder.extract_segments` and
-                `evaluate_final_coverage` expect when handed a file path).
+            table_name: Name of the persisted data table (default 'udl_data'). A
+                custom name is fine — a ``udl_data`` view is always added as an
+                alias, so `StrategicSegmentBuilder.extract_segments` and
+                `evaluate_final_coverage` keep working when handed the returned
+                path (both resolve 'udl_data' by that fixed name).
             scorer_view_name: Optional view name aliasing the data table so
                 `StrategicSegmentScore.calculate_and_export_weights` can consume
                 the same file (default 'df'). Pass None/'' to skip creating it.
@@ -357,9 +359,9 @@ class UniversalDataLoader:
         Examples:
             >>> from rapidsegment.utils.data_loader import UniversalDataLoader
             >>> out = UniversalDataLoader(file_path="bank_train.csv").stream_to_duckdb("bank_data")
-            >>> builder.extract_segments(out)          # reads table 'udl_data'
-            >>> builder.evaluate_final_coverage(out)   # reads table 'udl_data'
-            >>> scorer.calculate_and_export_weights(out, "w.json")  # reads view 'df'
+            >>> builder.extract_segments(out)          # reads table/view 'udl_data'
+            >>> builder.evaluate_final_coverage(out)   # reads table/view 'udl_data'
+            >>> scorer.calculate_and_export_weights(out, "w.json")  # reads table/view 'df'
         """
         if not db_path:
             unique_id = uuid.uuid4().hex[:8]
@@ -446,7 +448,16 @@ class UniversalDataLoader:
                 )
             # float64 convention, memory-light (on-disk ALTER per numeric column)
             self._cast_numeric_columns_to_double(con, table_name)
-            if scorer_view_name:
+            # Engine-compatibility aliases: keep a `udl_data` view (builder /
+            # evaluator resolve it by that fixed name) and a `df` view (scorer).
+            # Views are catalog metadata only — a few bytes, never a data copy.
+            engine_base = "udl_data"
+            if table_name != engine_base:
+                self._drop_object_if_exists(con, engine_base)
+                con.execute(
+                    f'CREATE VIEW "{engine_base}" AS SELECT * FROM "{table_name}"'
+                )
+            if scorer_view_name and scorer_view_name != table_name:
                 self._drop_object_if_exists(con, scorer_view_name)
                 con.execute(
                     f'CREATE VIEW "{scorer_view_name}" AS SELECT * FROM "{table_name}"'

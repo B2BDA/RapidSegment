@@ -121,7 +121,7 @@ class StrategicSegmentScore:
         # ---------------------------------------------------------------------
         agg_expressions = [
             f'COUNT(CASE WHEN "{col}" = 1 THEN 1 END) AS "{col}_cnt", '
-            f'SUM(CASE WHEN "{col}" = 1 THEN "{self.target_col}" ELSE 0 END) AS "{col}_ev"'
+            f'SUM(CAST(CASE WHEN "{col}" = 1 THEN "{self.target_col}" ELSE 0 END AS DOUBLE)) AS "{col}_ev"'
             for col in self.segment_cols
         ]
 

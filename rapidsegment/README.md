@@ -45,7 +45,7 @@
 - **⚡ Hyper‑Efficient & Out-of-Core** – Leverages **DuckDB** (disk-backed by default) for vectorised SQL aggregations; spills to disk so large datasets fit in limited RAM.
 - **🔋 Single Data Artifact (opt-in)** – With `persist_db=True`, extraction keeps one DuckDB file for evaluate / health / score reuse; residual rows are flagged in place (`__rs_excluded`) instead of rewriting the full table each iteration.
 - **📉 Two-Phase Binning** – Fits IV ranking across all eligible features, then materialises full-length bin-label arrays only for `top_n_vars`, bounding peak Python memory.
-- **📁 Zero-Copy File Path** – Pass a path to an existing DuckDB file (table `udl_data` for the builder, `df` for the scorer) so data never has to be pulled into a Python frame.
+- **📁 DuckDB‑Native Ingestion & Zero-Copy Path** – `UniversalDataLoader.stream_to_duckdb()` writes any source (local file, in-memory object, BigQuery) straight into a `.duckdb` file and returns its path; `extract_segments`, `evaluate_final_coverage`, and `calculate_and_export_weights` then consume it zero-copy (table `udl_data` for the builder, `df`/named table for the scorer) — no Python frame ever materialised.
 - **☁️ BigQuery Ready** – Optional feature screening runs natively inside Google BigQuery, downloading only the most predictive columns.
 - **📦 Production‑Ready Outputs** – Exports pure ANSI SQL filters and a JSON scorecard with decile thresholds, ready for deployment.
 - **📊 Transparent Weighting** – Uses the segment response rate to compute intuitive integer weights, while retaining lift, response rate, and capture rate for each segment.
@@ -161,6 +161,45 @@ print("Deciles:", model["decile_min_thresholds"])
 `sort_priority` controls how candidate segments are ranked during extraction.
 The exported model retains each `weight` together with `lift`, `response_rate`, and `capture_rate` for auditability.
 
+### DuckDB‑Native / Large‑File Quick Start
+
+Refer Example: [Handling Large Data](https://github.com/B2BDA/RapidSegment/blob/main/Notebooks/Examples/Example3_Big_Data.ipynb)
+
+For files too big for comfortable in‑memory loading — or when you already keep data in DuckDB — stream straight into a `.duckdb` file and let every engine stage read it zero-copy from disk:
+
+```python
+import duckdb
+from rapidsegment import StrategicSegmentBuilder, StrategicSegmentScore
+from rapidsegment.utils.data_loader import UniversalDataLoader
+
+# 1. Stream any source into a .duckdb file (db_path is optional -> auto temp path)
+out = UniversalDataLoader(file_path="bank_train.csv").stream_to_duckdb("bank_data")
+# out == absolute path; the file now holds table `udl_data` plus a `df` view
+
+# 2. Extract segments straight off the file (builder db_path must differ / be None)
+builder = StrategicSegmentBuilder(target="target_col", db_path=None)
+segments = builder.extract_segments(out)            # reads udl_data, zero-copy
+builder.evaluate_final_coverage(out)
+
+# 3. Prepare a scored table inside the same database...
+con = duckdb.connect(out)
+con.execute("""
+    CREATE OR REPLACE TABLE predicted AS SELECT
+        id, target,
+        (age > 45)::INTEGER         AS seg_1,
+        (region = 'east')::INTEGER  AS seg_2
+    FROM udl_data
+""")
+con.close()                                          # close before the scorer attaches
+
+# 4. ...and point the scorer at it by name
+scorer = StrategicSegmentScore("target_col", "id", ["seg_1", "seg_2"])
+model = scorer.calculate_and_export_weights(out, "model.json", table_name="predicted")
+
+# 5. Any DuckDB table -> PyArrow for ad-hoc analysis
+arrow = UniversalDataLoader.duckdb_to_arrow(out, table_name="predicted")
+```
+
 ## 🖥️ Web UI
 
 RapidSegment ships a no-code web app:
@@ -207,8 +246,14 @@ flowchart LR
 | **`UniversalDataLoader`** | Ingests CSV, Parquet, Excel, Arrow, and BigQuery tables into PyArrow tables. |
 
 ### 📥 `UniversalDataLoader`
-- **Purpose**: Ingests data from multiple sources and normalises it into a PyArrow Table.
-- **Supports**: CSV, Parquet, Arrow/Feather, Excel, and BigQuery (via streaming).
+- **Purpose**: Ingests data from multiple sources and normalises it into a PyArrow Table — or streams it straight into a persisted DuckDB database file.
+- **Supports**: CSV/TSV, Parquet, Arrow/Feather (DuckDB on-disk streaming), Excel, and BigQuery.
+- **`stream_to_duckdb(db_path=None, path=..., data=..., table_name="udl_data")`**
+  - Streams any source (a local file via `path=` or the constructor's `file_path=`, an in-memory `data=` object, or BigQuery identifiers) directly into a `.duckdb` file — memory-light for multi-GB files.
+  - `db_path` is optional: omit it and a unique `rapidsegment_udl_*.duckdb` is auto-created under the system temp dir. A `.duckdb` extension is appended automatically and the parent directory is created as needed.
+  - Returns the **absolute path**, usable directly by `extract_segments`, `evaluate_final_coverage`, and `calculate_and_export_weights`.
+  - Writes the data table (default `udl_data`) plus lightweight `udl_data`/`df` view aliases so the builder, evaluator, and scorer all find what they expect regardless of `table_name`; numeric columns are cast to `float64` (`DOUBLE`) on-disk.
+- **`duckdb_to_arrow(db, table_name="udl_data")`**: reads any table/view from a DuckDB file (or an open `duckdb` connection) back into a PyArrow Table.
 - **Key Benefit**: Automatically casts numeric columns to `float64` for consistent precision downstream.
 
 ### 🔍 `StrategicSegmentBuilder`
@@ -224,6 +269,7 @@ flowchart LR
 - **Weighting**: Uses the segment response rate rounded to an integer weight.
 - **Output**: A JSON artifact with model metadata, per-segment weights, and decile cutoffs.
 - **Active population handling**: Baseline customers with a zero total score are excluded from decile calibration so thresholds are derived from the active scored population.
+- **Input table**: Reads the table named by `table_name` (default `df`) from the DuckDB file you pass — build your scored table (e.g. `predicted`) inside the database and point the scorer at it with `table_name="predicted"`.
 
 ### ☁️ `BigQueryFeatureSelector`
 - **Purpose**: Screens hundreds of features directly inside Google BigQuery using IV and variance filters.
@@ -234,7 +280,7 @@ flowchart LR
 
 | Component | Primary Role | Key Output | Data Format |
 |-----------|--------------|------------|-------------|
-| `UniversalDataLoader` | Ingestion | PyArrow Table | CSV, Parquet, Excel, Arrow, BQ |
+| `UniversalDataLoader` | Ingestion / streaming | `.duckdb` path (`udl_data` + `df`) or PyArrow Table | CSV, Parquet, Excel, Arrow, BQ, DuckDB |
 | `StrategicSegmentBuilder` | Rule Discovery | Segment SQL + Metrics | List of dicts |
 | `StrategicSegmentScore` | Scorecard Compilation | JSON Model | JSON file |
 | `BigQueryFeatureSelector` | Feature Screening | Filtered Feature List | DuckDB relation |
@@ -512,13 +558,14 @@ Scores are computed as the sum of weights for all segments a customer triggers. 
 | `primary_key` | `str` | **Required** | Unique row identifier. |
 | `segment_cols` | `list` | **Required** | List of binary segment flag columns. |
 
-`calculate_and_export_weights(data, export_path=..., db_path=None)`:
+`calculate_and_export_weights(data, export_path=..., db_path=None, table_name="df")`:
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `data` | any / `str` | **Required** | Frame/table, or path to a DuckDB file containing table `df` (zero-copy attach). |
+| `data` | any / `str` | **Required** | Frame/table, or path to a DuckDB file containing the table named by `table_name` (zero-copy attach). |
 | `export_path` | `str` | timestamped JSON | Path for the model artifact. |
-| `db_path` | `str` | `None` | Optional shared DuckDB file (e.g. the builder’s `db_path`). If omitted, a unique temp DB under the system temp dir is created and removed after export. |
+| `db_path` | `str` | `None` | Optional shared DuckDB file (e.g. the builder’s `db_path`). If omitted, a unique temp DB under the system temp dir is created. Caller-supplied files are never deleted. |
+| `table_name` | `str` | `"df"` | Table or view to score from the DuckDB file given by `data` — any valid identifier, e.g. `"predicted"` after preparing a scored table inside your database |
 
 **Export** – JSON artifact with `model_metadata`, `segment_weights`, and `decile_min_thresholds`.
 

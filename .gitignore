@@ -38,6 +38,7 @@ Thumbs.db
 *.db.wal
 *.duckdb
 *.parquet
+data
 # *.csv
 # *.ipynb
 

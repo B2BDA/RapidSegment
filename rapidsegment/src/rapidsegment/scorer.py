@@ -11,6 +11,7 @@ Python Version: 3.11+
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from datetime import datetime
@@ -60,22 +61,36 @@ class StrategicSegmentScore:
         data: Any,
         export_path: str = f"scored_experiment_{timestamp}.json",
         db_path: Optional[str] = None,
+        table_name: str = "df",
     ) -> Dict[str, Any]:
         """
         Calculates harmonic weights and derives decile boundaries via vectorised execution.
 
         Args:
-            data: Input data (will be loaded into DuckDB).
+            data: Input data. Either the path to a DuckDB database file containing
+                ``table_name`` (zero-copy ATTACH), or any DuckDB-registrable object
+                (pandas DataFrame, PyArrow Table, duckdb Relation, ...).
             export_path: File path to save the model artifact JSON.
-            db_path: Optional path to a persistent DuckDB file/connection to reuse as the
-                single data artifact (e.g. the builder's ``db_path``). When omitted, a
-                temporary file-backed DB is created under the system temp dir and removed
-                after the run, avoiding CWD pollution.
+            db_path: Optional path to a persistent DuckDB file/connection to reuse
+                as the single data artifact (e.g. the builder's ``db_path``). When
+                omitted, a temporary file-backed DB is created under the system
+                temp dir and removed after the run, avoiding CWD pollution.
+            table_name: Table or view to read from the file handed in ``data``
+                (default 'df'). Point it at any table you prepared, e.g.
+                `table_name='predicted'` after creating a scored table named
+                'predicted' inside the database.
 
         Returns:
             Dictionary containing model metadata, segment weights, and decile thresholds.
         """
         logger.info("🚀 Initialising out‑of‑core DuckDB scorecard engine...")
+
+        if not isinstance(table_name, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", table_name
+        ):
+            raise ValueError(
+                f"table_name must be a valid SQL identifier; got {table_name!r}"
+            )
 
         # Use file‑backed storage for large datasets. Reuse a caller-supplied DB when
         # provided; otherwise create a unique temp file and clean it up afterwards so we
@@ -86,7 +101,7 @@ class StrategicSegmentScore:
             db_path = os.path.join(
                 tempfile.gettempdir(), f"rapidsegment_score_{unique_id}.duckdb"
             )
-        if os.path.exists(db_path):
+        if own_db and os.path.exists(db_path):
             os.remove(db_path)
         ctx = duckdb.connect(db_path)
         if isinstance(data, str):
@@ -95,7 +110,9 @@ class StrategicSegmentScore:
             # Attach it read-only instead of materialising it into Python.
             src_path = data.replace("\\", "/")
             ctx.execute(f"ATTACH '{src_path}' AS __rs_src (READ_ONLY)")
-            ctx.execute("CREATE OR REPLACE TABLE df AS SELECT * FROM __rs_src.df")
+            ctx.execute(
+                f'CREATE OR REPLACE TABLE df AS SELECT * FROM __rs_src."{table_name}"'
+            )
         else:
             ctx.execute("CREATE OR REPLACE TABLE df AS SELECT * FROM data")
 

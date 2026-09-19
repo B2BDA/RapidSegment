@@ -658,7 +658,7 @@ For major changes, please discuss them first via an issue.
 
 ## 📄 License
 
-This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License – see the [LICENSE](https://github.com/B2BDA/RapidSegment/blob/main/rapidsegment/LICENSE) file for details.
 
 ---
 **Built with ❤️ by Bishwarup Biswas**  

@@ -174,7 +174,7 @@ def clone_to_workbench(exp_id):
 
 def view_results(exp_id):
     st.session_state["m4_view_exp"] = exp_id
-    st.success("Open **Module 4 · Results Dashboard** → choose 'View a saved run'.")
+    st.switch_page("pages/4_Results_Dashboard.py")  # Redirect to Results Dashboard
 
 
 def export_run(exp_id):

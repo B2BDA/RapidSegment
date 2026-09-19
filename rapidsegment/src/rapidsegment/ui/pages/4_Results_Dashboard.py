@@ -113,8 +113,62 @@ def fmt_duration(secs):
 
 
 # ── Experiment loading ───────────────────────────────────────────────────────
+def _build_exp_from_row(row):
+    """Build an experiment dict from a suite_data.db row.
+
+    Shared by the saved-run loader and the latest-run fallback.
+    """
+    (
+        exp_id, name, created_at, data_rows, data_cols, status,
+        execution_time_sec, target_col, primary_key, builder_params,
+        segments_count, avg_lift, max_lift, coverage_pct, baseline_rate, error_msg,
+    ) = row
+    cfg = _jsonable(json.loads(builder_params)) if builder_params else {}
+    return {
+        "exp_id": exp_id, "name": name, "created_at": str(created_at),
+        "status": status, "execution_time_sec": float(execution_time_sec or 0),
+        "target_col": target_col, "primary_key": primary_key or "",
+        "data_rows": int(data_rows or 0), "data_cols": int(data_cols or 0),
+        "config": cfg,
+        "result": {
+            "segments_count": int(segments_count or 0),
+            "avg_lift": float(avg_lift or 0),
+            "max_lift": float(max_lift or 0),
+            "coverage_pct": float(coverage_pct or 0),
+            "baseline_rate_pct": float(baseline_rate or 0),
+            "error_msg": error_msg,
+            "segments": [], "coverage": [], "stop_reason": None,
+        },
+        "logs": [],
+    }
+
+
 def load_experiment():
-    """Return (exp_dict, source_label). Prefers live session; else latest DB row."""
+    """Return (exp_dict, source_label).
+
+    Prefers the saved run requested from the Leaderboard (`m4_view_exp`); else
+    a live session; else the latest DB row.
+    """
+    saved_id = st.session_state.get("m4_view_exp")
+    if saved_id:
+        st.session_state.pop("m4_view_exp", None)
+        try:
+            con = duckdb.connect(SUITE_DB, read_only=True)
+            row = con.execute(
+                "SELECT exp_id, name, created_at, data_rows, data_cols, status, "
+                "execution_time_sec, target_col, primary_key, builder_params, "
+                "segments_count, avg_lift, max_lift, coverage_pct, baseline_rate, error_msg "
+                "FROM experiments WHERE exp_id = ?",
+                [saved_id],
+            ).fetchone()
+            con.close()
+        except Exception:
+            row = None
+        if row:
+            saved = _build_exp_from_row(row)
+            st.session_state["experiment"] = saved
+            return saved, "saved run (from Leaderboard)"
+
     live = st.session_state.get("experiment")
     if isinstance(live, dict) and live.get("result"):
         return live, "live session"
@@ -137,30 +191,7 @@ def load_experiment():
         con.close()
         if not row:
             return None, "empty experiments table"
-        (
-            exp_id, name, created_at, data_rows, data_cols, status,
-            execution_time_sec, target_col, primary_key, builder_params,
-            segments_count, avg_lift, max_lift, coverage_pct, baseline_rate, error_msg,
-        ) = row
-        cfg = _jsonable(json.loads(builder_params)) if builder_params else {}
-        exp = {
-            "exp_id": exp_id, "name": name, "created_at": str(created_at),
-            "status": status, "execution_time_sec": float(execution_time_sec or 0),
-            "target_col": target_col, "primary_key": primary_key or "",
-            "data_rows": int(data_rows or 0), "data_cols": int(data_cols or 0),
-            "config": cfg,
-            "result": {
-                "segments_count": int(segments_count or 0),
-                "avg_lift": float(avg_lift or 0),
-                "max_lift": float(max_lift or 0),
-                "coverage_pct": float(coverage_pct or 0),
-                "baseline_rate_pct": float(baseline_rate or 0),
-                "error_msg": error_msg,
-                "segments": [], "coverage": [], "stop_reason": None,
-            },
-            "logs": [],
-        }
-        return exp, "suite_data.db (latest)"
+        return _build_exp_from_row(row), "suite_data.db (latest)"
     except Exception as exc:
         return None, f"read error: {exc}"
 

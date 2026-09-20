@@ -7,12 +7,21 @@ or:
     python -c "from rapidsegment.ui import run_ui; run_ui()"
 """
 
+import os
+import shutil
 from pathlib import Path
 import sys
 import streamlit as st
 
 from rapidsegment.ui._exit import render_exit_button, write_server_pid
 from rapidsegment.ui._theme import apply_cyberpunk_theme
+from rapidsegment.ui._state import SUITE_DIR
+
+try:
+    import rapidsegment as _rs
+    _RS_VERSION = getattr(_rs, "__version__", "unknown")
+except Exception:
+    _RS_VERSION = "unknown"
 
 
 def run_ui():
@@ -59,8 +68,32 @@ def _home():
 if __name__ == "__main__":
     st.set_page_config(page_title="RapidSegment", layout="wide")
     apply_cyberpunk_theme()
+    st.sidebar.caption(f"RapidSegment {_RS_VERSION} | {SUITE_DIR}")
     st.sidebar.divider()
     render_exit_button()
+
+    # Danger zone: clear suite data
+    with st.sidebar.expander("Danger Zone", expanded=False):
+        if st.button("Clear all suite data", type="primary",
+                     help="Wipe .rapidsegment_suite (datasets, experiments, artifacts)."):
+            st.session_state["m_clear_confirm"] = True
+        if st.session_state.get("m_clear_confirm"):
+            st.warning("This will delete ALL datasets, experiments, and artifacts. Cannot be undone.")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("Yes, delete everything", type="primary"):
+                    try:
+                        shutil.rmtree(SUITE_DIR, ignore_errors=True)
+                        os.makedirs(SUITE_DIR, exist_ok=True)
+                        st.session_state.pop("m_clear_confirm", None)
+                        st.success("Suite data cleared. Reloading...")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Failed: {exc}")
+            with cc2:
+                if st.button("Cancel"):
+                    st.session_state.pop("m_clear_confirm", None)
+
     pg = st.navigation({
         "Modules": [
             st.Page(_home, title="Home", icon="🏠"),

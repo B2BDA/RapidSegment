@@ -524,3 +524,95 @@ class TestDefaultLogging:
             )
         finally:
             log.removeHandler(cap)
+
+
+# ---------------------------------------------------------------------------
+# _state.py — shared helpers (require streamlit[ui] extra)
+# ---------------------------------------------------------------------------
+
+try:
+    import streamlit as _st  # noqa: F401
+    _has_streamlit = True
+except ImportError:
+    _has_streamlit = False
+
+
+@pytest.mark.skipif(not _has_streamlit, reason="requires streamlit[ui] extra")
+class TestStateHelpers:
+    def test_jsonable_dict(self):
+        from rapidsegment.ui._state import _jsonable
+        assert _jsonable({"a": 1, "b": "x"}) == {"a": 1, "b": "x"}
+
+    def test_jsonable_nested(self):
+        from rapidsegment.ui._state import _jsonable
+        assert _jsonable({"a": [1, 2], "b": {"c": 3}}) == {"a": [1, 2], "b": {"c": 3}}
+
+    def test_jsonable_none(self):
+        from rapidsegment.ui._state import _jsonable
+        assert _jsonable(None) is None
+
+    def test_jsonable_numpy_scalar(self):
+        import numpy as np
+        from rapidsegment.ui._state import _jsonable
+        result = _jsonable(np.int64(42))
+        assert result == 42
+        assert isinstance(result, int)
+
+    def test_jsonable_unknown_type(self):
+        from rapidsegment.ui._state import _jsonable
+        result = _jsonable(object())
+        assert isinstance(result, str)
+
+    def test_fmt_duration_seconds(self):
+        from rapidsegment.ui._state import fmt_duration
+        assert fmt_duration(30) == "30s"
+
+    def test_fmt_duration_minutes(self):
+        from rapidsegment.ui._state import fmt_duration
+        assert fmt_duration(125) == "2m 05s"
+
+    def test_fmt_duration_hours(self):
+        from rapidsegment.ui._state import fmt_duration
+        assert fmt_duration(3661) == "1h 01m"
+
+    def test_fmt_duration_zero(self):
+        from rapidsegment.ui._state import fmt_duration
+        assert fmt_duration(0) == "0s"
+
+    def test_exp_cols_includes_dataset_name(self):
+        from rapidsegment.ui._state import EXP_COLS
+        assert "dataset_name" in EXP_COLS
+
+    def test_suite_dir_created(self):
+        from rapidsegment.ui._state import SUITE_DIR
+        import os
+        assert os.path.isdir(SUITE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# _state.py SQL quoting used in UI
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not _has_streamlit, reason="requires streamlit[ui] extra")
+class TestUISQLQuoting:
+    """Verify that UI pages import _quote_sql_ident and use it correctly.
+
+    These tests require streamlit (UI extra) to be installed.
+    """
+
+    def test_page1_imports_quote_ident(self):
+        pytest.importorskip("streamlit", reason="requires streamlit[ui] extra")
+        import importlib
+        mod = importlib.import_module("rapidsegment.ui.pages.1_Data_Loader")
+        assert hasattr(mod, "_quote_sql_ident")
+
+    def test_page3_imports_quote_ident(self):
+        pytest.importorskip("streamlit", reason="requires streamlit[ui] extra")
+        import importlib
+        mod = importlib.import_module("rapidsegment.ui.pages.3_Execution_Console")
+        assert hasattr(mod, "_quote_sql_ident")
+
+    def test_page4_imports_quote_ident(self):
+        pytest.importorskip("streamlit", reason="requires streamlit[ui] extra")
+        import importlib
+        mod = importlib.import_module("rapidsegment.ui.pages.4_Results_Dashboard")
+        assert hasattr(mod, "_quote_sql_ident")

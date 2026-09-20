@@ -36,81 +36,18 @@ import streamlit as st
 
 from rapidsegment import StrategicSegmentScore, StrategicSegmentBuilder
 from rapidsegment.ui._theme import apply_cyberpunk_theme
+from rapidsegment.builder import _quote_sql_ident
 
-# ── Constants & storage ───────────────────────────────────────────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
-SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
-os.makedirs(SUITE_DIR, exist_ok=True)
-DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
-DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
-SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
-ARTIFACTS_DIR = os.path.join(SUITE_DIR, "artifacts")
-
-
-def active_db():
-    """Read the materialized *modified* dataset if it exists, else the raw load."""
-    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
+from rapidsegment.ui._state import (
+    SUITE_DIR, DB_FILE, DB_FILE_MOD, SUITE_DB, ARTIFACTS_DIR,
+    active_db, db_query, db_scalar, rerun, card, _jsonable, fmt_duration,
+)
 
 SEG_COLORS = [
     "#6366f1", "#f59e0b", "#22c55e", "#ef4444", "#3b82f6",
     "#ec4899", "#14b8a6", "#f97316", "#8b5cf6", "#06b6d4",
     "#84cc16", "#eab308", "#a855f7", "#10b981", "#fb7185",
 ]
-
-
-# ── Small helpers (consistent with Module 2 / 3) ──────────────────────────────
-def rerun():
-    try:
-        st.rerun()
-    except AttributeError:
-        st.experimental_rerun()
-
-
-def db_query(sql, read_only=True):
-    con = duckdb.connect(active_db(), read_only=read_only)
-    result = con.execute(sql).df()
-    con.close()
-    return result
-
-
-def db_scalar(sql):
-    con = duckdb.connect(active_db(), read_only=True)
-    result = con.execute(sql).fetchone()[0]
-    con.close()
-    return result
-
-
-def card():
-    try:
-        return st.container(border=True)
-    except TypeError:
-        return st.container()
-
-
-def _jsonable(obj):
-    if isinstance(obj, dict):
-        return {k: _jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_jsonable(v) for v in obj]
-    if hasattr(obj, "item"):
-        try:
-            return obj.item()
-        except Exception:
-            return str(obj)
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    return str(obj)
-
-
-def fmt_duration(secs):
-    secs = max(0, int(secs))
-    if secs < 60:
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}m {secs % 60:02d}s"
-    return f"{secs // 3600}h {secs % 3600 // 60:02d}m"
-
 
 # ── Experiment loading ───────────────────────────────────────────────────────
 def _build_exp_from_row(row):
@@ -320,7 +257,7 @@ def build_scorecard(cfg, data_path, segments):
         con.execute(f"ATTACH '{src}' AS src (READ_ONLY)")
         con.execute(
             f"CREATE TABLE df AS SELECT ROW_NUMBER() OVER () AS rs_row_id, "
-            f'"{target}" AS "{target}", {case_exprs} FROM src.udl_data'
+            f'{_quote_sql_ident(target)} AS {_quote_sql_ident(target)}, {case_exprs} FROM src.udl_data'
         )
     finally:
         con.close()
@@ -496,8 +433,8 @@ def _build_coverage_sql(segments, target):
 WITH PER_SEG_KPIS AS (
     SELECT CASE {case_sql} ELSE 0 END AS segment,
            COUNT(*) AS total_count,
-           SUM(CAST("{target}" AS DOUBLE)) AS target_events,
-           (SUM(CAST("{target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
+           SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) AS target_events,
+           (SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
     FROM input_data_view
     GROUP BY 1
 ),
@@ -821,8 +758,8 @@ def generate_feature_health_local(data_path, features, target, type_overrides=No
 
     target_expr = f"""
     (CASE
-        WHEN TRY_CAST("{target}" AS DOUBLE) IS NOT NULL THEN TRY_CAST("{target}" AS DOUBLE)
-        WHEN LOWER(TRIM(CAST("{target}" AS VARCHAR))) IN ('1','true','yes','y','t') THEN 1.0
+        WHEN TRY_CAST({_quote_sql_ident(target)} AS DOUBLE) IS NOT NULL THEN TRY_CAST({_quote_sql_ident(target)} AS DOUBLE)
+        WHEN LOWER(TRIM(CAST({_quote_sql_ident(target)} AS VARCHAR))) IN ('1','true','yes','y','t') THEN 1.0
         ELSE 0.0
     END)
     """
@@ -843,14 +780,14 @@ def generate_feature_health_local(data_path, features, target, type_overrides=No
             q = f"""
             SELECT
                 CASE
-                    WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) {missing_test} THEN 'Missing'
-                    ELSE CAST("{col}" AS VARCHAR)
+                    WHEN {_quote_sql_ident(col)} IS NULL OR TRIM(CAST({_quote_sql_ident(col)} AS VARCHAR)) {missing_test} THEN 'Missing'
+                    ELSE CAST({_quote_sql_ident(col)} AS VARCHAR)
                 END AS bin,
                 COUNT(*) AS total_count,
                 SUM({target_expr}) AS event_count,
                 (SUM({target_expr}) * 100.0 / COUNT(*)) AS response_rate,
                 CASE
-                    WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) {missing_test} THEN TRUE
+                    WHEN {_quote_sql_ident(col)} IS NULL OR TRIM(CAST({_quote_sql_ident(col)} AS VARCHAR)) {missing_test} THEN TRUE
                     ELSE FALSE
                 END AS is_missing
             FROM input_df
@@ -862,11 +799,11 @@ def generate_feature_health_local(data_path, features, target, type_overrides=No
             q = f"""
             WITH ranked AS (
                 SELECT
-                    TRY_CAST("{col}" AS DOUBLE) AS val,
+                    TRY_CAST({_quote_sql_ident(col)} AS DOUBLE) AS val,
                     {target_expr} AS target_val,
-                    NTILE({nb}) OVER (ORDER BY TRY_CAST("{col}" AS DOUBLE)) AS tile
+                    NTILE({nb}) OVER (ORDER BY TRY_CAST({_quote_sql_ident(col)} AS DOUBLE)) AS tile
                 FROM input_df
-                WHERE TRY_CAST("{col}" AS DOUBLE) IS NOT NULL
+                WHERE TRY_CAST({_quote_sql_ident(col)} AS DOUBLE) IS NOT NULL
             ),
             num_bins AS (
                 SELECT
@@ -892,7 +829,7 @@ def generate_feature_health_local(data_path, features, target, type_overrides=No
                    (SUM({target_expr}) * 100.0 / NULLIF(COUNT(*), 0)) AS response_rate,
                    TRUE AS is_missing, NULL AS tile
             FROM input_df
-            WHERE "{col}" IS NULL
+            WHERE {_quote_sql_ident(col)} IS NULL
             HAVING COUNT(*) > 0
             ORDER BY is_missing ASC, tile ASC
             """
@@ -978,6 +915,60 @@ def render_diagnostics(exp, cfg, data_path, segments):
                 st.code(st.session_state["m4_noseg"], language="text")
 
 
+def _build_runnable_script(exp, cfg, data_path):
+    """Reconstruct a standalone Python script that reproduces the experiment."""
+    cfg = cfg or {}
+    data_path_str = data_path or "module1_data.duckdb"
+    lines = [
+        '#!/usr/bin/env python3',
+        '"""Runnable script to reproduce this RapidSegment experiment."""',
+        '',
+        '# 1. Install dependencies (uncomment if needed)',
+        '# pip install rapidsegment',
+        '',
+        'import os',
+        'from rapidsegment import StrategicSegmentBuilder',
+        '',
+        '',
+        f'data_path = r"{data_path_str}"',
+        '',
+        '',
+        'builder = StrategicSegmentBuilder(',
+        f'    target={cfg.get("target_col")!r},',
+        f'    min_sample_size={cfg.get("min_sample_size", 1000)},',
+        f'    min_lift={cfg.get("min_lift", 1.5)},',
+        f'    min_events={cfg.get("min_events", 100)},',
+        f'    max_segments={cfg.get("max_segments", 10)},',
+        f'    top_n_vars={cfg.get("top_n_vars", 15)},',
+        f'    max_feature_reuse={cfg.get("max_feature_reuse", 1)},',
+        f'    enable_diversity={cfg.get("enable_diversity", False)},',
+        f'    enable_1way={cfg.get("enable_1way", True)},',
+        f'    enable_2way={cfg.get("enable_2way", True)},',
+        f'    enable_3way={cfg.get("enable_3way", True)},',
+        f'    selection_metric={cfg.get("selection_metric", "iv")!r},',
+        f'    binning_method={cfg.get("binning_method", "optimal_cart")!r},',
+        f'    naive_bins={cfg.get("naive_bins", 5)},',
+        f'    max_expansion_hops={cfg.get("max_expansion_hops", 0)},',
+        f'    n_jobs={cfg.get("n_jobs", -1)},',
+        f'    sort_priority={cfg.get("sort_priority", "rate_lift_count")!r},',
+        ')',
+        '',
+        '',
+        'segments = builder.extract_segments(data_path)',
+        '',
+        '',
+        'print(f"Found {len(segments)} segments.")',
+        'for s in segments:',
+        '    print(f"  Seg {s[\'segment_id\']}: lift={s[\'lift\"]:.2f}x, '
+        'count={s[\'count\']}, rule={s[\'rule_string\"]}")',
+    ]
+    if cfg.get("primary_key"):
+        lines.insert(16, f'    primary_key={cfg["primary_key"]!r},')
+    if cfg.get("expand_log_mode"):
+        lines.insert(-8, f'    expand_log_mode={cfg["expand_log_mode"]!r},')
+    return "\n".join(lines) + "\n"
+
+
 def render_export_hub(exp, segments, coverage, scorecard, cfg):
     st.subheader("Export Hub")
     res = exp.get("result") or {}
@@ -998,6 +989,12 @@ def render_export_hub(exp, segments, coverage, scorecard, cfg):
                        mime="text/plain", width='stretch')
     c5.download_button("Report (HTML)", html_report, file_name=f"report_{exp.get('exp_id','')}.html",
                        mime="text/html", width='stretch')
+
+    # Runnable Python script export
+    runnable_script = _build_runnable_script(exp, cfg, data_path).encode("utf-8")
+    st.download_button("Runnable Python script", runnable_script,
+                       file_name=f"run_{exp.get('exp_id','')}.py", mime="text/x-python",
+                       width='stretch')
 
     if scorecard is not None:
         sc_json = json.dumps(scorecard, indent=2).encode("utf-8")

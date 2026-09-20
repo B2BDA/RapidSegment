@@ -43,22 +43,15 @@ import streamlit as st
 
 from rapidsegment import StrategicSegmentBuilder
 from rapidsegment.ui._theme import apply_cyberpunk_theme
+from rapidsegment.builder import _quote_sql_ident
 
-# ── Constants & storage ───────────────────────────────────────────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
-SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
-os.makedirs(SUITE_DIR, exist_ok=True)
-DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
-DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
-SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
+from rapidsegment.ui._state import (
+    SUITE_DIR, DB_FILE, DB_FILE_MOD, SUITE_DB, ARTIFACTS_DIR,
+    active_db, db_query, db_scalar, rerun, card, _jsonable, fmt_duration,
+)
 
-
-def active_db():
-    """Read the materialized *modified* dataset if it exists, else the raw load."""
-    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
-
-REFRESH_SECONDS = 2.0  # live-metrics refresh cadence (2–5 s per spec)
+# ── Page-specific constants ──────────────────────────────────────────────────
+REFRESH_SECONDS = 2.0  # live-metrics refresh cadence (2-5 s per spec)
 
 PHASE_NAMES = [
     "Configure & load data",
@@ -72,60 +65,6 @@ PHASE_NAMES = [
 LEVEL_RANK = {"INFO": 10, "WARNING": 30, "ERROR": 40}
 LEVEL_COLORS = {"INFO": "#c9d1d9", "WARNING": "#f0b429", "ERROR": "#f85149",
                 "DEBUG": "#8b949e"}
-
-
-# ── Small helpers (Module 2 conventions) ─────────────────────────────────────
-def rerun():
-    try:
-        st.rerun()
-    except AttributeError:
-        st.experimental_rerun()
-
-
-def db_query(sql, read_only=True):
-    con = duckdb.connect(active_db(), read_only=read_only)
-    result = con.execute(sql).df()
-    con.close()
-    return result
-
-
-def db_scalar(sql):
-    con = duckdb.connect(active_db(), read_only=True)
-    result = con.execute(sql).fetchone()[0]
-    con.close()
-    return result
-
-
-def card():
-    try:
-        return st.container(border=True)
-    except TypeError:
-        return st.container()
-
-
-def _jsonable(obj):
-    if isinstance(obj, dict):
-        return {k: _jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_jsonable(v) for v in obj]
-    if hasattr(obj, "item"):
-        try:
-            return obj.item()
-        except Exception:
-            return str(obj)
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    return str(obj)
-
-
-def fmt_duration(secs):
-    secs = max(0, int(secs))
-    if secs < 60:
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}m {secs % 60:02d}s"
-    return f"{secs // 3600}h {secs % 3600 // 60:02d}m"
-
 
 # ── Log capture (Python logging piped into Streamlit state) ──────────────────
 def _ui_log(run, level, msg):
@@ -309,8 +248,8 @@ def _build_coverage_sql(segments, target):
 WITH PER_SEG_KPIS AS (
     SELECT CASE {case_sql} ELSE 0 END AS segment,
            COUNT(*) AS total_count,
-           SUM(CAST("{target}" AS DOUBLE)) AS target_events,
-           (SUM(CAST("{target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
+           SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) AS target_events,
+           (SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
     FROM input_data_view
     GROUP BY 1
 ),
@@ -760,18 +699,29 @@ def _render_console(run, live=False):
     left_col, right_col = st.columns(2)
     with left_col:
         st.markdown("#### Log Terminal")
-        lvl = st.radio(
-            "Level filter", ["All", "Info", "Warning", "Error"], index=0,
-            horizontal=True, key=f"m3_log_lvl_{run['exp_id']}",
-        )
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            lvl = st.radio(
+                "Level filter", ["All", "Info", "Warning", "Error"], index=0,
+                horizontal=True, key=f"m3_log_lvl_{run['exp_id']}",
+            )
+        with c2:
+            log_search = st.text_input(
+                "Search logs", key=f"m3_log_search_{run['exp_id']}",
+                placeholder="filter by keyword...",
+            )
         st.download_button(
-            "⧉ Copy Logs (.txt)",
+            "Copy Logs (.txt)",
             _logs_txt(run.get("logs") or []).encode("utf-8"),
             file_name=f"logs_{run['exp_id']}.txt", mime="text/plain",
             key=f"m3_copy_{run['exp_id']}",
         )
+        filtered_logs = _filter_logs(run.get("logs") or [], lvl)
+        if log_search:
+            q = log_search.lower()
+            filtered_logs = [l for l in filtered_logs if q in l.get("msg", "").lower()]
         st.markdown(
-            _terminal_html(_filter_logs(run.get("logs") or [], lvl)),
+            _terminal_html(filtered_logs),
             unsafe_allow_html=True,
         )
     with right_col:

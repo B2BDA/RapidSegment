@@ -22,20 +22,9 @@ import pandas as pd
 import streamlit as st
 from rapidsegment.ui._theme import apply_cyberpunk_theme
 
-# ── Paths (must match modules 1–4) ──────────────────────────────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
-SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
-os.makedirs(SUITE_DIR, exist_ok=True)
-SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
-ARTIFACTS_DIR = os.path.join(SUITE_DIR, "artifacts")
-
-EXP_COLS = [
-    "exp_id", "name", "created_at", "data_rows", "data_cols", "status",
-    "execution_time_sec", "target_col", "primary_key", "builder_params",
-    "segments_count", "avg_lift", "max_lift", "coverage_pct", "cumulative_event_capture",
-    "baseline_rate", "error_msg", "dataset_name",
-]
+from rapidsegment.ui._state import (
+    SUITE_DIR, SUITE_DB, ARTIFACTS_DIR, EXP_COLS,
+)
 
 # Ranking KPIs the user can pick from
 KPI_OPTS = {

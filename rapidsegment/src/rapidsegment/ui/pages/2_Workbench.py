@@ -11,7 +11,6 @@ with smart defaults, interactive validation, parameter presets, grid search
 and experiment execution.
 
 
-
 Consumes Module 1 (data loader) output:
 
     - st.session_state["loaded"]        bool      data present in module1_data.duckdb
@@ -19,7 +18,6 @@ Consumes Module 1 (data loader) output:
     - st.session_state["target_col"]    str       validated target column
 
     - st.session_state["tinfo"]         dict      profiling info incl. event_rate
-
 
 
 Hands off to Module 3 (execution console) — the Run button no longer
@@ -57,7 +55,6 @@ dataset into a pandas frame) were removed to avoid an out-of-memory crash on lar
 data.
 
 
-
 Files touched:
 
     read  .rapidsegment_suite/module1_data.duckdb   (udl_data)
@@ -67,7 +64,6 @@ Files touched:
     r/w   .rapidsegment_suite/suite_data.db         (experiments table)
 
     write .rapidsegment_suite/artifacts/<exp_id>/   (builder DuckDB + temp dir)
-
 
 
 Run with:  streamlit run Module_2_workbench.py
@@ -95,41 +91,12 @@ import duckdb
 import streamlit as st
 
 
-
 from rapidsegment import StrategicSegmentBuilder
-
 from rapidsegment.ui._theme import apply_cyberpunk_theme
-
-
-
-# ── Constants & storage ───────────────────────────────────────────────────────
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-
-_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
-
-SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
-
-os.makedirs(SUITE_DIR, exist_ok=True)
-
-DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
-
-DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
-
-SUITE_DB = os.path.join(SUITE_DIR, "suite_data.db")
-
-TEMPLATES_FILE = os.path.join(SUITE_DIR, "templates.json")
-
-
-
-
-
-def active_db():
-
-    """Read the materialized *modified* dataset if it exists, else the raw load."""
-
-    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
-
+from rapidsegment.ui._state import (
+    SUITE_DIR, DB_FILE, DB_FILE_MOD, SUITE_DB, TEMPLATES_FILE, EXP_COLS,
+    active_db, db_query, db_scalar, rerun, card, toggle, _jsonable, fmt_duration,
+)
 
 
 BIN_OPTIONS = ["Optimal (CART)", "Optimal (Quantile)", "Naive"]
@@ -151,7 +118,6 @@ METRIC_OPTIONS = ["IV", "Response Rate"]
 METRIC_MAP = {"IV": "iv", "Response Rate": "response_rate"}
 
 METRIC_RMAP = {v: k for k, v in METRIC_MAP.items()}
-
 
 
 SORT_PRIORITY_OPTIONS = [
@@ -203,7 +169,6 @@ SORT_PRIORITY_HELP = (
 )
 
 
-
 MAX_JOBS = max(1, os.cpu_count() or 4)
 
 N_JOBS_OPTIONS = ["-1 (all but one core)"] + [str(i) for i in range(1, MAX_JOBS + 1)]
@@ -213,14 +178,11 @@ N_JOBS_MAP = {opt: -1 if opt.startswith("-1") else int(opt) for opt in N_JOBS_OP
 N_JOBS_RMAP = {v: k for k, v in N_JOBS_MAP.items()}
 
 
-
 EXPAND_LOG_OPTIONS = ["none", "summary", "champion", "full"]
-
 
 
 GRID_SIZE_RANGE = (1000, 20000)
 GRID_LIFT_RANGE = (1.0, 10.0)
-
 
 
 QUICK_DISCOVERY = {
@@ -270,7 +232,6 @@ QUICK_DISCOVERY = {
 }
 
 
-
 CONSERVATIVE = {
 
     "experiment_name": "Conservative",
@@ -318,128 +279,8 @@ CONSERVATIVE = {
 }
 
 
-
-
-
-# ── Small helpers ─────────────────────────────────────────────────────────────
-
-def rerun():
-
-    try:
-
-        st.rerun()
-
-    except AttributeError:
-
-        st.experimental_rerun()
-
-
-
-
-
-def db_query(sql, read_only=True):
-
-    con = duckdb.connect(active_db(), read_only=read_only)
-
-    result = con.execute(sql).df()
-
-    con.close()
-
-    return result
-
-
-
-
-
-def db_scalar(sql):
-
-    con = duckdb.connect(active_db(), read_only=True)
-
-    result = con.execute(sql).fetchone()[0]
-
-    con.close()
-
-    return result
-
-
-
-
-
-def card():
-
-    try:
-
-        return st.container(border=True)
-
-    except TypeError:
-
-        return st.container()
-
-
-
-
-
-def toggle(label, key, help=None):
-
-    try:
-
-        return st.toggle(label, key=key, help=help)
-
-    except AttributeError:
-
-        return st.checkbox(label, key=key, help=help)
-
-
-
-
-
-def _jsonable(obj):
-
-    if isinstance(obj, dict):
-
-        return {k: _jsonable(v) for k, v in obj.items()}
-
-    if isinstance(obj, (list, tuple)):
-
-        return [_jsonable(v) for v in obj]
-
-    if hasattr(obj, "item"):
-
-        try:
-
-            return obj.item()
-
-        except Exception:
-
-            return str(obj)
-
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-
-        return obj
-
-    return str(obj)
-
-
-
-
-
-def fmt_duration(secs):
-
-    secs = max(0, int(secs))
-
-    if secs < 60:
-
-        return f"{secs}s"
-
-    if secs < 3600:
-
-        return f"{secs // 60}m {secs % 60:02d}s"
-
-    return f"{secs // 3600}h {secs % 3600 // 60:02d}m"
-
-
-
-
+# -- Small helpers (from _state.py: rerun, db_query, db_scalar, card, toggle,
+#                    _jsonable, fmt_duration, active_db)
 
 def grid_combos(cfg):
 
@@ -454,9 +295,6 @@ def grid_combos(cfg):
     lifts = len(pg.get("min_lift") or [1])
 
     return max(1, sizes) * max(1, lifts)
-
-
-
 
 
 # ── Config build / validation / estimation ───────────────────────────────────
@@ -566,10 +404,6 @@ def build_params():
 
     }
 
-
-
-
-
 def validate_params(cfg, all_cols):
 
     issues = []
@@ -624,10 +458,6 @@ def validate_params(cfg, all_cols):
 
     return issues
 
-
-
-
-
 def estimate_seconds(cfg, n_rows):
 
     pg = cfg.get("param_grid") or {}
@@ -653,9 +483,6 @@ def estimate_seconds(cfg, n_rows):
     return max(15.0, base * combos)
 
 
-
-
-
 # ── Templates / leaderboard persistence ──────────────────────────────────────
 
 def load_templates():
@@ -676,10 +503,6 @@ def load_templates():
 
         return {}
 
-
-
-
-
 def save_template(name, cfg):
 
     templates = load_templates()
@@ -689,10 +512,6 @@ def save_template(name, cfg):
     with open(TEMPLATES_FILE, "w", encoding="utf-8") as fh:
 
         json.dump(templates, fh, indent=2)
-
-
-
-
 
 def cfg_from_json(value):
 
@@ -711,10 +530,6 @@ def cfg_from_json(value):
             return {}
 
     return {}
-
-
-
-
 
 def read_leaderboard():
 
@@ -753,10 +568,6 @@ def read_leaderboard():
     except Exception:
 
         return None
-
-
-
-
 
 def upsert_experiment(exp):
 
@@ -840,10 +651,6 @@ def upsert_experiment(exp):
 
     con.close()
 
-
-
-
-
 def clear_group_keys():
 
     for key in list(st.session_state):
@@ -851,10 +658,6 @@ def clear_group_keys():
         if key.startswith("wb_group_cols_") or key.startswith("wb_group_rm_"):
 
             del st.session_state[key]
-
-
-
-
 
 def apply_config(cfg):
 
@@ -965,19 +768,11 @@ def apply_config(cfg):
         st.session_state["wb_enable_grid"] = False
 
 
-
-
-
-
-
-
-
 # ── Page setup ────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="RapidSegment — Workbench", layout="wide")
 
 apply_cyberpunk_theme()
-
 
 
 st.markdown(
@@ -1023,13 +818,11 @@ st.markdown(
 )
 
 
-
 # ── Session init & deferred actions ──────────────────────────────────────────
 
 if "wb_groups" not in st.session_state:
 
     st.session_state["wb_groups"] = []
-
 
 
 pending = st.session_state.pop("wb_pending", None)
@@ -1039,7 +832,6 @@ if isinstance(pending, dict):
     apply_config(pending)
 
     rerun()
-
 
 
 # ── Guard: data must be loaded by Module 1 ───────────────────────────────────
@@ -1071,7 +863,6 @@ if not st.session_state.get("loaded"):
         st.stop()
 
 
-
 all_cols = db_query(
 
     "SELECT column_name FROM information_schema.columns "
@@ -1087,13 +878,11 @@ n_cols = len(all_cols)
 tinfo = st.session_state.get("tinfo")
 
 
-
 preset_target = st.session_state.get("target_col") or (all_cols[0] if all_cols else "")
 
 if preset_target not in all_cols:
 
     preset_target = all_cols[0] if all_cols else ""
-
 
 
 defaults = {
@@ -1163,7 +952,6 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
-
 if st.session_state["wb_target_col"] not in all_cols:
 
     st.session_state["wb_target_col"] = preset_target
@@ -1179,7 +967,6 @@ if isinstance(st.session_state["wb_grid_lifts"], list):
     st.session_state["wb_grid_lifts"] = ", ".join(str(v) for v in st.session_state["wb_grid_lifts"])
 
 
-
 st.title("RapidSegment — Module 2: The Workbench")
 
 st.caption(
@@ -1191,17 +978,14 @@ st.caption(
 )
 
 
-
 # ── Two-column layout (right column first so presets can re-fill widgets) ─────
 
 left, right = st.columns([3, 1.55], gap="medium")
 
 
-
 with right:
 
     notice = st.empty()
-
 
 
     saved_templates = load_templates()
@@ -1251,7 +1035,6 @@ with right:
             apply_config(preset_cfg)
 
             rerun()
-
 
 
     st.markdown("#### Real-Time Summary")
@@ -1335,7 +1118,6 @@ with right:
                 f"{grid_combos(cfg_now)} combinations"
 
             )
-
 
 
     st.markdown("#### Validation Checklist")
@@ -1423,7 +1205,6 @@ with right:
         st.caption(note)
 
 
-
 with left:
 
     with st.expander("Basic Settings", expanded=True):
@@ -1449,7 +1230,6 @@ with left:
         )
 
 
-
     with st.expander("Segment Discovery Strategy", expanded=True):
 
         d1, d2, d3 = st.columns(3)
@@ -1459,7 +1239,6 @@ with left:
         d2.slider("max_segments", 1, 20, key="wb_max_segments")
 
         d3.slider("max_feature_reuse", 1, 5, key="wb_max_feature_reuse")
-
 
 
         s1, s2 = st.columns(2)
@@ -1487,7 +1266,6 @@ with left:
             help="-1 uses all but one CPU core for IV computation.",
 
         )
-
 
 
         with st.expander("Feature grouping (business categories)"):
@@ -1589,7 +1367,6 @@ with left:
         )
 
 
-
     with st.expander("Binning & Rule Complexity", expanded=True):
 
         st.radio(
@@ -1653,7 +1430,6 @@ with left:
         )
 
 
-
     with st.expander("Hard Constraints", expanded=True):
 
         h1, h2, h3 = st.columns(3)
@@ -1685,7 +1461,6 @@ with left:
             key="wb_min_events",
 
         )
-
 
 
     with st.expander("Advanced: Grid Search (Optional)", expanded=True):
@@ -1744,7 +1519,6 @@ with left:
             st.caption("Grid search disabled — single (min_sample_size, min_lift) pair will be used.")
 
 
-
 # ── Sticky action bar ─────────────────────────────────────────────────────────
 
 try:
@@ -1754,7 +1528,6 @@ try:
 except TypeError:
 
     footer = st.container()
-
 
 
 with footer:
@@ -1782,7 +1555,6 @@ with footer:
             else:
 
                 notice.error("Enter a template name first.")
-
 
 
     with f2:
@@ -1844,7 +1616,6 @@ with footer:
                     notice.error("Selected experiment has no stored parameters.")
 
 
-
     with f3:
 
         cfg_now = build_params()
@@ -1882,7 +1653,6 @@ with footer:
         st.caption(f"Estimated time: **{fmt_duration(estimated)}**")
 
 
-
 # ── Latest experiment results (preview for Module 3) ─────────────────────────
 
 exp = st.session_state.get("experiment")
@@ -1906,7 +1676,6 @@ if exp:
         f"stop_reason={res.get('stop_reason') or '—'}"
 
     )
-
 
 
     segments = res.get("segments") or []

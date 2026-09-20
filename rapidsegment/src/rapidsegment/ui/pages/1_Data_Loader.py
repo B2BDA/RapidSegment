@@ -19,69 +19,15 @@ import streamlit as st
 
 from rapidsegment.utils.data_loader import UniversalDataLoader
 from rapidsegment.ui._theme import apply_cyberpunk_theme
+from rapidsegment.ui._state import (
+    SUITE_DIR, DB_FILE, DB_FILE_MOD, PROFILING_JSON,
+    active_db, db_write, db_query, db_scalar, db_exec, rerun, is_num,
+)
+from rapidsegment.builder import _quote_sql_ident
 
-# ── Constants & storage ───────────────────────────────────────────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "pages" else _HERE
-SUITE_DIR = os.path.join(_PROJECT_ROOT, ".rapidsegment_suite")
-os.makedirs(SUITE_DIR, exist_ok=True)
-DB_FILE = os.path.join(SUITE_DIR, "module1_data.duckdb")
-DB_FILE_MOD = os.path.join(SUITE_DIR, "module1_data_modified.duckdb")
-PROFILING_JSON = os.path.join(SUITE_DIR, "module1_profiling.json")
-
-
-def active_db():
-    """Return the materialized *modified* dataset if it exists, else the raw load.
-
-    Module 1 writes a transformed copy (`module1_data_modified.duckdb`) when the
-    user applies metadata (type overrides + target 1/0). Every downstream read
-    goes through this so DuckDB sees the actual changed types, not just the UI.
-    """
-    return DB_FILE_MOD if os.path.exists(DB_FILE_MOD) else DB_FILE
+# ── Page-specific constants ──────────────────────────────────────────────────
 MAX_UPLOAD_MB = 8000
 SAMPLE_NAMES = ["bank-full.csv", "train.csv"]
-
-NUMERIC = {"INTEGER", "BIGINT", "DOUBLE", "FLOAT", "DECIMAL", "REAL",
-           "SMALLINT", "TINYINT", "HUGEINT", "INT", "UBIGINT", "UINTEGER"}
-
-
-def is_num(t):
-    return any(k in str(t).upper() for k in NUMERIC)
-
-
-def rerun():
-    try:
-        st.rerun()
-    except AttributeError:
-        st.experimental_rerun()
-
-
-# ── DuckDB helpers (short-lived connections) ─────────────────────────────────
-def db_write(arrow_table):
-    con = duckdb.connect(DB_FILE)
-    con.execute("DROP TABLE IF EXISTS udl_data")
-    con.execute("CREATE TABLE udl_data AS SELECT * FROM arrow_table")
-    con.close()
-
-
-def db_query(sql, read_only=True):
-    con = duckdb.connect(active_db(), read_only=read_only)
-    result = con.execute(sql).df()
-    con.close()
-    return result
-
-
-def db_scalar(sql):
-    con = duckdb.connect(active_db(), read_only=True)
-    result = con.execute(sql).fetchone()[0]
-    con.close()
-    return result
-
-
-def db_exec(sql):
-    con = duckdb.connect(active_db())
-    con.execute(sql)
-    con.close()
 
 
 def reset_dataset():
@@ -140,32 +86,33 @@ def materialize_modified(positive_value=None):
     select_parts = []
     new_target = target_col
     for col in cols:
+        qcol = _quote_sql_ident(col)
         if col == target_col and target_col:
             if positive_value is not None:
                 pv = str(positive_value).replace("'", "''")
-                select_parts.append(f'"{col}"')
+                select_parts.append(qcol)
                 select_parts.append(
-                    f"(CASE WHEN LOWER(TRIM(CAST(\"{col}\" AS VARCHAR)))='{pv.lower()}' "
-                    f"THEN 1 ELSE 0 END)::INT AS \"{col}__binary\""
+                    f"(CASE WHEN LOWER(TRIM(CAST({qcol} AS VARCHAR)))='{pv.lower()}' "
+                    f"THEN 1 ELSE 0 END)::INT AS {_quote_sql_ident(col + '__binary')}"
                 )
                 new_target = f"{col}__binary"
             elif tinfo.get("is_binary") and tinfo.get("binary_label"):
                 select_parts.append(
-                    f"(CASE WHEN TRY_CAST(\"{col}\" AS DOUBLE) IS NOT NULL "
-                    f"THEN CAST(TRY_CAST(\"{col}\" AS DOUBLE) AS INT) "
-                    f"WHEN LOWER(TRIM(CAST(\"{col}\" AS VARCHAR))) "
-                    f"IN ('1','true','yes','y','t') THEN 1 ELSE 0 END)::INT AS \"{col}\""
+                    f"(CASE WHEN TRY_CAST({qcol} AS DOUBLE) IS NOT NULL "
+                    f"THEN CAST(TRY_CAST({qcol} AS DOUBLE) AS INT) "
+                    f"WHEN LOWER(TRIM(CAST({qcol} AS VARCHAR))) "
+                    f"IN ('1','true','yes','y','t') THEN 1 ELSE 0 END)::INT AS {qcol}"
                 )
             else:
-                select_parts.append(f'"{col}"')
+                select_parts.append(qcol)
         else:
             ov = overrides.get(str(col), "AUTO")
             if ov == "CATEGORICAL":
-                select_parts.append(f'CAST("{col}" AS VARCHAR) AS "{col}"')
+                select_parts.append(f"CAST({qcol} AS VARCHAR) AS {qcol}")
             elif ov == "NUMERIC":
-                select_parts.append(f'TRY_CAST("{col}" AS DOUBLE) AS "{col}"')
+                select_parts.append(f"TRY_CAST({qcol} AS DOUBLE) AS {qcol}")
             else:
-                select_parts.append(f'"{col}"')
+                select_parts.append(qcol)
 
     select_sql = ", ".join(select_parts)
     # Pure DuckDB transform on the persisted raw copy — no pandas/arrow staging.
@@ -345,17 +292,40 @@ with st.sidebar:
         if method == "File path":
             hints = smart_default_hint()
             if hints:
-                st.caption("💡 Smart defaults — detected: " + ", ".join(os.path.basename(h) for h in hints))
+                st.caption("Smart defaults -- detected: " + ", ".join(os.path.basename(h) for h in hints))
             fp = st.text_input("File path", placeholder="/path/to/file.csv")
             encoding = st.selectbox("Encoding", ["Auto-detect", "UTF-8", "Latin-1"])
-            st.caption("Supported: CSV · Parquet · Arrow/Feather · Excel")
+            st.caption("Supported: CSV, Parquet, Arrow/Feather, Excel")
+            if fp and os.path.exists(fp):
+                if st.button("Peek (first 5 rows + types)", key="peek_path"):
+                    try:
+                        ext = os.path.splitext(fp)[1].lower()
+                        if ext in (".csv", ".tsv"):
+                            delim = "\t" if ext == ".tsv" else ","
+                            peek_df = duckdb.read_csv(fp, delim=delim, nrows=5,
+                                                      header=True, sample_size=5)
+                        elif ext in (".parquet", ".pq"):
+                            peek_df = duckdb.read_parquet(fp, nrows=5)
+                        elif ext in (".arrow", ".feather"):
+                            peek_df = duckdb.read_arrow(fp, nrows=5)
+                        else:
+                            peek_df = None
+                            st.info("Peek not supported for this format; click Load File directly.")
+                        if peek_df is not None:
+                            st.caption(f"**First 5 rows** of `{os.path.basename(fp)}`")
+                            st.dataframe(peek_df, width="stretch", hide_index=True)
+                            desc = duckdb.sql(f"DESCRIBE SELECT * FROM peek_df").df()
+                            st.caption("**Inferred column types**")
+                            st.dataframe(desc, width="stretch", hide_index=True)
+                    except Exception as exc:
+                        st.warning(f"Peek failed: {exc}")
             if st.button("Load File", type="primary", disabled=not fp):
                 if not os.path.exists(fp):
                     st.error(f"File not found: {fp}")
                 else:
-                    with st.spinner("Reading file…"):
+                    with st.spinner("Reading file..."):
                         try:
-                            progress = st.progress(0, text="Loading…")
+                            progress = st.progress(0, text="Loading...")
                             persist_file_direct(fp, encoding, dataset_name=os.path.basename(fp), progress=progress)
                             st.success(f"Loaded: {os.path.basename(fp)}")
                         except Exception as exc:
@@ -370,12 +340,40 @@ with st.sidebar:
                 size_mb = uploaded.size / 1e6
                 if size_mb > MAX_UPLOAD_MB:
                     st.warning(
-                        f"File is {size_mb:.1f} MB — large browser uploads are slow and "
+                        f"File is {size_mb:.1f} MB -- large browser uploads are slow and "
                         f"memory-heavy. For multi-GB files use the **File path** method "
                         f"instead (no upload limit, streams straight from disk)."
                     )
                 encoding = st.selectbox("Encoding", ["Auto-detect", "UTF-8", "Latin-1"], key="up_enc")
-                st.caption(f"Detected format: **{detect_format(uploaded.name)}** · {size_mb:.1f} MB")
+                st.caption(f"Detected format: **{detect_format(uploaded.name)}** - {size_mb:.1f} MB")
+                if st.button("Peek (first 5 rows + types)", key="peek_upload"):
+                    try:
+                        ext = os.path.splitext(uploaded.name)[1].lower()
+                        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                            shutil.copyfileobj(uploaded, tmp)
+                            tmp_path = tmp.name
+                        try:
+                            if ext in (".csv", ".tsv"):
+                                delim = "\t" if ext == ".tsv" else ","
+                                peek_df = duckdb.read_csv(tmp_path, delim=delim, nrows=5,
+                                                          header=True, sample_size=5)
+                            elif ext in (".parquet", ".pq"):
+                                peek_df = duckdb.read_parquet(tmp_path, nrows=5)
+                            elif ext in (".arrow", ".feather"):
+                                peek_df = duckdb.read_arrow(tmp_path, nrows=5)
+                            else:
+                                peek_df = None
+                                st.info("Peek not supported for this format; click Load directly.")
+                            if peek_df is not None:
+                                st.caption(f"**First 5 rows** of `{uploaded.name}`")
+                                st.dataframe(peek_df, width="stretch", hide_index=True)
+                                desc = duckdb.sql(f"DESCRIBE SELECT * FROM peek_df").df()
+                                st.caption("**Inferred column types**")
+                                st.dataframe(desc, width="stretch", hide_index=True)
+                        finally:
+                            os.unlink(tmp_path)
+                    except Exception as exc:
+                        st.warning(f"Peek failed: {exc}")
                 if st.button("Load Uploaded File", type="primary"):
                         with st.spinner(f"Loading '{uploaded.name}'…"):
                             ext = os.path.splitext(uploaded.name)[1].lower()
@@ -545,7 +543,7 @@ def build_metadata(summ):
     @st.cache_data(ttl=600, show_spinner=False)
     def top5(col, _stamp):
         return db_query(
-            f'SELECT CAST("{col}" AS VARCHAR) AS value, COUNT(*) AS cnt '
+            f'SELECT CAST({_quote_sql_ident(col)} AS VARCHAR) AS value, COUNT(*) AS cnt '
             f'FROM udl_data GROUP BY 1 ORDER BY 2 DESC LIMIT 5'
         )
 
@@ -767,11 +765,12 @@ with tab_target:
     if st.button("Validate Target", type="primary"):
         with st.spinner("Validating…"):
             n_total = db_scalar("SELECT COUNT(*) FROM udl_data")
-            n_notnull = db_scalar(f'SELECT COUNT("{sel_col}") FROM udl_data')
-            n_distinct = db_scalar(f'SELECT COUNT(DISTINCT "{sel_col}") FROM udl_data')
+            qsel = _quote_sql_ident(sel_col)
+            n_notnull = db_scalar(f'SELECT COUNT({qsel}) FROM udl_data')
+            n_distinct = db_scalar(f'SELECT COUNT(DISTINCT {qsel}) FROM udl_data')
             dist = db_query(
-                f'SELECT CAST("{sel_col}" AS VARCHAR) AS val, COUNT(*) AS cnt '
-                f'FROM udl_data GROUP BY "{sel_col}" ORDER BY cnt DESC LIMIT 10'
+                f'SELECT CAST({qsel} AS VARCHAR) AS val, COUNT(*) AS cnt '
+                f'FROM udl_data GROUP BY {qsel} ORDER BY cnt DESC LIMIT 10'
             )
             vals_nonnull = [v for v in dist["val"].tolist() if v is not None]
             BMAPS = [

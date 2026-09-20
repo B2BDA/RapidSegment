@@ -359,7 +359,7 @@ class TestNoBasicConfig:
 
     @staticmethod
     def _has_basic_config_call(filepath: str) -> bool:
-        tree = ast.parse(open(filepath).read())
+        tree = ast.parse(open(filepath, encoding="utf-8").read())
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
@@ -449,7 +449,7 @@ class TestDefaultLogging:
         # __init__ must configure logging via its own helper, not basicConfig.
         import rapidsegment
 
-        tree = ast.parse(open(rapidsegment.__file__).read())
+        tree = ast.parse(open(rapidsegment.__file__, encoding="utf-8").read())
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func

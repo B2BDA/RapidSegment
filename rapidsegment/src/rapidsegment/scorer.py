@@ -19,17 +19,18 @@ from typing import Any, Dict, List, Optional, Union
 import duckdb
 import numpy as np
 
+from .builder import _quote_sql_ident
+
 # -----------------------------------------------------------------------------
 # Module-level configuration
 # -----------------------------------------------------------------------------
 now = datetime.now()
 timestamp = now.strftime("%Y_%m_%d_%H_%M_%S")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | [%(filename)s:%(lineno)d] | %(message)s",
-)
 logger = logging.getLogger("StrategicEngine")
+# Library code must never call logging.basicConfig() at import time — it
+# hijacks the root logger of any host application that imports this module.
+logger.addHandler(logging.NullHandler())
 
 
 class StrategicSegmentScore:
@@ -120,15 +121,15 @@ class StrategicSegmentScore:
         # Step 1: Baseline metrics + vectorised multi‑segment aggregation
         # ---------------------------------------------------------------------
         agg_expressions = [
-            f'COUNT(CASE WHEN "{col}" = 1 THEN 1 END) AS "{col}_cnt", '
-            f'SUM(CAST(CASE WHEN "{col}" = 1 THEN "{self.target_col}" ELSE 0 END AS DOUBLE)) AS "{col}_ev"'
+            f'COUNT(CASE WHEN {_quote_sql_ident(col)} = 1 THEN 1 END) AS {_quote_sql_ident(col + "_cnt")}, '
+            f'SUM(CAST(CASE WHEN {_quote_sql_ident(col)} = 1 THEN {_quote_sql_ident(self.target_col)} ELSE 0 END AS DOUBLE)) AS {_quote_sql_ident(col + "_ev")}'
             for col in self.segment_cols
         ]
 
         master_sql = f"""
             SELECT
                 COUNT(*) AS total_pop,
-                SUM(CAST("{self.target_col}" AS DOUBLE)) AS total_ev,
+                SUM(CAST({_quote_sql_ident(self.target_col)} AS DOUBLE)) AS total_ev,
                 {', '.join(agg_expressions)}
             FROM df
         """
@@ -215,7 +216,7 @@ class StrategicSegmentScore:
 
         # Build the linear sum expression: flag_1 * w1 + flag_2 * w2 + ...
         score_terms = [
-            f'(CAST("{col}" AS DOUBLE) * {weights_lookup[col]["weight"]})'
+            f'(CAST({_quote_sql_ident(col)} AS DOUBLE) * {weights_lookup[col]["weight"]})'
             for col in scored_cols
         ]
         score_math_expr = " + ".join(score_terms)
@@ -224,7 +225,7 @@ class StrategicSegmentScore:
 
         ctx.execute(f"""
             CREATE OR REPLACE TABLE scored_population AS
-            SELECT "{self.primary_key}", {score_sql}
+            SELECT {_quote_sql_ident(self.primary_key)}, {score_sql}
             FROM df
         """)
 

@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import ast
+import tempfile
 from datetime import datetime
 from itertools import combinations, product, groupby
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -29,37 +30,67 @@ import shutil
 # -----------------------------------------------------------------------------
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | [%(filename)s:%(lineno)d] | %(message)s",
-)
 logger = logging.getLogger("StrategicEngine")
+# Library code must never call logging.basicConfig() at import time — it
+# hijacks the root logger of any host application that imports this module.
+# Attach a NullHandler so log records are silently dropped if the host has
+# not configured logging, and let the host app own its own format/level.
+logger.addHandler(logging.NullHandler())
 
 # Pre-compiled regex for fast parsing inside loops
 _BRACKET_REGEX = re.compile(r"\[(.*?)\]", flags=re.DOTALL)
 
 
-def setup_disk_backed_db(base_dir: str = "experiments") -> tuple[str, str]:
+def _quote_sql_ident(ident: str) -> str:
+    """Quote a SQL identifier for DuckDB by wrapping it in double quotes
+    and escaping any embedded double quotes.
+
+    This is the single shared helper used everywhere a user-supplied column
+    name (``target``, ``primary_key``, feature columns, …) is interpolated
+    into a SQL string.  It prevents a column name containing a ``"`` from
+    breaking the query or, worse, enabling SQL injection.
+    """
+    return '"' + str(ident).replace('"', '""') + '"'
+
+
+def _quote_sql_string(val: Any) -> str:
+    """Quote a SQL string literal by wrapping it in single quotes and
+    escaping any embedded single quotes."""
+    return "'" + str(val).replace("'", "''") + "'"
+
+
+def setup_disk_backed_db(base_dir: Optional[str] = None) -> tuple[str, str]:
     """
     Creates an experiment directory and generates a unique DuckDB file path.
     Returns the database path and the temp directory path.
+
+    Args:
+        base_dir: Base directory for the DuckDB file and temp spill dir.
+            When ``None`` (default) a unique directory under the system temp
+            dir is used so the caller's working directory is never polluted
+            with an ``experiments/`` folder. Pass an explicit path to keep
+            the artefacts in a known location.
     """
-    # 1. Create the main experiments directory
+    if base_dir is None:
+        base_dir = os.path.join(
+            tempfile.gettempdir(), f"rapidsegment_{uuid.uuid4().hex[:8]}"
+        )
+
     os.makedirs(base_dir, exist_ok=True)
-    
-    # 2. Generate unique identifiers (Date + UUID)
+
+    # Generate unique identifiers (Date + UUID)
     date_str = datetime.now().strftime("%Y%m%d")
-    unique_id = uuid.uuid4().hex[:8]  # Short UUID is usually sufficient and cleaner
-    
-    # 3. Define the main database file path
+    unique_id = uuid.uuid4().hex[:8]
+
+    # Define the main database file path
     db_filename = f"segmentation_{date_str}_{unique_id}.duckdb"
     db_path = os.path.join(base_dir, db_filename)
-    
-    # 4. Create a dedicated temp directory for DuckDB to spill to
+
+    # Create a dedicated temp directory for DuckDB to spill to
     temp_dir = os.path.join(base_dir, f"tmp_{date_str}_{unique_id}")
     os.makedirs(temp_dir, exist_ok=True)
-    
-    return db_path, temp_dir    
+
+    return db_path, temp_dir
 
 
 class StrategicSegmentBuilder:
@@ -171,6 +202,20 @@ class StrategicSegmentBuilder:
             for var in vars_list
         }
         self.sort_priority = sort_priority
+        # Validate sort_priority strictly so unknown values surface
+        # immediately instead of silently falling back to the default.
+        _VALID_SORT_PRIORITIES = {
+            "lift_count_rate", "count_lift_rate", "rate_lift_count",
+            "lift_rate_count", "count_rate_lift", "rate_count_lift",
+            "events_lift_rate", "events_rate_lift", "lift_events_rate",
+            "rate_events_lift", "events_count_rate", "events_rate_count",
+            "count_events_rate", "rate_events_count",
+        }
+        if self.sort_priority not in _VALID_SORT_PRIORITIES:
+            raise ValueError(
+                f"sort_priority must be one of {sorted(_VALID_SORT_PRIORITIES)}; "
+                f"got {self.sort_priority!r}"
+            )
         self.diagnostics_: List[Dict[str, Any]] = []
         self.stop_reason: Optional[str] = None
         self.binning_method = binning_method
@@ -224,6 +269,41 @@ class StrategicSegmentBuilder:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
+
+    def _configure_duckdb(
+        self, con: duckdb.DuckDBPyConnection, db_temp_dir: Optional[str] = None
+    ) -> None:
+        """Apply engine-wide DuckDB settings (threads, memory, temp dir).
+
+        This is the single shared helper used by ``extract_segments``,
+        ``evaluate_final_coverage``, and ``generate_feature_health_report``
+        so that every connection honours the same memory / thread / temp-dir
+        limits — previously only ``extract_segments`` applied threads and
+        memory_limit, leaving the other two under-configured.
+        """
+        total_cores = os.cpu_count() or 1
+        if self.engine_threads is not None:
+            target_threads = max(1, int(self.engine_threads))
+        else:
+            target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
+        total_mem_gb = psutil.virtual_memory().total / (1024**3)
+        if self.memory_limit_gb is not None:
+            target_memory_gb = max(1, int(self.memory_limit_gb))
+        else:
+            # Default: utilise the host. On a 32 GB / 16-core box this yields
+            # ~25 GB buffer and ~14 threads. Override via memory_limit_gb /
+            # engine_threads on memory-constrained hardware.
+            target_memory_gb = max(1, int(total_mem_gb * 0.8))
+
+        con.execute(f"SET threads = {target_threads};")
+        con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
+        if db_temp_dir:
+            con.execute(f"PRAGMA temp_directory='{db_temp_dir}';")
+
+        logger.info(
+            f"⚙️ DuckDB Configured: Threads={target_threads}/{total_cores}, "
+            f"MemoryLimit={target_memory_gb}GB, TempDir={db_temp_dir or '<none>'}"
+        )
 
     @staticmethod
     def _resolve_optb_dtype(duckdb_type: str) -> str:
@@ -314,7 +394,8 @@ class StrategicSegmentBuilder:
         elif priority == "rate_events_count":
             key = (rule["rate"], rule["events"], rule["count"])
         else:
-            key = (rule["lift"], rule["rate"], rule["count"])
+            # Should be unreachable — __init__ validates sort_priority.
+            raise ValueError(f"Unknown sort_priority: {priority!r}")
         # Deterministic tie-breaker: when every configured priority dimension
         # is exactly equal between two candidates, the winner must not depend
         # on incoming list order (which itself can vary run-to-run due to
@@ -357,7 +438,7 @@ class StrategicSegmentBuilder:
                         q_str = ", ".join(str(q) for q in q_list)
                         
                         quantiles = thread_con.execute(
-                            f'SELECT QUANTILE_CONT("{col}", [{q_str}]) FROM current_df WHERE "{col}" IS NOT NULL'
+                            f'SELECT QUANTILE_CONT({_quote_sql_ident(col)}, [{q_str}]) FROM current_df WHERE {_quote_sql_ident(col)} IS NOT NULL'
                         ).fetchone()[0]
 
                         if quantiles is None or len(quantiles) == 0:
@@ -383,19 +464,19 @@ class StrategicSegmentBuilder:
 
                             if lower_is_ninf and upper_is_pinf:
                                 # Whole domain → every non-null value belongs here
-                                case_clauses.append(f'WHEN "{col}" IS NOT NULL THEN \'{label}\'')
+                                case_clauses.append(f'WHEN {_quote_sql_ident(col)} IS NOT NULL THEN \'{label}\'')
                             elif lower_is_ninf:
-                                case_clauses.append(f'WHEN "{col}" < {upper} THEN \'{label}\'')
+                                case_clauses.append(f'WHEN {_quote_sql_ident(col)} < {upper} THEN \'{label}\'')
                             elif upper_is_pinf:
-                                case_clauses.append(f'WHEN "{col}" >= {lower} THEN \'{label}\'')
+                                case_clauses.append(f'WHEN {_quote_sql_ident(col)} >= {lower} THEN \'{label}\'')
                             else:
                                 case_clauses.append(
-                                    f'WHEN "{col}" >= {lower} AND "{col}" < {upper} THEN \'{label}\''
+                                    f'WHEN {_quote_sql_ident(col)} >= {lower} AND {_quote_sql_ident(col)} < {upper} THEN \'{label}\''
                                 )
 
                         case_expr = f"""
                         CASE 
-                            WHEN "{col}" IS NULL THEN 'Missing'
+                            WHEN {_quote_sql_ident(col)} IS NULL THEN 'Missing'
                             {' '.join(case_clauses)}
                             ELSE 'Missing'
                         END
@@ -403,8 +484,8 @@ class StrategicSegmentBuilder:
                     else:
                         case_expr = f"""
                         CASE 
-                            WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
-                            ELSE '[' || CAST("{col}" AS VARCHAR) || ']'
+                            WHEN {_quote_sql_ident(col)} IS NULL OR TRIM(CAST({_quote_sql_ident(col)} AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
+                            ELSE '[' || CAST({_quote_sql_ident(col)} AS VARCHAR) || ']'
                         END
                         """
 
@@ -414,7 +495,7 @@ class StrategicSegmentBuilder:
                         WITH binned AS (
                             SELECT 
                                 {case_expr} AS bin_label,
-                                CAST("{self.target}" AS DOUBLE) AS target
+                                CAST({_quote_sql_ident(self.target)} AS DOUBLE) AS target
                             FROM current_df
                         )
                         SELECT 
@@ -463,8 +544,8 @@ class StrategicSegmentBuilder:
                         f'''
                         SELECT
                             "__rs_row_id",
-                            "{col}",
-                            "{self.target}"
+                            {_quote_sql_ident(col)},
+                            {_quote_sql_ident(self.target)}
                         FROM current_df
                         ORDER BY "__rs_row_id"
                         '''
@@ -592,8 +673,8 @@ class StrategicSegmentBuilder:
                     f'''
                     SELECT
                         "__rs_row_id",
-                        "{col}",
-                        "{self.target}"
+                        {_quote_sql_ident(col)},
+                        {_quote_sql_ident(self.target)}
                     FROM current_df
                     ORDER BY "__rs_row_id"
                     '''
@@ -706,14 +787,14 @@ class StrategicSegmentBuilder:
             other_cols = [c for c in combo if c != col]
 
             group_cols = other_cols + [col]
-            select_cols = ", ".join(f'CAST("{c}" AS VARCHAR) AS "{c}"' for c in group_cols)
-            group_by_cols = ", ".join(f'"{c}"' for c in group_cols)
+            select_cols = ", ".join(f'CAST({_quote_sql_ident(c)} AS VARCHAR) AS {_quote_sql_ident(c)}' for c in group_cols)
+            group_by_cols = ", ".join(f'{_quote_sql_ident(c)}' for c in group_cols)
             try:
                 rows = con.execute(
                     f"""
                     SELECT {select_cols},
-                           COUNT("{self.target}")::BIGINT AS cnt,
-                           SUM(CAST("{self.target}" AS DOUBLE)) AS evt
+                           COUNT({_quote_sql_ident(self.target)})::BIGINT AS cnt,
+                           SUM(CAST({_quote_sql_ident(self.target)} AS DOUBLE)) AS evt
                     FROM binned_df
                     GROUP BY {group_by_cols}
                     """
@@ -884,7 +965,7 @@ class StrategicSegmentBuilder:
         # while still letting us evaluate hundreds of candidate rules efficiently.
         queries = []
         for combo in combo_list:
-            cols_str = ", ".join([f'"{c}"' for c in combo])
+            cols_str = ", ".join([f'{_quote_sql_ident(c)}' for c in combo])
             rule_concat = " || ' & ' || ".join(
                 [f"'{c}=' || CAST(\"{c}\" AS VARCHAR)" for c in combo]
             )
@@ -893,13 +974,13 @@ class StrategicSegmentBuilder:
             query = f"""
                     SELECT
                     {rule_concat} AS rule,
-                    COUNT("{self.target}")::BIGINT AS count,
-                    SUM(CAST("{self.target}" AS DOUBLE)) AS events,
+                    COUNT({_quote_sql_ident(self.target)})::BIGINT AS count,
+                    SUM(CAST({_quote_sql_ident(self.target)} AS DOUBLE)) AS events,
                     '{combo_str}' AS combo_vars_str
                     FROM binned_df
                     GROUP BY {cols_str}
-                    HAVING COUNT("{self.target}") >= {self.min_sample_size}
-                    AND SUM(CAST("{self.target}" AS DOUBLE)) >= {self.min_events}
+                    HAVING COUNT({_quote_sql_ident(self.target)}) >= {self.min_sample_size}
+                    AND SUM(CAST({_quote_sql_ident(self.target)} AS DOUBLE)) >= {self.min_events}
             """
             queries.append(query)
             
@@ -1017,16 +1098,6 @@ class StrategicSegmentBuilder:
         parts = [p.strip() for p in rule_str.split("&")]
         sql_conditions: List[str] = []
 
-        def _quote_sql_ident(ident: str) -> str:
-            # Quote every emitted column identifier so DuckDB reserved words
-            # (e.g. "default") and exotic column names do not break the predicate.
-            return '"' + str(ident).replace('"', '""') + '"'
-
-        def _quote_sql_string(val: Any) -> str:
-            txt = str(val)
-            # escape single quotes for SQL and wrap in single quotes
-            return "'" + txt.replace("'", "''") + "'"
-
         def _strip_wrapping_quotes(s: str) -> str:
             # Only strip a matching outer quote pair; never strip interior/unbalanced quotes
             # (Bug 4: str.strip("'\"") mangles values like Say "hi")
@@ -1034,10 +1105,10 @@ class StrategicSegmentBuilder:
             if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
                 return s[1:-1]
             return s
-        
+
         def _is_categorical_col(col_name: str) -> bool:
             return col_name in self._categorical_cols
-        
+
         # Each rule is composed of one or more ``column=interval`` parts joined by ``&``.
         # We convert each part independently and later combine them with logical AND.
         for part in parts:
@@ -1242,7 +1313,7 @@ class StrategicSegmentBuilder:
         db_temp_dir = self.db_temp_dir
 
         if db_path is None or db_temp_dir is None:
-            db_path, db_temp_dir = setup_disk_backed_db("experiments")
+            db_path, db_temp_dir = setup_disk_backed_db()
             auto_created_db = True
             # When persistence is requested, remember the path so later calls
             # (evaluate_final_coverage / generate_feature_health_report) reuse the
@@ -1253,31 +1324,7 @@ class StrategicSegmentBuilder:
             logger.info(f"📂 Created temporary disk-backed DB at: {db_path}")
 
         con = duckdb.connect(db_path)
-
-        total_cores = os.cpu_count() or 1
-        if self.engine_threads is not None:
-            target_threads = max(1, int(self.engine_threads))
-        else:
-            target_threads = max(1, total_cores - 2) if total_cores > 4 else total_cores
-        total_mem_gb = psutil.virtual_memory().total / (1024**3)
-        if self.memory_limit_gb is not None:
-            target_memory_gb = max(1, int(self.memory_limit_gb))
-        else:
-            # Default: utilise the host. On a 32 GB / 16-core box this yields
-            # ~25 GB buffer and ~14 threads. Override via memory_limit_gb /
-            # engine_threads on memory-constrained hardware.
-            target_memory_gb = max(1, int(total_mem_gb * 0.8))
-
-        con.execute(f"SET threads = {target_threads};")
-        con.execute(f"SET memory_limit = '{target_memory_gb}GB';")
-        if db_temp_dir:
-            con.execute(f"PRAGMA temp_directory='{db_temp_dir}';")
-        # con.execute("SET preserve_insertion_order = false;")
-        
-        logger.info(
-            f"⚙️ DuckDB Configured for Disk Spilling: Threads={target_threads}/{total_cores}, "
-            f"MemoryLimit={target_memory_gb}GB, TempDir={self.db_temp_dir}"
-        )
+        self._configure_duckdb(con, db_temp_dir)
         logger.info(f"📊 Sort priority: {self.sort_priority}")
         logger.info(
             f"📦 Binning method: {self.binning_method}"
@@ -1312,7 +1359,7 @@ class StrategicSegmentBuilder:
                 SELECT
                     ROW_NUMBER() OVER () AS "__rs_row_id",
                     * REPLACE (
-                        CAST("{self.target}" AS DOUBLE) AS "{self.target}"
+                        CAST({_quote_sql_ident(self.target)} AS DOUBLE) AS {_quote_sql_ident(self.target)}
                     )
                 FROM input_data_view
                 '''
@@ -1367,14 +1414,14 @@ class StrategicSegmentBuilder:
                 experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
 
             original_base_rate = con.execute(
-                f'SELECT AVG(CAST("{self.target}" AS DOUBLE)) FROM current_df'
+                f'SELECT AVG(CAST({_quote_sql_ident(self.target)} AS DOUBLE)) FROM current_df'
             ).fetchone()[0] or 0.0
 
             logger.info(f"🔒 Locking Original Base Rate: {original_base_rate*100:.2f}%")
 
             for i in range(1, self.max_segments + 1):
                 res = con.execute(
-                    f'SELECT AVG(CAST("{self.target}" AS DOUBLE)), COUNT(*) FROM current_df'
+                    f'SELECT AVG(CAST({_quote_sql_ident(self.target)} AS DOUBLE)), COUNT(*) FROM current_df'
                 ).fetchone()
                 current_base_rate, current_volume = res[0] or 0.0, res[1] or 0
 
@@ -1455,7 +1502,7 @@ class StrategicSegmentBuilder:
 
                 raw_target_arr = con.execute(
                     f'''
-                    SELECT "{self.target}"
+                    SELECT {_quote_sql_ident(self.target)}
                     FROM current_df
                     ORDER BY "__rs_row_id"
                     '''
@@ -1506,12 +1553,15 @@ class StrategicSegmentBuilder:
                 self.min_lift = global_min_lift
                 
                 all_candidate_rules: List[Dict[str, Any]] = []
+                # Track per-level candidate counts for the diagnostics funnel
+                n_1way = n_2way = n_3way = 0
 
                 # Level 1 (Singles)
                 res_1 = self._agg_combinations(con, [(c,) for c in valid_vars], original_base_rate)
                 valid_1way_vars = set()
                 if res_1:
                     valid_1way_vars = {c["combo_vars"][0] for c in res_1}
+                    n_1way = len(res_1)
                     if self.enable_1way:
                         all_candidate_rules.extend(res_1)
 
@@ -1523,6 +1573,7 @@ class StrategicSegmentBuilder:
                         res_2 = self._agg_combinations(con, combos_2, original_base_rate)
                         if res_2:
                             valid_2way_sets = {frozenset(c["combo_vars"]) for c in res_2}
+                            n_2way = len(res_2)
                             if self.enable_2way:
                                 all_candidate_rules.extend(res_2)
 
@@ -1535,6 +1586,7 @@ class StrategicSegmentBuilder:
                     if combos_3:
                         res_3 = self._agg_combinations(con, combos_3, original_base_rate)
                         if res_3:
+                            n_3way = len(res_3)
                             all_candidate_rules.extend(res_3)
 
                 # Build a shortlist of candidates for each grid configuration and keep the top
@@ -1555,6 +1607,9 @@ class StrategicSegmentBuilder:
 
                 if not grid_candidates:
                     self.diagnostics_[-1]["candidate_funnel"] = {
+                        "1way_candidates": n_1way,
+                        "2way_candidates": n_2way,
+                        "3way_candidates": n_3way,
                         "total_candidates_before_grid": len(all_candidate_rules),
                         "candidates_after_grid": 0,
                     }
@@ -1564,6 +1619,9 @@ class StrategicSegmentBuilder:
 
                 grid_candidates.sort(key=lambda x: self._get_sort_key(x), reverse=True)
                 self.diagnostics_[-1]["candidate_funnel"] = {
+                    "1way_candidates": n_1way,
+                    "2way_candidates": n_2way,
+                    "3way_candidates": n_3way,
                     "total_candidates_before_grid": len(all_candidate_rules),
                     "candidates_after_grid": len(grid_candidates),
                 }
@@ -1577,7 +1635,7 @@ class StrategicSegmentBuilder:
                     rule_str = candidate["rule"]
                     sql_filter = self.parse_rule_to_sql(rule_str)
                     actual = con.execute(
-                        f'SELECT COUNT(*) AS cnt, SUM(CAST("{self.target}" AS DOUBLE)) AS evt '
+                        f'SELECT COUNT(*) AS cnt, SUM(CAST({_quote_sql_ident(self.target)} AS DOUBLE)) AS evt '
                         f'FROM current_df WHERE ({sql_filter})'
                     ).fetchone()
                     actual_cnt, actual_evt = actual[0], actual[1] or 0
@@ -1810,8 +1868,7 @@ class StrategicSegmentBuilder:
         logger.info("📊 Evaluating final hierarchical coverage on original data...")
         target_db = self.db_path if self.db_path else ":memory:"
         con = duckdb.connect(target_db)
-        if self.db_temp_dir and os.path.exists(self.db_temp_dir):
-            con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
+        self._configure_duckdb(con, self.db_temp_dir)
 
         # Reuse the single materialised original dataset when present (persistent
         # mode), otherwise register the caller's data and materialise it here.
@@ -1846,8 +1903,8 @@ class StrategicSegmentBuilder:
             SELECT
                 CASE {case_sql} ELSE 0 END AS segment,
                 COUNT(*) AS total_count,
-                SUM(CAST("{self.target}" AS DOUBLE)) AS target_events,
-                (SUM(CAST("{self.target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
+                SUM(CAST({_quote_sql_ident(self.target)} AS DOUBLE)) AS target_events,
+                (SUM(CAST({_quote_sql_ident(self.target)} AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
             FROM original_df
             GROUP BY 1
         ),
@@ -2012,8 +2069,7 @@ class StrategicSegmentBuilder:
 
         target_db = self.db_path if self.db_path else ":memory:"
         con = duckdb.connect(target_db)
-        if self.db_temp_dir and os.path.exists(self.db_temp_dir):
-            con.execute(f"PRAGMA temp_directory='{self.db_temp_dir}';")
+        self._configure_duckdb(con, self.db_temp_dir)
 
         # Reuse the single materialised original dataset when present (persistent
         # mode), otherwise register the caller's data and materialise it here.
@@ -2045,8 +2101,8 @@ class StrategicSegmentBuilder:
 
         target_expr = f"""
         (CASE 
-            WHEN TRY_CAST("{self.target}" AS DOUBLE) IS NOT NULL THEN TRY_CAST("{self.target}" AS DOUBLE)
-            WHEN LOWER(TRIM(CAST("{self.target}" AS VARCHAR))) IN ('1', 'true', 'yes', 'y', 't') THEN 1.0
+            WHEN TRY_CAST({_quote_sql_ident(self.target)} AS DOUBLE) IS NOT NULL THEN TRY_CAST({_quote_sql_ident(self.target)} AS DOUBLE)
+            WHEN LOWER(TRIM(CAST({_quote_sql_ident(self.target)} AS VARCHAR))) IN ('1', 'true', 'yes', 'y', 't') THEN 1.0
             ELSE 0.0
         END)
         """
@@ -2079,11 +2135,11 @@ class StrategicSegmentBuilder:
                 query = f"""
                 WITH ranked AS (
                     SELECT
-                        "{col}" AS val,
+                        {_quote_sql_ident(col)} AS val,
                         {target_expr} AS target_val,
-                        NTILE({self.naive_bins}) OVER (ORDER BY "{col}") AS tile
+                        NTILE({self.naive_bins}) OVER (ORDER BY {_quote_sql_ident(col)}) AS tile
                     FROM input_df
-                    WHERE "{col}" IS NOT NULL
+                    WHERE {_quote_sql_ident(col)} IS NOT NULL
                 ),
                 numeric_bins AS (
                     SELECT
@@ -2105,7 +2161,7 @@ class StrategicSegmentBuilder:
                         TRUE AS is_missing,
                         1e18 AS sort_key
                     FROM input_df
-                    WHERE "{col}" IS NULL
+                    WHERE {_quote_sql_ident(col)} IS NULL
                     HAVING COUNT(*) > 0
                 )
                 SELECT bin, total_count, event_count, response_rate, is_missing
@@ -2120,14 +2176,14 @@ class StrategicSegmentBuilder:
                 query = f"""
                 SELECT
                     CASE
-                        WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
-                        ELSE '[' || CAST("{col}" AS VARCHAR) || ']'
+                        WHEN {_quote_sql_ident(col)} IS NULL OR TRIM(CAST({_quote_sql_ident(col)} AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN 'Missing'
+                        ELSE '[' || CAST({_quote_sql_ident(col)} AS VARCHAR) || ']'
                     END AS bin,
                     COUNT(*) AS total_count,
                     SUM({target_expr}) AS event_count,
                     (SUM({target_expr}) * 100.0 / COUNT(*)) AS response_rate,
                     CASE
-                        WHEN "{col}" IS NULL OR TRIM(CAST("{col}" AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN TRUE
+                        WHEN {_quote_sql_ident(col)} IS NULL OR TRIM(CAST({_quote_sql_ident(col)} AS VARCHAR)) IN ('', 'None', 'nan', 'NaN', '<NA>', 'null', 'NULL') THEN TRUE
                         ELSE FALSE
                     END AS is_missing
                 FROM input_df

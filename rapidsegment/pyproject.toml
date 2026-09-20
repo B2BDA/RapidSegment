@@ -1,6 +1,6 @@
 [project]
 name = "rapidsegment"
-version = "1.3.3"
+version = "1.3.4"
 description = "A fast, multi-segment population scoring and combinatorial heuristic rule extraction engine."
 readme = "README.md"
 authors = [
@@ -49,7 +49,6 @@ prettytable = [
 
 [project.scripts]
 rapidsegment-ui = "rapidsegment.ui.app:run_ui"
-rapidsegment-webui = "rapidsegment.webui.backend.main:run_webui"
 
 [project.urls]
 Homepage = "https://github.com/B2BDA/RapidSegment"

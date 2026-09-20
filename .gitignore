@@ -1,21 +1,21 @@
-# Python cache / compiled bytecode
-__pycache__/
+Python cache / compiled bytecode
+pycache/
 *.pyc
 *.pyo
 *.pyd
 
-# Build & distribution artifacts
+Build & distribution artifacts
 build/
 dist/
 *.egg-info/
 
-# Virtual environments
+Virtual environments
 .venv/
 venv/
 ENV/
 .uv/
 
-# Test / tool caches
+Test / tool caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -25,7 +25,7 @@ htmlcov/
 .cache/
 .ipynb_checkpoints/
 
-# Editor / OS files
+Editor / OS files
 .vscode/
 .idea/
 *.swp
@@ -33,30 +33,31 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Databases / data files (runtime + sample data)
+Databases / data files (runtime + sample data)
 *.db
 *.db.wal
 *.duckdb
 *.parquet
 data
-# *.csv
-# *.ipynb
 
-# Generated / runtime artifacts
-*.json
-*.png
+*.csv
+*.ipynb
+# Generated / runtime artifacts (scoped to avoid hiding committed JSON/PNG)
+# experiments/.json
+# rapidsegment/.json
 *.log
+*.json
 
-# npm manifests (committed) — re-enable the specific files the repo needs
+npm manifests (committed) — re-enable the specific files the repo needs
 !package.json
 !package-lock.json
 !tsconfig.json
 !tsconfig.node.json
 
-# Node / npm
+Node / npm
 node_modules/
-*.tsbuildinfo
-npm-debug.log*
+.tsbuildinfo
+npm-debug.log
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
@@ -66,10 +67,11 @@ playwright-report/
 blob-report/
 playwright/.cache/
 
-# generated from vite.config.ts by `tsc -b`
+Stale webui stubs — the webui package was never shipped; these paths
+don't exist in the tree but are kept here in case the entry point is
+revived later.
 rapidsegment/src/rapidsegment/webui/frontend/vite.config.js
 rapidsegment/src/rapidsegment/webui/frontend/vite.config.d.ts
-
-# Runtime suites / experiments
+Runtime suites / experiments
 experiments/
 .rapidsegment_suite/

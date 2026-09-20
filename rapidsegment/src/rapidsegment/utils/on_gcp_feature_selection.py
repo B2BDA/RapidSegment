@@ -15,11 +15,15 @@ import duckdb
 # -----------------------------------------------------------------------------
 # Module-level configuration
 # -----------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+# Child of the canonical "StrategicEngine" logger so records propagate up to
+# the handler attached centrally in rapidsegment/__init__.py.
+logger = logging.getLogger("StrategicEngine.FeatureSelection")
+
+
+def _quote_bq_ident(ident: str) -> str:
+    """Quote a BigQuery identifier by wrapping it in backticks and
+    escaping any embedded backticks."""
+    return "`" + str(ident).replace("`", "``") + "`"
 
 
 class BigQueryFeatureSelector:
@@ -94,7 +98,7 @@ class BigQueryFeatureSelector:
         logger.info("🔍 Performing dynamic profiling on numerical columns to detect binary flags...")
 
         select_expressions = [
-            f"COUNT(DISTINCT {col}) AS `{col}`" for col in numerical_columns
+            f"COUNT(DISTINCT {_quote_bq_ident(col)}) AS {_quote_bq_ident(col)}" for col in numerical_columns
         ]
         query = f"SELECT {', '.join(select_expressions)} FROM {self.full_table_path}"
 
@@ -175,8 +179,8 @@ class BigQueryFeatureSelector:
         sql_parts = [f"""
         WITH global_stats AS (
             SELECT
-                COUNTIF({self.target_column} = 0) AS total_goods,
-                COUNTIF({self.target_column} = 1) AS total_bads
+                COUNTIF({_quote_bq_ident(self.target_column)} = 0) AS total_goods,
+                COUNTIF({_quote_bq_ident(self.target_column)} = 1) AS total_bads
             FROM {self.full_table_path}
         )
         """]
@@ -206,21 +210,21 @@ class BigQueryFeatureSelector:
             part = f"""
             SELECT
                 '{col}' AS feature_name,
-                (SELECT STDDEV({col}) FROM {self.full_table_path}) AS feature_stddev,
+                (SELECT STDDEV({_quote_bq_ident(col)}) FROM {self.full_table_path}) AS feature_stddev,
                 {iv_calculation_template}
             FROM
             (
                 SELECT
                     bin,
-                    COUNTIF({self.target_column} = 0) AS goods_in_bin,
-                    COUNTIF({self.target_column} = 1) AS bads_in_bin
+                    COUNTIF({_quote_bq_ident(self.target_column)} = 0) AS goods_in_bin,
+                    COUNTIF({_quote_bq_ident(self.target_column)} = 1) AS bads_in_bin
                 FROM
                 (
                     SELECT
-                        NTILE({self.bins}) OVER (ORDER BY {col}) AS bin,
-                        {self.target_column}
+                        NTILE({self.bins}) OVER (ORDER BY {_quote_bq_ident(col)}) AS bin,
+                        {_quote_bq_ident(self.target_column)}
                     FROM {self.full_table_path}
-                    WHERE {col} IS NOT NULL
+                    WHERE {_quote_bq_ident(col)} IS NOT NULL
                 )
                 GROUP BY bin
             )
@@ -238,11 +242,11 @@ class BigQueryFeatureSelector:
             FROM
             (
                 SELECT
-                    CAST({col} AS STRING) AS bin,
-                    COUNTIF({self.target_column} = 0) AS goods_in_bin,
-                    COUNTIF({self.target_column} = 1) AS bads_in_bin
+                    CAST({_quote_bq_ident(col)} AS STRING) AS bin,
+                    COUNTIF({_quote_bq_ident(self.target_column)} = 0) AS goods_in_bin,
+                    COUNTIF({_quote_bq_ident(self.target_column)} = 1) AS bads_in_bin
                 FROM {self.full_table_path}
-                WHERE {col} IS NOT NULL
+                WHERE {_quote_bq_ident(col)} IS NOT NULL
                 GROUP BY 1
             )
             CROSS JOIN global_stats

@@ -594,25 +594,34 @@ class TestStateHelpers:
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not _has_streamlit, reason="requires streamlit[ui] extra")
 class TestUISQLQuoting:
-    """Verify that UI pages import _quote_sql_ident and use it correctly.
+    """Verify that UI pages import _quote_sql_ident via AST analysis.
 
-    These tests require streamlit (UI extra) to be installed.
+    Page modules cannot be imported outside Streamlit runtime (top-level side
+    effects), so we parse the source instead.
     """
 
+    @staticmethod
+    def _has_quote_ident_import(filepath: str) -> bool:
+        tree = ast.parse(open(filepath, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module and "_quote_sql_ident" in [
+                    alias.name for alias in node.names
+                ]:
+                    return True
+        return False
+
     def test_page1_imports_quote_ident(self):
-        pytest.importorskip("streamlit", reason="requires streamlit[ui] extra")
-        import importlib
-        mod = importlib.import_module("rapidsegment.ui.pages.1_Data_Loader")
-        assert hasattr(mod, "_quote_sql_ident")
+        import rapidsegment.ui.pages as pkg
+        page = os.path.join(os.path.dirname(pkg.__file__), "1_Data_Loader.py")
+        assert self._has_quote_ident_import(page)
 
     def test_page3_imports_quote_ident(self):
-        pytest.importorskip("streamlit", reason="requires streamlit[ui] extra")
-        import importlib
-        mod = importlib.import_module("rapidsegment.ui.pages.3_Execution_Console")
-        assert hasattr(mod, "_quote_sql_ident")
+        import rapidsegment.ui.pages as pkg
+        page = os.path.join(os.path.dirname(pkg.__file__), "3_Execution_Console.py")
+        assert self._has_quote_ident_import(page)
 
     def test_page4_imports_quote_ident(self):
-        pytest.importorskip("streamlit", reason="requires streamlit[ui] extra")
-        import importlib
-        mod = importlib.import_module("rapidsegment.ui.pages.4_Results_Dashboard")
-        assert hasattr(mod, "_quote_sql_ident")
+        import rapidsegment.ui.pages as pkg
+        page = os.path.join(os.path.dirname(pkg.__file__), "4_Results_Dashboard.py")
+        assert self._has_quote_ident_import(page)

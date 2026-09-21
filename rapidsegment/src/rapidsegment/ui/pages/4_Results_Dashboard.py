@@ -41,6 +41,7 @@ from rapidsegment.builder import _quote_sql_ident
 from rapidsegment.ui._state import (
     SUITE_DIR, DB_FILE, DB_FILE_MOD, SUITE_DB, ARTIFACTS_DIR,
     active_db, db_query, db_scalar, rerun, card, _jsonable, fmt_duration,
+    _build_coverage_sql, _build_sql_script, render_coverage_table,
 )
 
 SEG_COLORS = [
@@ -134,7 +135,7 @@ def load_experiment():
 
 
 def load_segments_from_artifacts(exp):
-    """Recover full segments/coverage from the saved artifact JSON if present."""
+    """Recover full segments/coverage/stop_reason from the saved artifact JSON."""
     exp_id = exp.get("exp_id")
     if not exp_id:
         return None, None
@@ -145,6 +146,8 @@ def load_segments_from_artifacts(exp):
         with open(path, "r", encoding="utf-8") as fh:
             saved = json.load(fh)
         res = saved.get("result") or {}
+        if exp.get("result") and res.get("stop_reason"):
+            exp["result"]["stop_reason"] = res["stop_reason"]
         return res.get("segments") or [], res.get("coverage") or []
     except Exception:
         return None, None
@@ -421,79 +424,6 @@ def _fig_feature_importance(segments, feature_groups):
     return fig
 
 
-# ── SQL builder (reuses Module 3 style) ───────────────────────────────────────
-def _build_coverage_sql(segments, target):
-    if not segments:
-        return "-- No segments — coverage query skipped."
-    indent = "            "
-    case_sql = ("\n" + indent).join(
-        f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}" for seg in segments
-    )
-    return f"""
-WITH PER_SEG_KPIS AS (
-    SELECT CASE {case_sql} ELSE 0 END AS segment,
-           COUNT(*) AS total_count,
-           SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) AS target_events,
-           (SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
-    FROM input_data_view
-    GROUP BY 1
-),
-BASE_KPIS AS (
-    SELECT *, SUM(total_count) OVER() AS total_population,
-             SUM(target_events) OVER() AS total_target_events,
-             (SUM(target_events) OVER() * 1.0 / SUM(total_count) OVER()) * 100 AS base_response_rate
-    FROM PER_SEG_KPIS
-),
-CUMULATIVE_KPIS AS (
-    SELECT *, SUM(total_count) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_count,
-              SUM(target_events) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_events
-    FROM BASE_KPIS
-)
-SELECT segment, total_count, target_events, response_rate, base_response_rate,
-       (total_count * 100.0 / total_population) AS capture_rate,
-       (response_rate / NULLIF(base_response_rate, 0)) AS lift,
-       (cum_count * 100.0 / NULLIF(total_population, 0)) AS cumulative_sample_capture,
-       (cum_events * 100.0 / NULLIF(total_target_events, 0)) AS cumulative_event_capture
-FROM CUMULATIVE_KPIS
-ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
-"""
-
-
-def _build_sql_script(segments, coverage, cfg=None, exp=None):
-    cfg = cfg or {}
-    exp = exp or {}
-    table = cfg.get("data_table") or "udl_data"
-    target = cfg.get("target_col") or ""
-    lines = [
-        "-- =====================================================================",
-        "-- RapidSegment — deployable segment SQL",
-        f"-- Experiment : {exp.get('name', '')} ({exp.get('exp_id', '')})",
-        f"-- Status     : {exp.get('status', '')}",
-        f"-- Target     : {target}",
-        f"-- Table      : {table}",
-        "-- =====================================================================",
-        "",
-        "-- 1. Per-segment WHERE filters (copy into your own query)",
-    ]
-    for s in segments:
-        lines.append(f"-- Segment {s['segment_id']} . {s['rule_string']}")
-        lines.append(f"SELECT * FROM {table} WHERE ({s['sql_filter']});")
-        lines.append("")
-    lines.append("-- 2. Full segment assignment (CASE WHEN, in extraction order)")
-    lines.append("SELECT *,")
-    if segments:
-        case_lines = ",\n".join(
-            f"         WHEN ({s['sql_filter']}) THEN {s['segment_id']}" for s in segments
-        )
-        lines.append(f"       CASE\n{case_lines}\n         ELSE 0 END AS segment")
-    else:
-        lines.append("       0 AS segment  -- no segments found")
-    lines.append(f"FROM {table};")
-    lines.append("")
-    lines.append("-- 3. Final coverage (CTE — run against the original table)")
-    lines.append(_build_coverage_sql(segments, target))
-    return "\n".join(lines)
-
 
 # ── HTML report ───────────────────────────────────────────────────────────────
 def _build_html_report(exp, res, segments, coverage, scorecard):
@@ -541,36 +471,6 @@ def render_summary_cards(exp, res):
     m[4].metric("Baseline rate", f"{res.get('baseline_rate_pct', 0):.2f}%")
     m[5].metric("Elapsed", fmt_duration(exp.get("execution_time_sec", 0)))
 
-
-def render_segments_table(segments, coverage, weights):
-    if not segments:
-        st.caption("No segments were produced by this experiment.")
-        return
-    cov_by_seg = {int(r.get("segment")): r for r in (coverage or []) if r.get("segment")}
-    rows = []
-    for s in segments:
-        c = cov_by_seg.get(int(s["segment_id"]), {})
-        rows.append({
-            "segment_id": s["segment_id"],
-            "rule_string": s.get("rule_string", ""),
-            "sql_filter": s.get("sql_filter", ""),
-            "count": s.get("count", 0),
-            "rate": s.get("rate", 0),
-            "lift": s.get("lift", 0),
-            "capture_rate": c.get("capture_rate", s.get("capture_rate", 0)),
-            "weight": weights.get(s["segment_id"], 0),
-            "meta_applied_sample_size": s.get("meta_applied_sample_size", ""),
-            "meta_applied_min_lift": s.get("meta_applied_min_lift", ""),
-        })
-    df = pd.DataFrame(rows)
-    for col in ("rate", "lift", "capture_rate"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    st.dataframe(df, width='stretch', hide_index=True)
-    with st.expander("Expand a segment for full SQL WHERE clause"):
-        for s in segments:
-            st.markdown(f"**Segment {s['segment_id']}** - `{s.get('rule_string','')}`")
-            st.code(s.get("sql_filter", ""), language="sql")
 
 
 def render_visualizations(segments, coverage, scorecard, cfg):
@@ -664,7 +564,7 @@ def _build_diag_builder(cfg, data_path, exp_id=None):
     (cached on session state) only when no persisted diagnostics are available.
     """
     cached = st.session_state.get("m4_diag_builder")
-    if cached is not None:
+    if cached is not None and st.session_state.get("m4_diag_exp_id") == exp_id:
         return cached
     full = _normalize_cfg(cfg)
 
@@ -678,29 +578,32 @@ def _build_diag_builder(cfg, data_path, exp_id=None):
                 res = saved.get("result") or {}
                 diag = res.get("diagnostics_")
                 if diag:
+                    # Prefer the artifact's own config (guaranteed to match the original run)
+                    art_cfg = _normalize_cfg(saved.get("config") or cfg)
                     b = StrategicSegmentBuilder(
-                        target=full.get("target_col") or "",
-                        n_jobs=full.get("n_jobs", -1),
-                        min_sample_size=full.get("min_sample_size", 1000),
-                        min_lift=full.get("min_lift", 1.5),
-                        min_events=full.get("min_events", 100),
-                        top_n_vars=full.get("top_n_vars", 15),
-                        max_segments=full.get("max_segments", 10),
-                        max_feature_reuse=full.get("max_feature_reuse", 1),
-                        enable_diversity=full.get("enable_diversity", False),
-                        enable_1way=full.get("enable_1way", True),
-                        enable_2way=full.get("enable_2way", True),
-                        enable_3way=full.get("enable_3way", True),
-                        selection_metric=full.get("selection_metric", "iv"),
-                        binning_method=full.get("binning_method", "optimal_cart"),
-                        naive_bins=full.get("naive_bins", 5),
-                        max_expansion_hops=full.get("max_expansion_hops", 0),
+                        target=art_cfg.get("target_col") or "",
+                        n_jobs=art_cfg.get("n_jobs", -1),
+                        min_sample_size=art_cfg.get("min_sample_size", 1000),
+                        min_lift=art_cfg.get("min_lift", 1.5),
+                        min_events=art_cfg.get("min_events", 100),
+                        top_n_vars=art_cfg.get("top_n_vars", 15),
+                        max_segments=art_cfg.get("max_segments", 10),
+                        max_feature_reuse=art_cfg.get("max_feature_reuse", 1),
+                        enable_diversity=art_cfg.get("enable_diversity", False),
+                        enable_1way=art_cfg.get("enable_1way", True),
+                        enable_2way=art_cfg.get("enable_2way", True),
+                        enable_3way=art_cfg.get("enable_3way", True),
+                        selection_metric=art_cfg.get("selection_metric", "iv"),
+                        binning_method=art_cfg.get("binning_method", "optimal_cart"),
+                        naive_bins=art_cfg.get("naive_bins", 5),
+                        max_expansion_hops=art_cfg.get("max_expansion_hops", 0),
                     )
                     b.diagnostics_ = diag
                     b.segments = res.get("segments") or []
                     b.stop_reason = res.get("stop_reason")
                     b.feature_usage_counts = res.get("feature_usage_counts") or {}
                     st.session_state["m4_diag_builder"] = b
+                    st.session_state["m4_diag_exp_id"] = exp_id
                     return b
             except Exception:
                 pass
@@ -729,6 +632,7 @@ def _build_diag_builder(cfg, data_path, exp_id=None):
     with st.spinner("Running extraction to collect diagnostics..."):
         b.extract_segments(data_path)
     st.session_state["m4_diag_builder"] = b
+    st.session_state["m4_diag_exp_id"] = exp_id
     return b
 
 
@@ -908,6 +812,7 @@ def render_diagnostics(exp, cfg, data_path, segments):
             st.caption("Dataset not available - reload in Module 1 to enable the full diagnostic.")
         else:
             if st.button("Run full diagnostics", key="m4_diag"):
+                st.session_state.pop("m4_noseg", None)
                 b = _build_diag_builder(cfg, data_path, exp.get("exp_id"))
                 if b is not None:
                     st.session_state["m4_noseg"] = b.explain_no_segments()
@@ -978,28 +883,27 @@ def render_export_hub(exp, segments, coverage, scorecard, cfg):
     sql_script = _build_sql_script(segments, coverage, cfg=cfg, exp=exp).encode("utf-8")
     html_report = _build_html_report(exp, res, segments, coverage, scorecard).encode("utf-8")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.download_button("Segments (CSV)", segs_csv, file_name=f"segments_{exp.get('exp_id','')}.csv",
-                       mime="text/csv", width='stretch')
-    c2.download_button("Coverage (CSV)", cov_csv, file_name=f"coverage_{exp.get('exp_id','')}.csv",
-                       mime="text/csv", width='stretch')
-    c3.download_button("Config (JSON)", cfg_json, file_name=f"config_{exp.get('exp_id','')}.json",
-                       mime="application/json", width='stretch')
-    c4.download_button("SQL (deployable)", sql_script, file_name=f"segments_{exp.get('exp_id','')}.sql",
-                       mime="text/plain", width='stretch')
-    c5.download_button("Report (HTML)", html_report, file_name=f"report_{exp.get('exp_id','')}.html",
-                       mime="text/html", width='stretch')
-
-    # Runnable Python script export
-    runnable_script = _build_runnable_script(exp, cfg, data_path).encode("utf-8")
-    st.download_button("Runnable Python script", runnable_script,
-                       file_name=f"run_{exp.get('exp_id','')}.py", mime="text/x-python",
-                       width='stretch')
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("Segments (CSV)", segs_csv, file_name=f"segments_{exp.get('exp_id','')}.csv",
+                           mime="text/csv")
+        st.download_button("Coverage (CSV)", cov_csv, file_name=f"coverage_{exp.get('exp_id','')}.csv",
+                           mime="text/csv")
+        st.download_button("Config (JSON)", cfg_json, file_name=f"config_{exp.get('exp_id','')}.json",
+                           mime="application/json")
+    with c2:
+        st.download_button("SQL (deployable)", sql_script, file_name=f"segments_{exp.get('exp_id','')}.sql",
+                           mime="text/plain")
+        st.download_button("Report (HTML)", html_report, file_name=f"report_{exp.get('exp_id','')}.html",
+                           mime="text/html")
+        st.download_button("Runnable script (.py)",
+                           _build_runnable_script(exp, cfg, active_db()).encode("utf-8"),
+                           file_name=f"run_{exp.get('exp_id','')}.py", mime="text/x-python")
 
     if scorecard is not None:
         sc_json = json.dumps(scorecard, indent=2).encode("utf-8")
         st.download_button("Scorecard (JSON)", sc_json, file_name=f"scorecard_{exp.get('exp_id','')}.json",
-                           mime="application/json", width='stretch')
+                           mime="application/json")
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1011,8 +915,7 @@ def render_export_hub(exp, segments, coverage, scorecard, cfg):
         if scorecard is not None:
             zf.writestr("scorecard.json", sc_json.decode("utf-8", "ignore"))
     st.download_button("Download ALL (ZIP)", zip_buf.getvalue(),
-                       file_name=f"rapidsegment_{exp.get('exp_id','')}.zip", mime="application/zip",
-                       width='stretch')
+                       file_name=f"rapidsegment_{exp.get('exp_id','')}.zip", mime="application/zip")
 
 
 # ── Page setup ───────────────────────────────────────────────────────────────
@@ -1068,8 +971,17 @@ weights = map_weights(scorecard, segments)
 st.divider()
 render_summary_cards(exp, exp.get("result") or {})
 
-st.subheader("Segments")
-render_segments_table(segments, coverage, weights)
+st.subheader("Coverage")
+render_coverage_table(segments, coverage, weights)
+
+if segments:
+    with st.expander("Expand a segment for full SQL WHERE clause"):
+        parts = []
+        for s in segments:
+            parts.append(f"-- Segment {s['segment_id']} · {s['rule_string']}")
+            parts.append(s.get("sql_filter") or "")
+            parts.append("")
+        st.code("\n".join(parts), language="sql")
 
 st.subheader("Visualizations")
 render_visualizations(segments, coverage, scorecard, cfg)

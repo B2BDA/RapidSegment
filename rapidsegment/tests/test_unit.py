@@ -594,34 +594,36 @@ class TestStateHelpers:
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not _has_streamlit, reason="requires streamlit[ui] extra")
 class TestUISQLQuoting:
-    """Verify that UI pages import _quote_sql_ident via AST analysis.
+    """Verify that UI pages import SQL quoting via AST analysis.
 
     Page modules cannot be imported outside Streamlit runtime (top-level side
     effects), so we parse the source instead.
+
+    Pages 1 & 4 import _quote_sql_ident directly (they build SQL inline).
+    Page 3 imports _build_coverage_sql / _build_sql_script from _state
+    (which use _quote_sql_ident internally).
     """
 
     @staticmethod
-    def _has_quote_ident_import(filepath: str) -> bool:
+    def _has_import(filepath: str, name: str) -> bool:
         tree = ast.parse(open(filepath, encoding="utf-8").read())
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                if node.module and "_quote_sql_ident" in [
-                    alias.name for alias in node.names
-                ]:
+                if node.module and name in [alias.name for alias in node.names]:
                     return True
         return False
 
     def test_page1_imports_quote_ident(self):
         import rapidsegment.ui.pages as pkg
         page = os.path.join(os.path.dirname(pkg.__file__), "1_Data_Loader.py")
-        assert self._has_quote_ident_import(page)
+        assert self._has_import(page, "_quote_sql_ident")
 
-    def test_page3_imports_quote_ident(self):
+    def test_page3_imports_sql_builders(self):
         import rapidsegment.ui.pages as pkg
         page = os.path.join(os.path.dirname(pkg.__file__), "3_Execution_Console.py")
-        assert self._has_quote_ident_import(page)
+        assert self._has_import(page, "_build_sql_script")
 
-    def test_page4_imports_quote_ident(self):
+    def test_page4_imports_sql_builders(self):
         import rapidsegment.ui.pages as pkg
         page = os.path.join(os.path.dirname(pkg.__file__), "4_Results_Dashboard.py")
-        assert self._has_quote_ident_import(page)
+        assert self._has_import(page, "_build_sql_script")

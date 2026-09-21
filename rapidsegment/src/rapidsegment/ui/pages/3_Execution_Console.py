@@ -43,11 +43,11 @@ import streamlit as st
 
 from rapidsegment import StrategicSegmentBuilder
 from rapidsegment.ui._theme import apply_cyberpunk_theme
-from rapidsegment.builder import _quote_sql_ident
 
 from rapidsegment.ui._state import (
     SUITE_DIR, DB_FILE, DB_FILE_MOD, SUITE_DB, ARTIFACTS_DIR,
     active_db, db_query, db_scalar, rerun, card, _jsonable, fmt_duration,
+    _build_coverage_sql, _build_sql_script, render_coverage_table,
 )
 
 # ── Page-specific constants ──────────────────────────────────────────────────
@@ -235,79 +235,6 @@ def _current_feature(run):
         pass
     return "—"
 
-
-# ── Coverage + SQL generation (local, in-memory — no library evaluate_* call) ─
-def _build_coverage_sql(segments, target):
-    if not segments:
-        return "-- No segments — coverage query skipped."
-    indent = "            "
-    case_sql = ("\n" + indent).join(
-        f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}" for seg in segments
-    )
-    return f"""
-WITH PER_SEG_KPIS AS (
-    SELECT CASE {case_sql} ELSE 0 END AS segment,
-           COUNT(*) AS total_count,
-           SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) AS target_events,
-           (SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
-    FROM input_data_view
-    GROUP BY 1
-),
-BASE_KPIS AS (
-    SELECT *, SUM(total_count) OVER() AS total_population,
-             SUM(target_events) OVER() AS total_target_events,
-             (SUM(target_events) OVER() * 1.0 / SUM(total_count) OVER()) * 100 AS base_response_rate
-    FROM PER_SEG_KPIS
-),
-CUMULATIVE_KPIS AS (
-    SELECT *, SUM(total_count) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_count,
-             SUM(target_events) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_events
-    FROM BASE_KPIS
-)
-SELECT segment, total_count, target_events, response_rate, base_response_rate,
-       (total_count * 100.0 / total_population) AS capture_rate,
-       (response_rate / NULLIF(base_response_rate, 0)) AS lift,
-       (cum_count * 100.0 / NULLIF(total_population, 0)) AS cumulative_sample_capture,
-       (cum_events * 100.0 / NULLIF(total_target_events, 0)) AS cumulative_event_capture
-FROM CUMULATIVE_KPIS
-ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
-"""
-
-
-def _build_sql_script(segments, coverage, cfg=None, exp=None):
-    cfg = cfg or {}
-    exp = exp or {}
-    table = cfg.get("data_table") or "udl_data"
-    target = cfg.get("target_col") or ""
-    lines = [
-        "-- =====================================================================",
-        "-- RapidSegment — deployable segment SQL",
-        f"-- Experiment : {exp.get('name', '')} ({exp.get('exp_id', '')})",
-        f"-- Status     : {exp.get('status', '')}",
-        f"-- Target     : {target}",
-        f"-- Table      : {table}",
-        "-- =====================================================================",
-        "",
-        "-- 1. Per-segment WHERE filters (copy into your own query)",
-    ]
-    for s in segments:
-        lines.append(f"-- Segment {s['segment_id']} · {s['rule_string']}")
-        lines.append(f"SELECT * FROM {table} WHERE ({s['sql_filter']});")
-        lines.append("")
-    lines.append("-- 2. Full segment assignment (CASE WHEN, in extraction order)")
-    lines.append("SELECT *,")
-    if segments:
-        case_lines = ",\n".join(
-            f"         WHEN ({s['sql_filter']}) THEN {s['segment_id']}" for s in segments
-        )
-        lines.append(f"       CASE\n{case_lines}\n         ELSE 0 END AS segment")
-    else:
-        lines.append("       0 AS segment  -- no segments found")
-    lines.append(f"FROM {table};")
-    lines.append("")
-    lines.append("-- 3. Final coverage (CTE — run against the original table)")
-    lines.append(_build_coverage_sql(segments, target))
-    return "\n".join(lines)
 
 
 # ── Persistence (same contract as Module 2) ──────────────────────────────────
@@ -727,16 +654,12 @@ def _render_console(run, live=False):
     with right_col:
         st.markdown("#### SQL Inspector")
         if segs:
+            parts = []
             for s in segs:
-                st.caption(f"Segment {s['segment_id']} · `{s['rule_string']}`")
-                st.code(s.get("sql_filter") or "", language="sql")
-                st.download_button(
-                    "Copy SQL",
-                    (s.get("sql_filter") or "").encode("utf-8"),
-                    file_name=f"segment_{s['segment_id']}.sql", mime="text/plain",
-                    key=f"m3_sql_{run['exp_id']}_{s['segment_id']}",
-                    width='stretch',
-                )
+                parts.append(f"-- Segment {s['segment_id']} · {s['rule_string']}")
+                parts.append(s.get("sql_filter") or "")
+                parts.append("")
+            st.code("\n".join(parts), language="sql")
         else:
             st.caption("Waiting for segments…")
 
@@ -756,33 +679,6 @@ def _render_live(run):
     _render_console(run, live=True)
 
 
-def _render_export_hub(run, exp):
-    st.divider()
-    st.subheader("Export Hub")
-    res = exp.get("result") or {}
-    logs_txt = _logs_txt(run.get("logs") or [])
-    sql_script = _build_sql_script(
-        res.get("segments") or [], res.get("coverage") or [],
-        cfg=exp.get("config") or {}, exp=exp,
-    )
-    cfg_json = json.dumps(exp.get("config") or {}, indent=2)
-    e1, e2, e3 = st.columns(3)
-    e1.download_button(
-        "⬇️ Logs.txt", logs_txt.encode("utf-8"),
-        file_name=f"logs_{exp['exp_id']}.txt", mime="text/plain",
-        key=f"dl_logs_{exp['exp_id']}", width='stretch',
-    )
-    e2.download_button(
-        "⬇️ SQL.sql", sql_script.encode("utf-8"),
-        file_name=f"segments_{exp['exp_id']}.sql", mime="text/plain",
-        key=f"dl_sql_{exp['exp_id']}", width='stretch',
-    )
-    e3.download_button(
-        "⬇️ Config.json", cfg_json.encode("utf-8"),
-        file_name=f"config_{exp['exp_id']}.json", mime="application/json",
-        key=f"dl_cfg_{exp['exp_id']}", width='stretch',
-    )
-
 
 def _render_results(exp):
     st.divider()
@@ -798,19 +694,9 @@ def _render_results(exp):
     m[3].metric("Max lift", f"{res.get('max_lift', 0):.2f}×")
     m[4].metric("Baseline rate", f"{res.get('baseline_rate_pct', 0):.2f}%")
     m[5].metric("Elapsed", fmt_duration(exp.get("execution_time_sec", 0)))
-    if segments:
-        seg_cols = ["segment_id", "rule_string", "sql_filter", "count", "rate",
-                    "lift", "meta_applied_sample_size", "meta_applied_min_lift"]
-        seg_df = pd.DataFrame(segments)
-        st.markdown("**Segments**")
-        st.dataframe(
-            seg_df[[c for c in seg_cols if c in seg_df.columns]],
-            height=300, width='stretch', hide_index=True,
-        )
     if coverage:
-        st.markdown("**Final coverage (events vs. non-events)**")
-        st.dataframe(pd.DataFrame(coverage), height=300,
-                     width='stretch', hide_index=True)
+        st.markdown("**Coverage**")
+        render_coverage_table(segments, coverage)
     else:
         st.caption("No coverage rows — experiment produced no segments.")
 
@@ -848,27 +734,8 @@ def _render_view(exp):
                  f"{(exp.get('result') or {}).get('error_msg') or 'unknown error'}")
     run = _view_run(exp)
     _render_console(run, live=False)
-    _render_export_hub(run, exp)
     _render_results(exp)
     st.divider()
-    c1, c2 = st.columns(2)
-    with c1:
-        lc = st.session_state.get("last_config")
-        if st.button(
-            "♻️ Re-run last config", width='stretch',
-            disabled=not lc, key=f"m3_rerun_{exp.get('exp_id', 'view')}",
-        ):
-            if lc:
-                st.session_state["pending_run"] = dict(lc)
-                rerun()
-        if not lc:
-            st.caption("No stored config to re-run — start from the Workbench.")
-    with c2:
-        try:
-            st.page_link("pages/2_Workbench.py",
-                         label="Configure new experiment in Workbench (Module 2)", icon="⚙️")
-        except Exception:
-            st.caption("Configure a new experiment in the Workbench (Module 2).")
 
 
 def _render_final(run):
@@ -880,7 +747,6 @@ def _render_final(run):
     _render_console(run, live=False)
     exp = run.get("experiment") or {}
     if exp:
-        _render_export_hub(run, exp)
         _render_results(exp)
 
 

@@ -6,6 +6,7 @@ Every page imports paths (SUITE_DIR, DB_FILE, …) and utility functions
 import os
 
 import duckdb
+import pandas as pd
 import streamlit as st
 
 # ── Paths (must match modules 1–5) ──────────────────────────────────────────
@@ -61,7 +62,10 @@ def db_write(arrow_table):
 
 
 def db_query(sql, read_only=True):
-    con = duckdb.connect(active_db(), read_only=read_only)
+    path = active_db()
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    con = duckdb.connect(path, read_only=read_only)
     try:
         result = con.execute(sql).df()
     finally:
@@ -70,7 +74,10 @@ def db_query(sql, read_only=True):
 
 
 def db_scalar(sql):
-    con = duckdb.connect(active_db(), read_only=True)
+    path = active_db()
+    if not os.path.exists(path):
+        return 0
+    con = duckdb.connect(path, read_only=True)
     try:
         result = con.execute(sql).fetchone()[0]
     finally:
@@ -132,3 +139,97 @@ def fmt_duration(secs):
     if secs < 3600:
         return f"{secs // 60}m {secs % 60:02d}s"
     return f"{secs // 3600}h {secs % 3600 // 60:02d}m"
+
+
+# ── SQL builders (shared by pages 3 & 4) ───────────────────────────────────
+def _build_coverage_sql(segments, target):
+    from rapidsegment.builder import _quote_sql_ident
+    if not segments:
+        return "-- No segments — coverage query skipped."
+    indent = "            "
+    case_sql = ("\n" + indent).join(
+        f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}" for seg in segments
+    )
+    return f"""
+WITH PER_SEG_KPIS AS (
+    SELECT CASE {case_sql} ELSE 0 END AS segment,
+           COUNT(*) AS total_count,
+           SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) AS target_events,
+           (SUM(CAST({_quote_sql_ident(target)} AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
+    FROM input_data_view
+    GROUP BY 1
+),
+BASE_KPIS AS (
+    SELECT *, SUM(total_count) OVER() AS total_population,
+             SUM(target_events) OVER() AS total_target_events,
+             (SUM(target_events) OVER() * 1.0 / SUM(total_count) OVER()) * 100 AS base_response_rate
+    FROM PER_SEG_KPIS
+),
+CUMULATIVE_KPIS AS (
+    SELECT *, SUM(total_count) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_count,
+             SUM(target_events) OVER (ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END) AS cum_events
+    FROM BASE_KPIS
+)
+SELECT segment, total_count, target_events, response_rate, base_response_rate,
+       (total_count * 100.0 / total_population) AS capture_rate,
+       (response_rate / NULLIF(base_response_rate, 0)) AS lift,
+       (cum_count * 100.0 / NULLIF(total_population, 0)) AS cumulative_sample_capture,
+       (cum_events * 100.0 / NULLIF(total_target_events, 0)) AS cumulative_event_capture
+FROM CUMULATIVE_KPIS
+ORDER BY CASE WHEN segment = 0 THEN 999999 ELSE segment END
+"""
+
+
+def _build_sql_script(segments, coverage, cfg=None, exp=None):
+    cfg = cfg or {}
+    exp = exp or {}
+    table = cfg.get("data_table") or "udl_data"
+    target = cfg.get("target_col") or ""
+    lines = [
+        "-- =====================================================================",
+        "-- RapidSegment — deployable segment SQL",
+        f"-- Experiment : {exp.get('name', '')} ({exp.get('exp_id', '')})",
+        f"-- Status     : {exp.get('status', '')}",
+        f"-- Target     : {target}",
+        f"-- Table      : {table}",
+        "-- =====================================================================",
+        "",
+        "-- 1. Per-segment WHERE filters (copy into your own query)",
+    ]
+    for s in segments:
+        lines.append(f"-- Segment {s['segment_id']} · {s['rule_string']}")
+        lines.append(f"SELECT * FROM {table} WHERE ({s['sql_filter']});")
+        lines.append("")
+    lines.append("-- 2. Full segment assignment (CASE WHEN, in extraction order)")
+    lines.append("SELECT *,")
+    if segments:
+        case_lines = ",\n".join(
+            f"         WHEN ({s['sql_filter']}) THEN {s['segment_id']}" for s in segments
+        )
+        lines.append(f"       CASE\n{case_lines}\n         ELSE 0 END AS segment")
+    else:
+        lines.append("       0 AS segment  -- no segments found")
+    lines.append(f"FROM {table};")
+    lines.append("")
+    lines.append("-- 3. Final coverage (CTE — run against the original table)")
+    lines.append(_build_coverage_sql(segments, target))
+    return "\n".join(lines)
+
+
+def render_coverage_table(segments, coverage, weights=None):
+    """Render the coverage table with meta_applied + weight columns merged from segments."""
+    if not coverage:
+        st.caption("No coverage rows — experiment produced no segments.")
+        return
+    cov_df = pd.DataFrame(coverage)
+    seg_by_id = {s["segment_id"]: s for s in segments}
+    w_map = weights or {}
+    for col in ("meta_applied_sample_size", "meta_applied_min_lift"):
+        cov_df[col] = cov_df["segment"].map(
+            lambda sid, _col=col: str(seg_by_id.get(int(sid), {}).get(_col, ""))
+            if pd.notna(sid) and int(sid) != 0 else ""
+        ).astype(str)
+    cov_df["weight"] = cov_df["segment"].map(
+        lambda sid: w_map.get(int(sid), 0) if pd.notna(sid) and int(sid) != 0 else 0
+    )
+    st.dataframe(cov_df, height=300, width='stretch', hide_index=True)

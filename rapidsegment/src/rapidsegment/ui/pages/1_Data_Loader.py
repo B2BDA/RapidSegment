@@ -296,29 +296,6 @@ with st.sidebar:
             fp = st.text_input("File path", placeholder="/path/to/file.csv")
             encoding = st.selectbox("Encoding", ["Auto-detect", "UTF-8", "Latin-1"])
             st.caption("Supported: CSV, Parquet, Arrow/Feather, Excel")
-            if fp and os.path.exists(fp):
-                if st.button("Peek (first 5 rows + types)", key="peek_path"):
-                    try:
-                        ext = os.path.splitext(fp)[1].lower()
-                        if ext in (".csv", ".tsv"):
-                            delim = "\t" if ext == ".tsv" else ","
-                            peek_df = duckdb.read_csv(fp, delim=delim, nrows=5,
-                                                      header=True, sample_size=5)
-                        elif ext in (".parquet", ".pq"):
-                            peek_df = duckdb.read_parquet(fp, nrows=5)
-                        elif ext in (".arrow", ".feather"):
-                            peek_df = duckdb.read_arrow(fp, nrows=5)
-                        else:
-                            peek_df = None
-                            st.info("Peek not supported for this format; click Load File directly.")
-                        if peek_df is not None:
-                            st.caption(f"**First 5 rows** of `{os.path.basename(fp)}`")
-                            st.dataframe(peek_df, width="stretch", hide_index=True)
-                            desc = duckdb.sql(f"DESCRIBE SELECT * FROM peek_df").df()
-                            st.caption("**Inferred column types**")
-                            st.dataframe(desc, width="stretch", hide_index=True)
-                    except Exception as exc:
-                        st.warning(f"Peek failed: {exc}")
             if st.button("Load File", type="primary", disabled=not fp):
                 if not os.path.exists(fp):
                     st.error(f"File not found: {fp}")
@@ -346,34 +323,6 @@ with st.sidebar:
                     )
                 encoding = st.selectbox("Encoding", ["Auto-detect", "UTF-8", "Latin-1"], key="up_enc")
                 st.caption(f"Detected format: **{detect_format(uploaded.name)}** - {size_mb:.1f} MB")
-                if st.button("Peek (first 5 rows + types)", key="peek_upload"):
-                    try:
-                        ext = os.path.splitext(uploaded.name)[1].lower()
-                        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                            shutil.copyfileobj(uploaded, tmp)
-                            tmp_path = tmp.name
-                        try:
-                            if ext in (".csv", ".tsv"):
-                                delim = "\t" if ext == ".tsv" else ","
-                                peek_df = duckdb.read_csv(tmp_path, delim=delim, nrows=5,
-                                                          header=True, sample_size=5)
-                            elif ext in (".parquet", ".pq"):
-                                peek_df = duckdb.read_parquet(tmp_path, nrows=5)
-                            elif ext in (".arrow", ".feather"):
-                                peek_df = duckdb.read_arrow(tmp_path, nrows=5)
-                            else:
-                                peek_df = None
-                                st.info("Peek not supported for this format; click Load directly.")
-                            if peek_df is not None:
-                                st.caption(f"**First 5 rows** of `{uploaded.name}`")
-                                st.dataframe(peek_df, width="stretch", hide_index=True)
-                                desc = duckdb.sql(f"DESCRIBE SELECT * FROM peek_df").df()
-                                st.caption("**Inferred column types**")
-                                st.dataframe(desc, width="stretch", hide_index=True)
-                        finally:
-                            os.unlink(tmp_path)
-                    except Exception as exc:
-                        st.warning(f"Peek failed: {exc}")
                 if st.button("Load Uploaded File", type="primary"):
                         with st.spinner(f"Loading '{uploaded.name}'…"):
                             ext = os.path.splitext(uploaded.name)[1].lower()

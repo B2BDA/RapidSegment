@@ -13,7 +13,7 @@ major upgrades, dry-runs, and troubleshooting.
 - **Always** commit `uv.lock` alongside any `pyproject.toml` change.
 - **Always** run the smoke test (`uv run pytest`) before committing an upgrade.
 - **`uv.lock` is the single source of truth** for exact versions. Never edit it by hand.
-- **Upper bounds** in `pyproject.toml` (e.g. `duckdb>=1.5.5,<2.0`) intentionally
+- **Upper bounds** in `pyproject.toml` (e.g. `duckdb>=2.0.0,<3.0`) intentionally
   block accidental **major** jumps. An upgrade can never cross a bound unless you
   raise it first.
 - **`uv_build` `source-exclude`** keeps the published package to the core library
@@ -94,8 +94,8 @@ A green CI on your PR is the signal that an upgrade is safe to merge.
 ### A. Periodic in-bounds upgrade (do this monthly)
 
 Pulls in newer patch/minor releases that stay inside the declared bounds
-(e.g. the latest `duckdb` 1.x). It will **not** cross an upper bound (e.g. `duckdb`
-stays `<2.0` by design).
+(e.g. the latest `duckdb` 2.x). It will **not** cross an upper bound (e.g. `duckdb`
+stays `<3.0` by design).
 
 ```bash
 cd rapidsegment
@@ -138,19 +138,20 @@ uv lock
 
 ## 5. Major upgrade runbook (crossing an upper bound)
 
-"Major" = the version leaves the current range, e.g. adopting **duckdb 2.0**
-(or pandas 3.0 / numpy 3.0). Do it deliberately:
+RapidSegment currently supports **DuckDB 2.x** (`>=2.0.0,<3.0`). A future
+upgrade that crosses the upper bound (for example DuckDB 3.x, pandas 4.x, or
+NumPy 3.x) must be handled deliberately:
 
 1. **Raise the bound** in `pyproject.toml`, keeping the floor:
 
    ```toml
-   duckdb = ">=1.5.5,<3.0"
+   duckdb = ">=2.0.0,<4.0"
    ```
 
    Optionally pin a specific release so a later `uv lock` does not jump to 2.1:
 
    ```bash
-   uv lock --upgrade-package duckdb==2.0.0
+   uv lock --upgrade-package duckdb==<target-version>
    ```
 
 2. **Resolve and sync** (the extras must still resolve against the new version):
@@ -169,7 +170,7 @@ uv lock
 4. **If green**, commit both files:
 
    ```bash
-   git add pyproject.toml uv.lock && git commit -m "chore: upgrade duckdb to 2.x"
+   git add pyproject.toml uv.lock && git commit -m "chore: upgrade duckdb"
    ```
 
 5. **If red**, fix the *source*, not the lock. Likely spots for a DuckDB bump:
@@ -186,11 +187,11 @@ uv lock
 
 ## 6. Pre-flight dry-run (validate without committing)
 
-Prove the safety net works **before** you ever ship a major bump:
+Prove the safety net works **before** you ever ship a future major bump:
 
 ```bash
 cd rapidsegment
-uv lock --upgrade-package duckdb==2.0.0
+uv lock --upgrade-package duckdb==<target-version>
 uv sync --all-extras
 uv run pytest
 git checkout pyproject.toml uv.lock     # revert if not ready to ship

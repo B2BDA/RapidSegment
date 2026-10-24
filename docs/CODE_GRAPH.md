@@ -23,7 +23,7 @@ Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `78653d4` (m
 │   ├── train.csv                # Churn training set
 │   └── test.csv                 # Churn test set
 └── rapidsegment/                # Installable Python package (src layout)
-    ├── pyproject.toml           # uv_build backend, v1.2.4
+    ├── pyproject.toml           # uv_build backend, v1.4.0
     ├── uv.lock
     ├── LICENSE
     ├── .python-version
@@ -78,6 +78,7 @@ Data ingestion layer. Normalizes inputs to PyArrow Tables with all numeric colum
 | `_load_from_file()` | 134 | Ext by extension: `.parquet` (pa_pq), `.csv` (pa_csv), `.arrow`/`.feather` (ipc), `.xlsx`/`.xls` (openpyxl), else `ValueError` |
 | `_load_excel_to_arrow()` | 163 | openpyxl read-only; positional column tracking, missing headers named `_col_{i}` |
 | `_load_from_bigquery()` | 204 | With `google.cloud.bigquery`: `get_table` schema, `SAFE_CAST` numeric types → `FLOAT64`, `query().to_arrow()`. Without lib: returns DuckDB scan macro string `bigquery_scan('project','dataset','table')` |
+| `duckdb_to_arrow(db, table_name="udl_data")` | 470 | Uses DuckDB 2.x `con.sql(query).to_arrow_table()` relation execution to avoid DB-API Arrow extra-copy warnings |
 
 ### 3.2 `utils/on_gcp_feature_selection.py` — `BigQueryFeatureSelector`
 
@@ -278,8 +279,8 @@ BigQueryFeatureSelector.screen_features() → DuckDB relation (feature, stddev, 
 
 ## 8. Dependencies & Constraints
 
-- Python ≥ 3.11; build backend `uv_build`; version `1.2.4`.
-- Runtime: `duckdb>=1.5.4`, `joblib>=1.5.3`, `numpy>=2.5.1`, `optbinning>=0.21.0`, `pandas>=2.2.0`, `psutil>=7.2.2`, `pyarrow>=25.0.0`.
+- Python ≥ 3.11; build backend `uv_build`; version `1.4.0`.
+- Runtime: `duckdb>=2.0.0,<3.0`, `joblib>=1.5.3`, `numpy>=2.5.1`, `optbinning>=0.21.0`, `pandas>=2.2.0`, `psutil>=7.2.2`, `pyarrow>=25.0.0`.
 - Optional extras: `excel` (openpyxl), `gcp` (google-cloud-bigquery), `prettytable`.
 - Packaging: src layout; package name `rapidsegment`; module `rapidsegment` inside `rapidsegment/src/rapidsegment`.
 

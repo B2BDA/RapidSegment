@@ -7,6 +7,7 @@ data.
 """
 import os
 import tempfile
+import warnings
 
 import pandas as pd
 import pytest
@@ -38,6 +39,29 @@ def test_duckdb_roundtrip():
         "SELECT a, SUM(b) AS s FROM t GROUP BY a ORDER BY a"
     ).fetchall()
     assert rows == [(1, 4), (2, 5), (3, 6)]
+
+
+def test_streamed_duckdb_arrow_roundtrip(tmp_path):
+    """The persisted-loader Arrow path uses DuckDB 2.x relations without warnings."""
+    from rapidsegment import UniversalDataLoader
+
+    frame = pd.DataFrame({"id": [1, 2, 3], "target": [0, 1, 0]})
+    db_path = UniversalDataLoader().stream_to_duckdb(
+        str(tmp_path / "source.duckdb"),
+        data=frame,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        table = UniversalDataLoader.duckdb_to_arrow(db_path)
+
+    assert not any(
+        "Arrow output on a DB-API result makes an extra copy" in str(item.message)
+        for item in caught
+    )
+    assert table.column_names == ["id", "target"]
+    assert table.num_rows == 3
+    assert table["target"].to_pylist() == [0.0, 1.0, 0.0]
 
 
 def test_tiny_segment_extraction():

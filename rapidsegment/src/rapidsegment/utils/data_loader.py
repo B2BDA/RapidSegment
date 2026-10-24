@@ -502,7 +502,7 @@ class UniversalDataLoader:
             exists = con.execute(
                 "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
                 [table_name],
-            ).fetchone()
+            ).fetchall()
             if not exists:
                 available = ", ".join(
                     r[0]
@@ -514,20 +514,20 @@ class UniversalDataLoader:
                     f"Table '{table_name}' not found in DuckDB source. "
                     f"Available tables: {available or '(none)'}"
                 )
-            return UniversalDataLoader._fetch_arrow_table(
-                con.execute(f'SELECT * FROM "{table_name}"')
-            )
+            query = f'SELECT * FROM "{table_name}"'
+            # DuckDB 2.x recommends creating a relation first, then calling
+            # ``to_arrow_table()`` on that relation. This avoids the DB-API
+            # extra-copy warning emitted by connection.execute().
+            result = con.sql(query)
+            return UniversalDataLoader._fetch_arrow_table(result)
         finally:
             if owned:
                 con.close()
 
     @staticmethod
     def _fetch_arrow_table(result: Any) -> pa.Table:
-        """Normalises duckdb's varying result hand-off into a concrete pa.Table."""
-        try:
-            return result.fetch_arrow_table()
-        except AttributeError:  # duckdb < 1.x exposes .arrow() -> RecordBatchReader
-            return result.arrow().read_all()
+        """Convert a DuckDB 2.x relation to a concrete PyArrow table."""
+        return result.to_arrow_table()
 
 
 def duckdb_to_arrow(

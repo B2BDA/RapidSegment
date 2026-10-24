@@ -3,7 +3,7 @@
 Handoff document. Read this first when resuming work so we can jump straight back in.
 
 ## What this project is
-A Streamlit no-code UI on top of the **RapidSegment** PyPI library (`rapidsegment==1.2.4`, class `StrategicSegmentBuilder`). Spec lives in `UI_MVP.md` (converted from Solara → Streamlit). 6 modules; all 1–6 done.
+A Streamlit no-code UI on top of the **RapidSegment** PyPI library (`rapidsegment==1.4.0`, class `StrategicSegmentBuilder`). The current package runtime supports **DuckDB 2.x** and uses DuckDB's relation API for Arrow conversion. Spec lives in `UI_MVP.md` (converted from Solara → Streamlit). 6 modules; all 1–6 done.
 
 ## File map
 - `C:\Users\Bishwarup\OneDrive\Documents\RapidSegment\docs\UI_MVP.md` — spec + Project Status tracker (module-by-module ✅/⬜)

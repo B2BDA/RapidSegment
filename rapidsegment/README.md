@@ -14,6 +14,9 @@
 
 **RapidSegment** is an industrial‑grade, combinatorial heuristic engine for discovering high‑lift predictive segments and compiling them into transparent, production‑ready scorecards. It bridges the gap between black‑box ML and legacy SQL rules engines.
 
+> **Runtime compatibility:** RapidSegment `1.4.0` supports DuckDB 2.x
+> (`duckdb>=2.0.0,<3.0`).
+
 
 ## Rapid Segment Interactive Explainer (Must Try)
 [Explainer](https://b2bda.github.io/RapidSegment/)

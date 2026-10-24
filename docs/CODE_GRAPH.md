@@ -1,6 +1,10 @@
 # RapidSegment — Code Graph
 
-Versioned map of the `RapidSegment` codebase. Updated for repo HEAD `78653d4` (main); the data-handling layer was refactored to hold a **single shared DuckDB artifact** — `current_df_base` + an in-place flag + a filtered `current_df` view, two-phase binning, and opt-in `persist_db`/`close()` so later steps reuse one materialised dataset.
+Versioned map of the `RapidSegment` codebase for the current `main` branch and
+the `1.4.0` release; the data-handling layer was refactored to hold a **single
+shared DuckDB artifact** — `current_df_base` + an in-place flag + a filtered
+`current_df` view, two-phase binning, and opt-in `persist_db`/`close()` so later
+steps reuse one materialised dataset.
 
 ---
 
@@ -280,7 +284,7 @@ BigQueryFeatureSelector.screen_features() → DuckDB relation (feature, stddev, 
 ## 8. Dependencies & Constraints
 
 - Python ≥ 3.11; build backend `uv_build`; version `1.4.0`.
-- Runtime: `duckdb>=2.0.0,<3.0`, `joblib>=1.5.3`, `numpy>=2.5.1`, `optbinning>=0.21.0`, `pandas>=2.2.0`, `psutil>=7.2.2`, `pyarrow>=25.0.0`.
+- Runtime: `duckdb>=2.0.0,<3.0`, `joblib>=1.5.3,<2.0`, `numpy>=2.4.6,<3.0`, `optbinning>=0.21.0,<2.0`, `pandas>=2.3.3,<4.0`, `psutil>=7.2.2,<8.0`, `pyarrow>=25.0.1,<26.0`.
 - Optional extras: `excel` (openpyxl), `gcp` (google-cloud-bigquery), `prettytable`.
 - Packaging: src layout; package name `rapidsegment`; module `rapidsegment` inside `rapidsegment/src/rapidsegment`.
 

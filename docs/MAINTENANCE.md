@@ -145,7 +145,9 @@ NumPy 3.x) must be handled deliberately:
 1. **Raise the bound** in `pyproject.toml`, keeping the floor:
 
    ```toml
-   duckdb = ">=2.0.0,<4.0"
+   dependencies = [
+       "duckdb>=2.0.0,<4.0",
+   ]
    ```
 
    Optionally pin a specific release so a later `uv lock` does not jump to 2.1:
